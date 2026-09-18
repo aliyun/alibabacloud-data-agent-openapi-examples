@@ -1,9 +1,25 @@
 {
-  "name": "data-agent-openapi-example",
+  "name": "alibabacloud-data-agent-openapi-examples",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "DataWorks DataAgent OpenAPI 示例工程：Fastify 代理 + React 三栏前端，把实测出来的接口约束固化成代码",
+  "keywords": [
+    "alibabacloud",
+    "dataworks",
+    "data-agent",
+    "openapi",
+    "agent",
+    "sse",
+    "fastify",
+    "react",
+    "example"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aliyun/alibabacloud-data-agent-openapi-examples.git"
+  },
   "engines": {
     "node": ">=20.19.0"
   },
