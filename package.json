@@ -1,0 +1,35 @@
+{
+  "name": "data-agent-openapi-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DataWorks DataAgent OpenAPI 示例工程：Fastify 代理 + React 三栏前端，把实测出来的接口约束固化成代码",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:server": "npm run dev --workspace server",
+    "dev:web": "npm run dev --workspace web",
+    "check": "npm run check --workspace server --",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "npm run typecheck --workspace shared && npm run typecheck --workspace server && npm run typecheck --workspace web",
+    "build": "npm run typecheck && npm run build --workspace web"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "concurrently": "^9.1.2",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@das/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "前后端共用的唯一解析权威：帧形状、rid 过滤、轮次聚合、错误分类",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,12 @@
+{
+	"JsonRpcResponse": {
+		"Result": {
+			"CachedTokens": 0,
+			"CompletionTokens": 58,
+			"PromptTokens": 41230,
+			"ThoughtsTokens": 0,
+			"TotalTokens": 41288
+		}
+	},
+	"RequestId": "00000000-1111-4222-8333-444444444403"
+}

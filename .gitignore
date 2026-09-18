@@ -1,0 +1,24 @@
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# 凭证：任何情况下都不要提交
+# .env.* 一并忽略，覆盖多环境的 .env.<name>（如 .env.pre，里面有真 AK/SK）；
+# 只把不含凭证的样例 .env.example 放回版本控制。
+.env
+.env.*
+!.env.example
+
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+.qwen
+
+.agents
