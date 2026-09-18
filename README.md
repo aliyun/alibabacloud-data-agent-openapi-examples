@@ -6,14 +6,15 @@
 [![Node](https://img.shields.io/badge/node-%E2%89%A520.19-brightgreen)](package.json)
 [![测试](https://img.shields.io/badge/%E6%B5%8B%E8%AF%95-389%20passing-brightgreen)](docs/CONSTRAINTS.md)
 
-**这不是一个"能跑就行"的 API 示例。** 它把 **DataWorks DataAgent OpenAPI** 实测出来的接口行为
-固化成了代码与测试：业务错误恒 HTTP 200、`ListAgents` 找不到目标 agent、约 220 秒的断流墙、
-并发收流串答案、人卡（工具授权/提问）的回覆通道——**每一条都能指到代码和测试**，
-错误信息如实呈现（而不是含糊的"任务失败，请重试"）。[English](README.en.md)
+**DataWorks DataAgent OpenAPI 最佳实践示例。** 覆盖 9 个 OpenAPI 的完整链路——会话管理、
+SSE 流式交互、人卡回覆（工具授权与提问）、取消与历史拉取——并把**实测验证过的关键行为与最佳实践**
+固化成代码与测试：业务错误以 HTTP 200 携带业务码、`SessionStatus` 恒为 `RELEASED`、
+artifacts 接口恒返回空、流式响应存在约 220 秒的时长边界、历史拉取在运行期会阻塞——
+**每一条都有代码归属与测试覆盖**，错误信息如实呈现（而不是含糊的"任务失败，请重试"）。[English](README.en.md)
 
-照官方文档直接写集成，大概率会在下面这些地方被打穿：业务错误恒 HTTP 200、`SessionStatus` 恒 `RELEASED`、
-artifacts 恒空、220 秒左右断流且**不能重发**、拉历史在运行期会阻塞、且可能混入大量重复帧。
-每一条都在本仓库里有明确的代码归属，错误信息都会如实呈现（而不是含糊的"任务失败，请重试"）。
+其中几条与直觉不同、也最影响集成成败：`SessionStatus` 恒为 `RELEASED`（轮次状态要从流里判），
+`CreateAgentSession` 的空响应与授权拒绝不可区分，`ListAgentSessions` 的标题过滤器被静默忽略，
+人卡回覆必须携带 `optionId`。逐条见下方「最佳实践精选」。
 
 覆盖 9 个 OpenAPI：`ListAgents`、`CreateAgentSession`、`ListAgentSessions`、`PromptAgentSession`（SSE）、
 `LoadAgentSession`（SSE）、`GetAgentSessionTokenUsage`、`ListAgentSessionArtifacts`、`CancelAgentSession`、
@@ -212,9 +213,9 @@ npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 
 ---
 
-## 实测约束精选
+## 最佳实践精选
 
-45 条完整清单见 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md)（每条都有代码归属）。最容易被官方文档"骗到"的十条：
+45 条完整清单见 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md)（每条都有代码归属与实测标记）。以下十条最值得先读：
 
 | # | 约束 | 代码归属 |
 |---|---|---|
@@ -225,7 +226,7 @@ npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 | 19 | `CancelAgentSession` 【LIVE 09-18】已生效：取消以 `stopReason=cancelled` 终态收场；但 **cancelled 终态不落库**（上游缺口） | `server/src/live.ts` 的 `liveCancel` |
 | 21 | `GetAgentSessionTokenUsage` 是唯一可靠度量，但**数值不是常量**（不同账号/会话差异极大） | `server/src/selfcheck.ts` |
 | 22 | `load` 在 RUNNING 期约一半概率阻塞（178s/81.6s 实测）⇒ 独立 30s readTimeout + 关闭聚焦重取 | `server/src/live.ts` 的 `liveHistory` |
-| 24 | `[LIVE 09-17]` 并发收流会**串答案**（4 路同时发 3/4 串），且串是上游响应扇出错——归属判别只能靠注入的 marker | `shared/src/marker.ts`、`server/src/routes/prompt.ts` |
+| 24 | `[LIVE 09-17]` 并发收流可能出现**跨会话串答**（4 路同时发 3/4 串），属上游响应扇出问题——归属判别以注入的 marker 为准 | `shared/src/marker.ts`、`server/src/routes/prompt.ts` |
 | 42 | `[LIVE 09-17]` 会话到执行端的绑定是**临时的**：闲置旧会话发 prompt 报 `Session is not ready`，要复用旧会话先预期"绑定已丢需重试" | `shared/src/errors.ts` 的 `classifyError` |
 | 44 | `[LIVE 09-17]` ask_user_question 的回覆必须带 optionId，缺了被上游 400 拒收 | `shared/src/rest.ts`、`web/src/components/chat/InteractionCard.tsx` |
 
@@ -249,7 +250,7 @@ npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 
 | 文档 | 内容 |
 |---|---|
-| [docs/FAQ.md](docs/FAQ.md) | 把坑写成问答（SDK 选型、空响应、过滤器、取消、断流探测…） |
+| [docs/FAQ.md](docs/FAQ.md) | 常见问题与最佳实践（SDK 选型、空响应、过滤器、取消、断流探测…） |
 | [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) | 45 条实测约束全表（每条含代码归属与实测标记） |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构导读：目录、后端 HTTP 契约、"谁是事实源"设计核心 |
 | [docs/MOCK.md](docs/MOCK.md) | MOCK 模式：合成帧流回放、时序压平/倍速 |

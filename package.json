@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "DataWorks DataAgent OpenAPI 示例工程：Fastify 代理 + React 三栏前端，把实测出来的接口约束固化成代码",
+  "description": "DataWorks DataAgent OpenAPI 最佳实践示例：Fastify 代理 + React 前端，把关键接口行为与最佳实践固化成代码与测试",
   "keywords": [
     "alibabacloud",
     "dataworks",

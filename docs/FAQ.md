@@ -1,4 +1,4 @@
-# FAQ：把坑写成问答
+# FAQ：常见问题与最佳实践
 
 **Q：为什么必须用 `promptAgentSessionWithSSE()`，普通的 `promptAgentSessionWithOptions()` 不行？**
 A：普通变体走 `callApi` + `bodyType:'json'`，`@alicloud/openapi-core` 的 `callApi` 从不路由到 `callSSEApi`，

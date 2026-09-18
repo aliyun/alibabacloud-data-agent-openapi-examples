@@ -6,17 +6,20 @@
 [![Node](https://img.shields.io/badge/node-%E2%89%A520.19-brightgreen)](package.json)
 [![Tests](https://img.shields.io/badge/tests-389%20passing-brightgreen)](docs/CONSTRAINTS.md)
 
-**This is not a "runs-once" API sample.** It turns the *battle-tested* behaviors of the
-**DataWorks DataAgent OpenAPI** into code and tests: business errors always come back as
-HTTP 200, `ListAgents` never lists the agent you need, a ~220s stream-break wall, answers
-crossing over between concurrent streams, the human-in-the-loop reply channel —
-**every claim points at code and tests**, and errors are surfaced honestly instead of a
-vague "task failed, please retry".
+**Best-practice examples for the DataWorks DataAgent OpenAPI.** Full-chain coverage of
+9 OpenAPIs — session management, SSE streaming, human-in-the-loop replies (tool approvals
+and questions), cancellation and history — with **verified behaviors and best practices
+pinned by code and tests**: business errors carried over HTTP 200 with a business code,
+`SessionStatus` always `RELEASED`, artifact APIs returning empty lists, a ~220s streaming
+duration boundary, history pulls that block during running turns. **Every item has code
+attribution and test coverage**, and errors are surfaced honestly instead of a vague
+"task failed, please retry". [中文文档](README.md)
 
-Integrating straight from the official docs? These are the places you will get bitten:
-business errors always return HTTP 200, `SessionStatus` is always `RELEASED`, the artifact
-APIs always return empty, streams break around 220 seconds and **cannot be resent**, and
-history pulls may block during a running turn.
+A few of these differ from what the docs would lead you to expect — and they matter most
+for integration: `SessionStatus` stays `RELEASED` (judge turn state from the stream), an
+empty `CreateAgentSession` response is indistinguishable from an authorization rejection,
+the `SessionTitle` filter is silently ignored, and human-in-the-loop replies must carry an
+`optionId`. The full list is under "Best-practice highlights" below.
 
 Covers 9 OpenAPIs: `ListAgents`, `CreateAgentSession`, `ListAgentSessions`,
 `PromptAgentSession` (SSE), `LoadAgentSession` (SSE), `GetAgentSessionTokenUsage`,
@@ -225,10 +228,10 @@ This repo implements the full loop for the 9th API:
 
 ---
 
-## Constraint highlights
+## Best-practice highlights
 
-The full list of 45 tested constraints (each with code attribution) lives in
-[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) (Chinese). The ten most likely to bite:
+The full list of 45 verified behaviors (each with code attribution) lives in
+[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) (Chinese). Ten key ones to read first:
 
 | # | Constraint | Code |
 |---|---|---|
@@ -239,7 +242,7 @@ The full list of 45 tested constraints (each with code attribution) lives in
 | 19 | `CancelAgentSession` works: cancellation ends the stream with `stopReason=cancelled`; but the cancelled state is **not persisted** (upstream gap) | `server/src/live.ts` `liveCancel` |
 | 21 | `GetAgentSessionTokenUsage` is the only reliable meter, but **the numbers are not constants** | `server/src/selfcheck.ts` |
 | 22 | `load` blocks ~50% of the time during RUNNING turns (measured 178s/81.6s) ⇒ separate 30s readTimeout + no refetch-on-focus | `server/src/live.ts` `liveHistory` |
-| 24 | Concurrent streams **cross-contaminate answers** (3/4 crossed with 4 concurrent turns) — the fan-out error is upstream; attribution only via injected markers | `shared/src/marker.ts`, `server/src/routes/prompt.ts` |
+| 24 | Concurrent streams may **cross answers between sessions** (3/4 crossed with 4 concurrent turns) — an upstream fan-out issue; attribute turns via injected markers | `shared/src/marker.ts`, `server/src/routes/prompt.ts` |
 | 42 | The session→daemon binding is **ephemeral**: an idle old session answers `Session is not ready` — expect "binding lost, retry/recreate" | `shared/src/errors.ts` `classifyError` |
 | 44 | An ask_user_question reply **must include optionId**, or the upstream rejects with 400 | `shared/src/rest.ts`, `web/src/components/chat/InteractionCard.tsx` |
 
