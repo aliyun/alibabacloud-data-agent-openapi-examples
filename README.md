@@ -12,13 +12,19 @@ SSE 流式交互、人卡回覆（工具授权与提问）、取消与历史拉�
 artifacts 接口恒返回空、流式响应存在约 220 秒的时长边界、历史拉取在运行期会阻塞——
 **每一条都有代码归属与测试覆盖**，错误信息如实呈现（而不是含糊的"任务失败，请重试"）。[English](README.en.md)
 
-其中几条与直觉不同、也最影响集成成败：`SessionStatus` 恒为 `RELEASED`（轮次状态要从流里判），
-`CreateAgentSession` 的空响应与授权拒绝不可区分，`ListAgentSessions` 的标题过滤器被静默忽略，
-人卡回覆必须携带 `optionId`。逐条见下方「最佳实践精选」。
+覆盖 9 个 OpenAPI（API 名链接到[官方文档](https://api.aliyun.com/product/dataworks-public)对应页）：
 
-覆盖 9 个 OpenAPI：`ListAgents`、`CreateAgentSession`、`ListAgentSessions`、`PromptAgentSession`（SSE）、
-`LoadAgentSession`（SSE）、`GetAgentSessionTokenUsage`、`ListAgentSessionArtifacts`、`CancelAgentSession`、
-`ReplyAgentSession`（人卡回覆：工具授权与 ask_user_question 的应答通道，见 §6.1）。
+| OpenAPI | 用途 | 文档 |
+|---|---|---|
+| `ListAgents` | 列出 agent | [↗](https://api.aliyun.com/document/dataworks-public/ListAgents) |
+| `CreateAgentSession` | 创建会话 | [↗](https://api.aliyun.com/document/dataworks-public/CreateAgentSession) |
+| `ListAgentSessions` | 分页列出会话 | [↗](https://api.aliyun.com/document/dataworks-public/ListAgentSessions) |
+| `PromptAgentSession` | 发起对话（SSE 流式，人卡帧也从这里出） | [↗](https://api.aliyun.com/document/dataworks-public/PromptAgentSession) |
+| `ReplyAgentSession` | 人卡回覆：工具授权与 ask_user_question 的应答通道（见 §6.1） | [↗](https://api.aliyun.com/document/dataworks-public/ReplyAgentSession) |
+| `CancelAgentSession` | 取消执行中的轮次 | [↗](https://api.aliyun.com/document/dataworks-public/CancelAgentSession) |
+| `LoadAgentSession` | 拉取历史（SSE） | [↗](https://api.aliyun.com/document/dataworks-public/LoadAgentSession) |
+| `GetAgentSessionTokenUsage` | 会话 token 用量 | [↗](https://api.aliyun.com/document/dataworks-public/GetAgentSessionTokenUsage) |
+| `ListAgentSessionArtifacts` | 会话产出物列表 | [↗](https://api.aliyun.com/document/dataworks-public/ListAgentSessionArtifacts) |
 
 ## 快速开始
 
@@ -41,13 +47,11 @@ npm install
 
 发 prompt 前建议先跑 `npm run check` 三步自检（第 6 节），全绿再上界面。
 
-没有云资源、只想先预览？`MOCK=1 npm run dev` 零配置起全栈，见第 11 节。
-
 > **验证边界一句话**：解析层与错误分类有单测覆盖（`npm test`：33 个文件 / 389 条，见第 5 节）；
-> MOCK 全链路可按第 11 节在浏览器里逐形态验收。真实链路已端到端验过一轮问答（`[LIVE 09-16]`），
-> 218~258s 断流墙与探测器判据 B 仍未验。09-15~16 排查过的「prompt 只回 POP 回执就关流」，
-> 真根因是**用户 Token 周限额计费闸门**且错误不透传回客户端——同款症状先查调用身份的限额，
-> 别急着改代码；完整形态与处置见第 8 节 FAQ 与第 10 节。
+> 真实链路已端到端验过一轮问答（`[LIVE 09-16]`），218~258s 断流墙与探测器判据 B 仍未验。
+> 09-15~16 排查过的「prompt 只回 POP 回执就关流」，真根因是**用户 Token 周限额计费闸门**且
+> 错误不透传回客户端——同款症状先查调用身份的限额，别急着改代码；
+> 完整形态与处置见 [docs/FAQ.md](docs/FAQ.md) 与 [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md)。
 
 ---
 
@@ -58,7 +62,7 @@ npm install
   - [`nvm`](https://github.com/nvm-sh/nvm)：`nvm install 22 && nvm use 22`
   - 官网安装包：<https://nodejs.org/>
 - **npm ≥ 10**（随 Node 一起来）。
-- 一个已开通 DataWorks 且有**运行中实例**的阿里云账号（还没有？可先用 MOCK 预览，见第 11 节）。
+- 一个已开通 DataWorks 且有**运行中实例**的阿里云账号。
 
 检查：
 
@@ -113,9 +117,8 @@ cp .env.example .env
 
 | 字段 | 什么时候必填 | 说明 |
 |---|---|---|
-| `MOCK` | 想跳过凭证时填 `1` | 回放本仓库自带的合成样例帧流，完全不调真实接口 |
-| `ALIBABA_CLOUD_ACCESS_KEY_ID` | `MOCK=0` 时必填 | 建议用单独的 RAM 用户 |
-| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | `MOCK=0` 时必填 | 绝不入库 |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID` | 必填 | 建议用单独的 RAM 用户 |
+| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | 必填 | 绝不入库 |
 | `DATAAGENT_REGION_ID` | 有默认值 `cn-hangzhou` | DataWorks 实例所在 region；**实例不在杭州时必须改**，否则所有调用都打到错的 region |
 | `END_POINT` | 接预发/日常网关时必填 | 显式上游域名，覆盖 SDK 的 region 内置映射。**留空时 SDK 在构造期就推导出 `dataworks.{region}.aliyuncs.com`（生产域名）**——所以接预发不填它，请求会静默打到生产（签名照样有效）。只填 host，不带 `https://` |
 | `RESOURCE_GROUP_ID` | 账号零运行实例时必填 | 注意服务端**不校验有效性**，填错也一样建会话成功 |
@@ -123,7 +126,7 @@ cp .env.example .env
 | `SESSION_SOURCE` | 有默认值 | 左栏只列带这个来源标记的会话 |
 | `PORT` / `CORS_ORIGIN` / `VITE_API_BASE` | 有默认值 | 改端口时三个地方要同步 |
 
-缺凭证且 `MOCK=0` 时，服务端**直接退出并打印一段指路文案**，不会起来一个半残的服务。
+缺凭证时，服务端**直接退出并打印一段指路文案**，不会起来一个半残的服务。
 
 ---
 
@@ -163,7 +166,6 @@ npm run check      # 三步自检（见下）
 
 ```bash
 npm run check            # 用 .env 里的真凭证
-npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 ```
 
 | 步 | 接口 | 它在判什么 |
@@ -182,9 +184,6 @@ npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 - **三步全绿 ≠ prompt 能跑起来**：本轮 ②③ 全通，但 `PromptAgentSession` 仍然一帧不回
   （见 [已知限制](docs/KNOWN-LIMITATIONS.md)）。自检覆盖的是"身份、开通、会话可用性"，
   覆盖不到"上游愿不愿意把这一轮派发给执行端"。
-
-`--mock` 的输出末尾会明说：它只证明"工程装对了、样例能被正确解析"，
-**不能**证明你的 AK/SK、region、实例或资源组配置是对的。
 
 ### 6.1 人卡回覆 `ReplyAgentSession`（第 9 个 API）
 
@@ -239,13 +238,6 @@ npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 
 ---
 
-## MOCK 模式（可选）
-
-没有凭证也能预览全部界面形态：`MOCK=1 npm run dev`。回放合成样例帧流
-（含断流、幽灵化、并发拒绝等五种异常形态的演示）。完整说明见 [docs/MOCK.md](docs/MOCK.md)。
-
----
-
 ## 文档索引
 
 | 文档 | 内容 |
@@ -253,7 +245,6 @@ npm run check -- --mock  # 回放合成样例，只验证工程本身装对了
 | [docs/FAQ.md](docs/FAQ.md) | 常见问题与最佳实践（SDK 选型、空响应、过滤器、取消、断流探测…） |
 | [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) | 45 条实测约束全表（每条含代码归属与实测标记） |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构导读：目录、后端 HTTP 契约、"谁是事实源"设计核心 |
-| [docs/MOCK.md](docs/MOCK.md) | MOCK 模式：合成帧流回放、时序压平/倍速 |
 | [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | 已知限制与免责声明 |
 
 ## 贡献
