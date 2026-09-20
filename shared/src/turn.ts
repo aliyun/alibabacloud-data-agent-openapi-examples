@@ -40,7 +40,7 @@ export interface ToolCallView {
    * 挑键就等于把没预料到的参数静默丢掉。渲染侧按 key/value 全列。
    */
   rawInput: Record<string, unknown> | undefined;
-  /** 操作对象位置。真实链路的帧里恒为空数组，见 frames.locationsOf。 */
+  /** 操作对象位置。全部录制件里恒为空数组，见 frames.locationsOf。 */
   locations: string[];
   /** 执行结果全文（含 Command / Output / Exit Code），来自 content[0].content.text 或 rawOutput。 */
   resultText: string | undefined;
@@ -129,7 +129,7 @@ function noteUnrecognized(turn: TurnAggregate, label: string): void {
  *
  * 这是全工程唯一的帧解释点：后端拉历史用它、前端渲染在途流用它、mock 回放也用它。
  * 只存聚合结果、不存原始帧——实测 901 帧 / 191 秒 ⇒ 平均约 4.7 帧/s，
- * 最密的 1 秒里有 15 帧（`server/test/reduce.test.ts` 钉住这两个数），
+ * 最密的 1 秒里有 15 帧（`server-node/test/reduce.test.ts` 钉住这两个数），
  * 存原始帧会让内存和 React 更新量都随轮次长度线性膨胀。
  */
 export function applyFrame(turn: TurnAggregate, frame: AcpFrame): void {

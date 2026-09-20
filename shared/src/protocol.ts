@@ -11,7 +11,7 @@ import type { StopReason } from './constants.js';
  * 服务端根本没有增量续传——用 SSE 等于在协议层撒谎。
  *
  * 帧一律**原样透传**（`body` 就是上游那一帧，不重塑、不改名），
- * 这样 wire 形状与样例帧同形，live 与 mock 才能共用同一个 reducer。
+ * 这样 wire 形状与录制 fixture 同形，live 与 mock 才能共用同一个 reducer。
  * 后端唯一加工的地方是错误归一化。
  */
 export type WireEvent =
@@ -21,12 +21,10 @@ export type WireEvent =
   | WireError
   | WireDone;
 
-/** 流的第一条：告诉前端这一轮的 rid 与校验码。 */
+/** 流的第一条：告诉前端这一轮的 rid。 */
 export interface WireMeta {
   type: 'meta';
   rid: string;
-  /** 注入到 prompt 末尾的校验码，前端用它判断回答归属。 */
-  marker: string;
   sessionId: string;
   mock: boolean;
   startedAt: number;

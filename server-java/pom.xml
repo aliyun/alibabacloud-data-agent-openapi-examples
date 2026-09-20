@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.5</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.das</groupId>
+  <artifactId>das-server-java</artifactId>
+  <version>0.1.0</version>
+  <name>data-agent-openapi-demo · Java server</name>
+  <description>DataWorks DataAgent OpenAPI 示例工程 · Java server 实现（与 Node server 同一 HTTP/NDJSON 契约）</description>
+
+  <properties>
+    <java.version>17</java.version>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <!-- DataAgent OpenAPI 的 Java SDK（非流式接口走它；prompt/load 的 SSE 走自实现 ACS3 签名 HTTP） -->
+    <dependency>
+      <groupId>com.aliyun</groupId>
+      <artifactId>dataworks_public20240518</artifactId>
+      <version>9.8.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!-- 单测一律 MOCK=1：AppConfig 缺凭证会 System.exit，
+               测试进程进不来；MOCK 模式下 LiveClient 不构造，不需要凭证。 -->
+          <environmentVariables>
+            <MOCK>1</MOCK>
+          </environmentVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

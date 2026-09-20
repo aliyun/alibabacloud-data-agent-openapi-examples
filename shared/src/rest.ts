@@ -157,9 +157,9 @@ export type SessionMode = 'yolo' | 'default';
  * 两种交互的回覆载荷（实测）：
  *  · ask_user_question（agent 提问）→ `answers: {'0': '<选项label>'}` **加**
  *    `outcome.optionId = options 里 kind==='allow_once' 的那个`（Web Shell 同款，两者一起发）；
- *    【LIVE 09-17】**缺 optionId 会被上游 400 拒收（参数不匹配）**——严格环境强制
- *    执行完整契约；宽松环境的旧版本宽容地接受了裸 selected（以 proceed_once
- *    解除阻塞，但 agent 收不到答案），两种行为不一致，按严格版对齐。
+ *    【LIVE 09-17 金融云】**缺 optionId 会被上游 400 拒收（参数不匹配）**——金融云强制
+ *    执行完整契约；北京预发 09-17 的旧版本宽容地接受了裸 selected（以 proceed_once
+ *    解除阻塞，但 agent 收不到答案），两种行为不一致，按金融云的严格版对齐。
  *    options 里 kind==='reject_once'|'reject_always' 的选项是"取消本次交互"的正路。
  *  · 工具授权 → `outcome: {optionId: '<proceed_once|proceed_always|cancel|…>'}`。
  */

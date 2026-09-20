@@ -1,0 +1,509 @@
+import { randomUUID } from 'node:crypto';
+
+import type { FastifyInstance, FastifyReply } from 'fastify';
+
+import { STREAM_HARD_LIMIT_MS, type AcpFrame } from '@das/shared';
+
+import type { AppConfig } from '../config.js';
+import { liveCancel, liveCreateSession, liveLoadFrames, type LiveContext } from '../live.js';
+import { findScenario, mockCreateSession, readFixtureFrames } from '../mock/fixtures.js';
+import { toApiError } from '../normalize.js';
+import type { SdkClient } from '../sdk.js';
+import { promptCancelledEvent } from './events.js';
+import { SessionRegistry, WORKSPACE_CWD, type SessionRecord } from './registry.js';
+import { admitPrompt, type PromptDeps } from './runner.js';
+import { streamSse } from './sse.js';
+import { historyFramesToEvents } from './translate.js';
+
+/**
+ * daemon 兼容层：把 @qwen-code/web-shell 说的话翻译成 data agent OpenAPI 的 8 个上游调用。
+ *
+ * 挂载在 `/d` 前缀下——DaemonClient 是 `baseUrl + path` 字符串拼接，所以前端把
+ * baseUrl 指到 `<origin>/d` 即可，与现有 `/api/*`、SPA 回退互不干扰。
+ *
+ * 实现面（对齐 qwen-code 官方契约 + sdk 校验器）：
+ *  · capabilities / standalone session-options（两个 feature 标签是 standalone 模式的启动门）
+ *  · standalone 会话 CRUD（创建走 alias 映射——客户端强制回显自带的 sessionId，而上游自生成 id）
+ *  · load/resume（历史帧过滤后灌 journal，回放放 compactedReplay / liveJournal）
+ *  · prompt 202 + SSE events（Last-Event-ID 续传）+ cancel / heartbeat / transcript
+ *  · permission 一律 404（上游没有 Respond 通道，永远不会出现待批准请求）
+ *  · 未知端点 404 并**记日志**——那是 OPENAPI-GAPS.md 的证据来源
+ */
+export async function registerDaemonRoutes(
+  app: FastifyInstance,
+  cfg: AppConfig,
+  client: SdkClient | undefined,
+): Promise<void> {
+  const live: LiveContext | undefined = client ? { client, cfg, log: app.log } : undefined;
+  const registry = new SessionRegistry();
+  /** 进程级事件纪元：重启即变；客户端凭它判断游标属于"上一个进程"并触发 resync。 */
+  const epoch = randomUUID();
+  const promptDeps: PromptDeps = { cfg, live, log: app.log };
+  /** 当前活跃 SSE 连接数（daemon/status 的 transport.restSseActive）。 */
+  let sseActive = 0;
+
+  /**
+   * 解析会话：alias 与 real id 都认。LIVE 下未知 id 也放行（深链/重启后直接发话，
+   * 存在性交给上游判）；MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
+   */
+  function resolveSession(id: string): SessionRecord | undefined {
+    const known = registry.resolve(id);
+    if (known) return known;
+    if (live) return registry.ensure(id);
+    return findScenario(id) ? registry.ensure(id) : undefined;
+  }
+
+  function notFound(reply: FastifyReply, id: string): unknown {
+    return reply.code(404).send({
+      error: `没有这个会话：${id}`,
+      code: 'standalone_session_not_found',
+    });
+  }
+
+  await app.register(
+    async (d) => {
+      // ---- 发现 ----
+
+      d.get('/health', async () => ({ status: 'ok' }));
+
+      d.get('/capabilities', async () => ({
+        v: 1,
+        mode: 'standalone',
+        features: ['standalone_sessions_v1', 'standalone_session_options_v1'],
+        modelServices: ['data-agent'],
+        workspaces: [],
+        policy: {},
+        // webshell 按这个间隔轮询会话目录 live-state；每次轮询在 LIVE 下都是一次
+        // 真实 ListAgentSessions（约 0.4s、上游无增量游标）——30s 是负载与新鲜度的折中
+        sessionLiveStatePollIntervalMs: 30_000,
+      }));
+
+      /**
+       * daemon 状态报告（webshell 的「Daemon 状态」面板）。
+       *
+       * 全部字段是**本地真实状态**（不依赖上游），形状对齐 sdk 的 DaemonStatusReport：
+       * 之前 404 会让面板显示"连接状态：错误"，像是坏了一样——其实只是没实现。
+       * journal 上限与 promptDeadline 对齐本仓实测常量，让面板显示的是真约束。
+       */
+      d.get<{ Querystring: { detail?: string } }>('/daemon/status', async (request) => {
+        const detail = request.query?.detail === 'full' ? 'full' : 'summary';
+        const stats = registry.stats();
+        return {
+          v: 1,
+          detail,
+          generatedAt: new Date().toISOString(),
+          status: 'ok',
+          issues: [],
+          daemon: {
+            pid: process.pid,
+            uptimeMs: Math.round(process.uptime() * 1000),
+            mode: 'standalone',
+            workspaceCwd: WORKSPACE_CWD,
+          },
+          security: {
+            tokenConfigured: false,
+            requireAuth: false,
+            loopbackBind: cfg.serverHost === '127.0.0.1',
+            allowOriginConfigured: cfg.corsOrigin.length > 0,
+            allowOriginMode: cfg.corsOrigin.join(','),
+            sessionShellCommandEnabled: false,
+          },
+          limits: {
+            maxSessions: null,
+            maxTotalSessions: null,
+            // 上游在途锁：同一会话同时只能一轮（session_concurrent_operation_in_progress）
+            maxPendingPromptsPerSession: 1,
+            listenerMaxConnections: null,
+            eventRingSize: 20_000,
+            promptDeadlineMs: STREAM_HARD_LIMIT_MS,
+            writerIdleTimeoutMs: null,
+            channelIdleTimeoutMs: 0,
+            sessionIdleTimeoutMs: 0,
+            acpConnectionCap: null,
+            compactedReplayMaxBytes: 0,
+            maxJournalEvents: 20_000,
+            maxJournalBytes: 0,
+          },
+          capabilities: {
+            protocolVersions: { current: '1', supported: ['1'] },
+            features: ['standalone_sessions_v1', 'standalone_session_options_v1'],
+          },
+          runtime: {
+            sessions: { active: stats.sessions },
+            permissions: { pending: 0, policy: 'upstream-none' },
+            channel: { live: false },
+            channelWorker: { enabled: false, state: 'disabled', channels: [] },
+            // 状态面板无条件读 process.rss / heapUsed（内存行）
+            process: {
+              rss: process.memoryUsage().rss,
+              heapUsed: process.memoryUsage().heapUsed,
+            },
+            transport: {
+              restSseActive: sseActive,
+              acp: {
+                enabled: false,
+                connections: 0,
+                connectionStreams: 0,
+                sessionStreams: 0,
+                sseStreams: 0,
+                wsStreams: 0,
+                pendingClientRequests: 0,
+              },
+            },
+            rateLimit: { enabled: false, rejectedSinceStart: {} },
+          },
+        };
+      });
+
+      d.get('/standalone/session-options', async () => ({
+        v: 1,
+        initialized: true,
+        providers: [
+          {
+            kind: 'model_provider',
+            status: 'ok',
+            authType: 'none',
+            current: true,
+            models: [
+              {
+                modelId: 'data-agent',
+                baseModelId: 'data-agent',
+                name: 'DataWorks Data Agent',
+                isCurrent: true,
+                isRuntime: false,
+              },
+            ],
+          },
+        ],
+        errors: [],
+      }));
+
+      // ---- standalone 会话目录 ----
+
+      d.get<{ Querystring: { archiveState?: string; size?: string; cursor?: string } }>(
+        '/standalone/sessions',
+        async (request) => {
+          if (request.query?.archiveState === 'archived') {
+            return { sessions: registry.archivedSummaries() };
+          }
+          return { sessions: await registry.listSummaries(cfg, live, app.log) };
+        },
+      );
+
+      d.post<{ Body: { sessionId?: unknown; modelServiceId?: unknown; approvalMode?: unknown } }>(
+        '/standalone/sessions',
+        async (request, reply) => {
+          const requested = typeof request.body?.sessionId === 'string' ? request.body.sessionId : undefined;
+          let realId: string;
+          if (live) {
+            const created = await liveCreateSession(live);
+            if (!created.ok) {
+              return reply.code(502).send({ error: created.error.message, code: 'create_failed' });
+            }
+            realId = created.result.sessionId;
+          } else {
+            realId = mockCreateSession('新建会话').sessionId;
+          }
+          const record = requested ? registry.link(requested, realId) : registry.ensure(realId);
+          const clientFacingId = requested ?? realId;
+          app.log.info({ clientFacingId, realId, mock: !live }, 'daemon 兼容层新建会话（alias 已登记）');
+          return standaloneSessionBody(record, clientFacingId);
+        },
+      );
+
+      d.get<{ Params: { id: string } }>('/standalone/sessions/:id', async (request, reply) => {
+        const record = resolveSession(request.params.id);
+        if (!record || record.deleted) return notFound(reply, request.params.id);
+        return registry.summaryFor(record, request.params.id);
+      });
+
+      d.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
+        '/standalone/sessions/:id/load',
+        async (request, reply) => loadSession(request.params.id, 'load', reply),
+      );
+
+      d.post<{ Params: { id: string }; Body: Record<string, unknown> }>(
+        '/standalone/sessions/:id/resume',
+        async (request, reply) => loadSession(request.params.id, 'resume', reply),
+      );
+
+      d.patch<{ Params: { id: string }; Body: { displayName?: unknown } }>(
+        '/standalone/sessions/:id/metadata',
+        async (request, reply) => renameSession(request.params.id, request.body?.displayName, reply),
+      );
+
+      d.post<{ Body: { sessionIds?: unknown } }>('/standalone/sessions/archive', async (request) =>
+        batchMutate('archive', request.body?.sessionIds),
+      );
+      d.post<{ Body: { sessionIds?: unknown } }>('/standalone/sessions/unarchive', async (request) =>
+        batchMutate('unarchive', request.body?.sessionIds),
+      );
+      d.post<{ Body: { sessionIds?: unknown } }>('/standalone/sessions/delete', async (request) =>
+        batchMutate('delete', request.body?.sessionIds),
+      );
+
+      // ---- 会话内：prompt / 事件流 / 生命周期 ----
+
+      d.post<{ Params: { id: string }; Body: { prompt?: unknown } }>('/session/:id/prompt', async (request, reply) => {
+        const id = request.params.id;
+        const clientId = headerString(request.headers['x-qwen-client-id']);
+        const record = resolveSession(id);
+        if (!record) return notFound(reply, id);
+        const admission = admitPrompt(promptDeps, record, id, request.body?.prompt, clientId);
+        if (!admission.ok) {
+          return reply.code(admission.status).send({ error: admission.error, code: admission.code });
+        }
+        // 202 严格契约（additionalProperties:false）：只有这三个键
+        return reply.code(202).send({
+          promptId: admission.promptId,
+          lastEventId: admission.lastEventId,
+          eventEpoch: epoch,
+        });
+      });
+
+      d.post<{ Params: { id: string } }>('/session/:id/cancel', async (request, reply) => {
+        const id = request.params.id;
+        const record = resolveSession(id);
+        if (!record) return notFound(reply, id);
+        if (live) await liveCancel(live, record.realId);
+        const activePromptId = record.journal.activePromptId;
+        if (activePromptId !== undefined) {
+          // 上游流随后会以 stopReason=cancelled 终态收场 → turn_complete(cancelled) 也会到
+          record.journal.append(promptCancelledEvent(id, activePromptId));
+        }
+        return reply.code(204).send();
+      });
+
+      d.get<{
+        Params: { id: string };
+        Querystring: { snapshot?: string; maxQueued?: string; connectReason?: string; previousStreamId?: string };
+      }>('/session/:id/events', async (request, reply) => {
+        const id = request.params.id;
+        const record = resolveSession(id);
+        if (!record) return notFound(reply, id);
+        const lastRaw = headerString(request.headers['last-event-id']);
+        const parsed = lastRaw !== undefined ? Number.parseInt(lastRaw, 10) : Number.NaN;
+        const snapshot = request.query?.snapshot === '1' || request.query?.snapshot === 'true';
+        sseActive += 1;
+        try {
+          await streamSse(reply, {
+            journal: record.journal,
+            sessionId: id,
+            epoch,
+            streamId: randomUUID(),
+            lastEventId: Number.isFinite(parsed) ? parsed : undefined,
+            snapshot,
+          });
+        } finally {
+          sseActive -= 1;
+        }
+        return reply;
+      });
+
+      d.post<{ Params: { id: string } }>('/session/:id/heartbeat', async (request, reply) => {
+        const record = resolveSession(request.params.id);
+        if (!record) return notFound(reply, request.params.id);
+        // 上游没有心跳接口；会话亲和是临时的（qwen-daemon 绑定闲置即失效），
+        // 这里只回 204 维持客户端记账，不做任何上游调用。
+        return reply.code(204).send();
+      });
+
+      d.get<{ Params: { id: string }; Querystring: { limit?: string; beforeRecordId?: string } }>(
+        '/session/:id/transcript',
+        async (request, reply) => {
+          const id = request.params.id;
+          const record = resolveSession(id);
+          if (!record) return notFound(reply, id);
+          // 上游 load 无增量游标（BeginLogOffset 是死参数），整份 journal 即全部历史
+          return {
+            v: 1,
+            sessionId: id,
+            events: record.journal.all().map((entry) => entry.event),
+            hasMore: false,
+          };
+        },
+      );
+
+      d.get<{ Params: { id: string } }>('/session/:id/status', async (request, reply) => {
+        const id = request.params.id;
+        const record = resolveSession(id);
+        if (!record) return notFound(reply, id);
+        return {
+          sessionId: id,
+          attached: false,
+          hasActivePrompt: record.journal.activePrompt,
+          clientCount: 0,
+        };
+      });
+
+      d.patch<{ Params: { id: string }; Body: { displayName?: unknown } }>(
+        '/session/:id/metadata',
+        async (request, reply) => renameSession(request.params.id, request.body?.displayName, reply),
+      );
+
+      d.delete<{ Params: { id: string } }>('/session/:id', async (request, reply) => {
+        const record = resolveSession(request.params.id);
+        if (!record) return notFound(reply, request.params.id);
+        // 上游没有删除接口：本地标记隐藏（journal 保留，深链重开还能看到），重启后恢复
+        record.deleted = true;
+        return reply.code(204).send();
+      });
+
+      // ---- permission：上游没有 Respond 通道 ----
+
+      d.post<{ Params: { id: string; requestId: string } }>(
+        '/session/:id/permission/:requestId',
+        async (_request, reply) =>
+          reply.code(404).send({
+            error: '上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求',
+            code: 'permission_not_found',
+          }),
+      );
+
+      d.post<{ Params: { requestId: string } }>('/permission/:requestId', async (_request, reply) =>
+        reply.code(404).send({
+          error: '上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求',
+          code: 'permission_not_found',
+        }),
+      );
+
+      // ---- 降级端点 ----
+
+      d.get('/workspace/tools', async () => ({ tools: [] }));
+
+      /**
+       * 兜底 404：**记日志**。webshell 打到这里的就是 daemon 有、而我们（因为上游
+       * OpenAPI 缺接口或尚未实现）给不了的端点——这份日志是 OPENAPI-GAPS.md 的证据链。
+       */
+      d.setNotFoundHandler((request, reply) => {
+        app.log.info({ method: request.method, url: request.url }, 'daemon-compat 未实现端点（缺口候选）');
+        return reply
+          .code(404)
+          .send({ error: `daemon 兼容层未实现该端点：${request.method} ${request.url}`, code: 'not_implemented' });
+      });
+
+      // ---- 内部实现 ----
+
+      async function loadSession(id: string, mode: 'load' | 'resume', reply: FastifyReply): Promise<unknown> {
+        const record = resolveSession(id);
+        if (!record || record.deleted) return notFound(reply, id);
+
+        if (mode === 'load') {
+          let frames: AcpFrame[] = [];
+          if (live) {
+            try {
+              frames = await liveLoadFrames(live, record.realId);
+            } catch (err) {
+              const api = toApiError(err, 'LoadAgentSession');
+              return reply.code(api.kind === 'transport' ? 502 : 404).send({
+                error: api.message,
+                code: 'standalone_session_not_found',
+              });
+            }
+          } else {
+            const scenario = findScenario(record.realId);
+            frames = scenario?.historyFixture ? readFixtureFrames(scenario.historyFixture) : [];
+          }
+          // 过滤 + 去重判据与 reduceHistory 同源（rid-less 污染 / load 伪轮次 /
+          // bridge-echo 重复回显都不进 journal）
+          const events = historyFramesToEvents(frames, id);
+          record.journal.seed(events);
+        }
+
+        return {
+          ...standaloneSessionBody(record, id),
+          state: {
+            models: [
+              {
+                modelId: 'data-agent',
+                baseModelId: 'data-agent',
+                name: 'DataWorks Data Agent',
+                isCurrent: true,
+                isRuntime: false,
+              },
+            ],
+            modes: {},
+            configOptions: null,
+          },
+          compactedReplay: record.journal.compacted().map((entry) => entry.event),
+          liveJournal: record.journal.live().map((entry) => entry.event),
+          lastEventId: record.journal.lastId(),
+          eventEpoch: epoch,
+          historyHasMore: false,
+        };
+      }
+
+      async function renameSession(id: string, displayName: unknown, reply: FastifyReply): Promise<unknown> {
+        const record = resolveSession(id);
+        if (!record) return notFound(reply, id);
+        const name = typeof displayName === 'string' ? displayName.trim() : '';
+        if (!name) {
+          return reply.code(400).send({ error: 'displayName 不能为空', code: 'invalid_metadata' });
+        }
+        // 进程级：上游没有改名接口（SessionTitle 恒为首条 prompt 原文），重启即失
+        record.displayName = name;
+        return { sessionId: id, displayName: name };
+      }
+
+      function batchMutate(
+        action: 'archive' | 'unarchive' | 'delete',
+        rawIds: unknown,
+      ): Record<string, unknown> {
+        const ids = (Array.isArray(rawIds) ? rawIds : []).filter((v): v is string => typeof v === 'string');
+        const done: string[] = [];
+        const skipped: string[] = [];
+        const notFoundIds: string[] = [];
+        const errors: Array<{ sessionId: string; code: string; message: string }> = [];
+        for (const raw of ids) {
+          const id = raw.toLowerCase();
+          const record = registry.resolve(id);
+          if (!record) {
+            notFoundIds.push(id);
+            continue;
+          }
+          if (action === 'archive') {
+            if (record.archived) skipped.push(id);
+            else {
+              record.archived = true;
+              done.push(id);
+            }
+          } else if (action === 'unarchive') {
+            if (record.archived) {
+              record.archived = false;
+              done.push(id);
+            } else skipped.push(id);
+          } else {
+            // 上游没有删除接口：本地隐藏标记（journal 保留），重启后恢复可见
+            record.deleted = true;
+            done.push(id);
+          }
+        }
+        if (action === 'archive') return { archived: done, alreadyArchived: skipped, notFound: notFoundIds, errors };
+        if (action === 'unarchive') return { unarchived: done, alreadyActive: skipped, notFound: notFoundIds, errors };
+        return { removed: done, notFound: notFoundIds, errors, fileCleanupPending: [] };
+      }
+
+      function standaloneSessionBody(record: SessionRecord, clientFacingId: string): Record<string, unknown> {
+        return {
+          sessionId: clientFacingId,
+          // daemon 分配的客户端身份：客户端随 prompt 以 X-Qwen-Client-Id 带回，
+          // 我们据此盖 originatorClientId（suppressOwnUserEcho 的匹配键）
+          clientId: record.clientId,
+          workspaceCwd: WORKSPACE_CWD,
+          attached: false,
+          createdAt: new Date(record.createdAt).toISOString(),
+          sourceType: 'standalone',
+          context: { kind: 'standalone' },
+          projectlessOutputDirectory: `${WORKSPACE_CWD}/out/${clientFacingId}`,
+          workingDirectory: { state: 'ready' },
+        };
+      }
+    },
+    { prefix: '/d' },
+  );
+}
+
+function headerString(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) return value[0];
+  return value;
+}

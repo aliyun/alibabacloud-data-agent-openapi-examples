@@ -31,7 +31,7 @@ export function partitionByRid(frames: Iterable<AcpFrame>): RidPartition {
     if (!rid) {
       // 键在，但值不是非空字符串（非字符串 / 空串）。
       // 空串当分组键会凭空多出一个"rid 为空的幽灵轮次"，所以一并归 ridLess。
-      // 真实链路里这种形态命中 0 行（一次 977 帧的实测返回中 900 行是键压根不存在），
+      // 真实录制件里这种形态命中 0 行（977 行中 900 行是键压根不存在），
       // 这里是防御性处理：上游改了序列化方式时，退化可见而不是静默串轮。
       ridLess.push(frame);
       continue;

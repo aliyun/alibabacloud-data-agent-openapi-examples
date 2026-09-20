@@ -176,17 +176,14 @@ export const ERROR_KINDS = [
 export type ErrorKind = (typeof ERROR_KINDS)[number];
 
 // ---------------------------------------------------------------------------
-// marker（回答归属校验）
+// marker（回答归属校验 · 已退役，2026-09-20）
 // ---------------------------------------------------------------------------
 
 /**
- * marker 前缀。
- *
- * 服务端存在跨会话串答案的历史问题（实测 5 个会话并发时隔离率只有 1/5），
- * 所以每条 prompt 注入一个唯一 marker，并校验回答里确实含它——
- * 这是唯一能自证"这段回答属于我这一轮"的手段。
+ * marker 前缀。机制已退役：不再注入、不做归属验证；
+ * 只保留给历史清洗助手 `stripMarkerInstruction` 用来识别 legacy 录制内容。
  */
 export const MARKER_PREFIX = 'DAS';
 
 /** 会话归属标记的环境变量默认值。 */
-export const DEFAULT_SESSION_SOURCE = 'data-agent-openapi-example';
+export const DEFAULT_SESSION_SOURCE = 'data-agent-openapi-demo';

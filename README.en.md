@@ -1,287 +1,106 @@
-# DataAgent OpenAPI Examples
+# DataAgent OpenAPI — Multi-Language Examples
 
-<a id="top"></a>
-[![CI](https://github.com/aliyun/alibabacloud-data-agent-openapi-examples/actions/workflows/ci.yml/badge.svg)](https://github.com/aliyun/alibabacloud-data-agent-openapi-examples/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A520.19-brightgreen)](package.json)
-[![Tests](https://img.shields.io/badge/tests-389%20passing-brightgreen)](docs/CONSTRAINTS.md)
+Experience DataWorks DataAgent in the web-shell: create a session, ask questions, watch the step-by-step reply, stop the run, and review history. The project ships **three independent backend implementations — Node.js, Python, and Java** — all behind the same web frontend.
 
-**Best-practice examples for the DataWorks DataAgent OpenAPI.** Full-chain coverage of
-9 OpenAPIs — session management, SSE streaming, human-in-the-loop replies (tool approvals
-and questions), cancellation and history — with **verified behaviors and best practices
-pinned by code and tests**: business errors carried over HTTP 200 with a business code,
-`SessionStatus` always `RELEASED`, artifact APIs returning empty lists, a ~220s streaming
-duration boundary, history pulls that block during running turns. **Every item has code
-attribution and test coverage**, and errors are surfaced honestly instead of a vague
-"task failed, please retry". [中文文档](README.md)
+You run exactly one backend and one frontend at a time. Picking a language changes nothing about how the pages work, and you never need to install all three runtimes.
 
-A few of these differ from what the docs would lead you to expect — and they matter most
-for integration: `SessionStatus` stays `RELEASED` (judge turn state from the stream), an
-empty `CreateAgentSession` response is indistinguishable from an authorization rejection,
-the `SessionTitle` filter is silently ignored, and human-in-the-loop replies must carry an
-`optionId`. The full list is under "Best-practice highlights" below.
+> All three backends are fully wired to the web-shell (sessions, streaming replies, stop, history). Each carries parity assertions spanning sessions / streaming / in-flight locking / lifecycle semantics, and all three implementations were verified end-to-end against a live gateway. The internal container deployment stays on Node.js.
 
-Covers 9 OpenAPIs: `ListAgents`, `CreateAgentSession`, `ListAgentSessions`,
-`PromptAgentSession` (SSE), `LoadAgentSession` (SSE), `GetAgentSessionTokenUsage`,
-`ListAgentSessionArtifacts`, `CancelAgentSession`, and `ReplyAgentSession` (the
-human-in-the-loop reply channel — see [§6.1](#61-human-in-the-loop-reply-replyagentsession-9th-api)).
+## Quick Start
 
-> 📖 中文文档：[README.md](README.md)。The deep-dive docs under `docs/` are currently
-> Chinese-only; the main flow is fully documented below.
+Every backend needs **Node.js 20.19+ (or 22.12+)** and **npm 10+** to run the frontend. Commands below work on macOS, Linux, and Windows WSL; on Windows, use a WSL terminal.
 
-## Quick start
-
-The only prerequisite is **Node ≥ 20.19** (pinned in `package.json` `engines`; npm ≥ 10
-comes with Node). Three ways to install:
-
-- [`fnm`](https://github.com/Schniz/fnm): `fnm install 22 && fnm use 22`
-- [`nvm`](https://github.com/nvm-sh/nvm): `nvm install 22 && nvm use 22`
-- Official installer: <https://nodejs.org/>
+Install shared dependencies at the repository root:
 
 ```bash
-node -v             # expect v20.19+
-npm install
+npm ci
 ```
 
-Against the real upstream (the main path):
+Pick a backend:
 
-1. Create a RAM user for the AccessKey — **never use the primary account** (step-by-step in §3)
-2. `cp .env.example .env`, fill in AK/SK; set `DATAAGENT_REGION_ID` if your DataWorks
-   instance is not in `cn-hangzhou`
-3. `npm run dev`, open <http://localhost:5173> (backend on 3000)
+| Backend | Extra setup | Start frontend + backend | Web support |
+| --- | --- | --- | --- |
+| Node.js | none | `MOCK=1 npm start -- node` | wired |
+| Python | Python 3.11+; install per the [Python notes](server-python/README.md) | `MOCK=1 npm start -- python` | wired |
+| Java | JDK 17+, Maven 3.6.3+; see the [Java notes](server-java/README.md) | `MOCK=1 npm start -- java` | wired |
 
-Before sending prompts, run `npm run check` (§6) — go to the UI only after all three steps pass.
+Open the URL printed in the terminal — default <http://127.0.0.1:5173>. Pick a sample session, send a question, and watch the reply stream in. `MOCK=1` replays sample data without calling any cloud service; answers don't regenerate based on what you type.
 
-No cloud resources yet? `MOCK=1 npm run dev` boots the full stack with zero config (§ MOCK mode).
+The first Java start downloads dependencies and builds, which can take a few minutes — wait for the web URL before opening the browser. `Ctrl+C` stops both processes; to switch languages, stop, then run the other command.
 
-> **Verification boundary in one line**: the parsing layer and error classification are
-> covered by unit tests (`npm test`: 33 files / 389 tests, §5); the full MOCK flow can be
-> accepted in the browser (§ MOCK mode); the real chain has been verified end-to-end once
-> (`[LIVE 09-16]`). Deeper caveats live in [docs/FAQ.md](docs/FAQ.md) (Chinese).
+`npm start` defaults to Node.js; `npm run dev -- python` is equivalent to `npm start -- python`; `bash scripts/dev.sh java` uses the same entry point. Backend-only startup is covered in each language's notes.
 
----
+## Use Your Own DataAgent
 
-## 1. Prerequisites
+You need an Alibaba Cloud account with DataWorks enabled, a running DataAgent instance, and an AccessKey for a RAM user with the right permissions. RAM-user credentials are recommended; if the account has no running instance, prepare a Serverless resource group ID.
 
-- **Node ≥ 20.19** (pinned via `engines`). npm ≥ 10 ships with it.
-- An Alibaba Cloud account with DataWorks enabled and **a running instance**
-  (no instance yet? preview with MOCK mode first).
+1. Run `cp .env.example .env` at the repository root.
+2. Edit `.env` with the values below.
+3. Run `npm start -- node`, `npm start -- python`, or `npm start -- java`.
+4. Open the page, create a session, and ask.
 
-Check:
+| Setting | How to fill in |
+| --- | --- |
+| `MOCK` | `0` for real use; `1` for credential-free replay |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID` | RAM user's AccessKey ID |
+| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | matching AccessKey Secret |
+| `DATAAGENT_REGION_ID` | region of your instance; default `cn-hangzhou` |
+| `RESOURCE_GROUP_ID` | Serverless resource group ID when the account has no instance |
+| `END_POINT` | usually empty; fill a gateway domain when needed (no `https://`) |
+| `DATAAGENT_AGENT_NAME` | leave as `dataworks_data_agent` |
+| `SESSION_SOURCE` | session source tag; changing it hides sessions with other sources |
+
+Credentials are used **only by backends**. Never put them in `VITE_*` variables, and never commit `.env`. `MOCK=1` on the command line overrides the file; remove it for real use.
+
+## What You Can Do in the Page
+
+Against any backend (Node.js / Python / Java), you can create or open sessions, send text questions, and watch streaming replies with thought traces and tool call results. Click stop to cancel. Permission-grant and ask-user-question replies aren't wired through yet — don't use tasks that require human confirmation to verify the full flow.
+
+History comes from the cloud; save important results promptly. Rename / archive / delete marks are stored only in the running backend process and may revert after restart. Token-usage queries are backend capabilities; the page doesn't promise a full usage dashboard. Context usage and parts of web-shell functionality may be unavailable where backends lack corresponding capabilities.
+
+Real tasks may read or modify data you have permissions for. Try small, easy-to-verify questions first, then run the real ones.
+
+## Ports and Environment Profiles
+
+The backend defaults to `3000`, the page to `5173`. The one-command starter wires the page to the backend it just launched:
 
 ```bash
-node -v   # expect v20.19+
-npm -v
+PORT=3100 WEB_PORT=5180 npm start -- python
 ```
 
----
+If a port is taken, the starter reports an error. Stop the existing service or pick another port — it won't kill other processes for you.
 
-## 2. npm registry
-
-This project depends on `@alicloud/*` and `@darabonba/*` packages — all on the public registry.
+Create self-contained profiles per account or environment as `.env.<name>` (e.g., `.env.demo`), then:
 
 ```bash
-npm config get registry          # check where you currently point
+DAS_ENV=demo npm start -- java
 ```
 
-- Switch to the official registry: `npm config set registry https://registry.npmjs.org/`
-- One-off install without touching global config:
+The chosen file must contain full configuration; it is not merged with `.env`. A missing named file aborts startup. Process environment variables win over file values.
 
-```bash
-npm install --registry=https://registry.npmjs.org/
-```
+## FAQ
 
----
+**Page won't open / says backend disconnected?** Check the terminal process is still running and look for missing runtimes, missing credentials, or port conflicts. Use the URL printed by the starter. The one-command entry waits for backend readiness; if you start the frontend alone, you must point it at your backend yourself.
 
-## 3. Credentials: create a RAM user, never use the primary account
+**Why are demo answers unrelated to my question?** `MOCK` replays a fixed fixture. Configure a real account and restart with `MOCK=0`.
 
-1. RAM console → Identities → Users → **Create User** → check "OpenAPI Access"
-2. Attach DataWorks-related permission policies to that user
-3. Create an AccessKey, note the ID and Secret (the Secret is shown only once)
-4. Make sure DataWorks is **activated with a running instance** under the account
-5. **If the account has zero running instances, you need a Serverless resource group ID**:
-   DataWorks → Resource Groups → Serverless Resource Group → copy the ID
+**Session creation failed?** Check region, RAM permissions, and whether an instance / resource group is available. Healthy local service only proves local availability, not cloud permission or quota.
 
-This project reads these two values **only from environment variables**: it does not read
-`~/.aliyun/config.json`, does not call the `aliyun` CLI, and has no fallback path.
-(Reason: local aliyun CLI profiles are usually OAuth-mode, which the SDK credential chain
-cannot pick up — a "looks-usable but isn't" fallback is harder to debug than failing fast.)
+**Reply cut off mid-way — send again?** Don't. The cloud turn may still be running, and resending can execute your write twice. Reopen the session and check history first. Long turns can hit stream duration limits; a page reconnect does not imply the upstream turn can resume.
 
-Logs and `/api/health` only ever show `credentials: present | missing` — **never a prefix
-or masked form**.
+**Got a receipt but no answer?** Check account quota and permissions first, then load history to see whether anything landed. A bare receipt does not mean the turn ran.
 
----
+**Cancelled, but history doesn't show it?** Real-time cancel results and history aren't perfectly consistent. Absence of a terminal record in history does not prove the cancel failed.
 
-## 4. Configure `.env`
+**Old session can't continue?** The session-to-executor binding can expire. Save what's there and create a new one.
 
-```bash
-cp .env.example .env
-```
+**Are the languages identical?** All three aim at the same web-shell feature set and are fully wired; contract asserts (34×3 at the HTTP/NDJSON layer and 14×3 at the daemon layer) pass. That doesn't prove every behavior of every cloud environment is verified — outside real-link connectivity, upstream behavior leads.
 
-`.env` is git-ignored. Field-by-field notes live in `.env.example` comments; the required ones:
+## More Docs
 
-| Field | When required | Notes |
-|---|---|---|
-| `MOCK` | set `1` to skip credentials | Replays the bundled synthetic frame streams; never calls the real API |
-| `ALIBABA_CLOUD_ACCESS_KEY_ID` | required when `MOCK=0` | Use a dedicated RAM user |
-| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | required when `MOCK=0` | Never commit |
-| `DATAAGENT_REGION_ID` | defaults to `cn-hangzhou` | Region of your DataWorks instance; **must change if not in Hangzhou** |
-| `END_POINT` | for pre/internal gateways | Overrides the SDK's region→host mapping. **When empty, the SDK derives `dataworks.{region}.aliyuncs.com` (production) at client construction** — pointing at a pre-prod gateway without this silently hits production. Host only, no `https://` |
-| `RESOURCE_GROUP_ID` | required with zero running instances | The server does **not validate** it — a wrong ID still "creates" sessions |
-| `DATAAGENT_AGENT_NAME` | has default | Always `dataworks_data_agent`; don't discover via `ListAgents` (see FAQ) |
-| `SESSION_SOURCE` | has default | The sidebar lists only sessions tagged with this source |
-| `PORT` / `CORS_ORIGIN` / `VITE_API_BASE` | have defaults | Change all three together when moving ports |
+- [Node.js setup & standalone startup](server-node/README.md)
+- [Python setup & standalone startup](server-python/README.md)
+- [Java setup & standalone startup](server-java/README.md)
+- [Layout & verification commands](docs/DEVELOPMENT.md)
 
-With missing credentials and `MOCK=0`, the server **exits immediately with guidance** —
-it never boots half-configured.
-
----
-
-## 5. Run
-
-```bash
-npm install
-npm run dev
-```
-
-- Backend `http://127.0.0.1:3000` (Fastify, `tsx watch`)
-- Frontend `http://localhost:5173` (Vite)
-- Open <http://localhost:5173>
-
-**Port busy**: change `PORT` in `.env`, and keep `CORS_ORIGIN` / `VITE_API_BASE` in sync;
-frontend port lives in `web/vite.config.ts` (`server.port`).
-
-**The frontend deliberately does not use the Vite dev proxy** — it talks to the backend
-directly, with the backend allowing localhost CORS. Reason: dev proxies carry a whole
-class of buffering/timeout risks for long-lived streams; direct connection removes them
-and keeps dev/prod shapes identical. If you insist on a proxy, set `timeout: 0,
-proxyTimeout: 0` or streams longer than 5 minutes will be cut.
-
-Other commands:
-
-```bash
-npm test           # vitest (shared + server + web; frontend component tests run in jsdom)
-npm run typecheck  # tsc per workspace
-npm run build      # typecheck + vite build
-npm run check      # three-step self-check (§6)
-```
-
----
-
-## 6. Three-step self-check: `npm run check`
-
-**No HTTP, no dev server** — it builds the SDK client and calls the upstream directly, so
-it still tells you which step failed when the server cannot even boot.
-
-```bash
-npm run check            # real credentials from .env
-npm run check -- --mock  # replay synthetic samples; only proves the project is wired up
-```
-
-| Step | API | What it proves |
-|---|---|---|
-| ① | `ListAgents` | Network, AK/SK, signature. **Not listing `dataworks_data_agent` is normal** |
-| ② | `CreateAgentSession` | DataWorks activated, running instance / resource group present. Success criterion: **`Result.SessionId` non-empty** |
-| ③ | `GetAgentSessionTokenUsage` | The session actually works (~0.3s) |
-
-Output is a `step / ok / ms / requestId / detail` table + exit code. Steps are timed;
-failures don't stop later diagnostic steps.
-
-`[LIVE 09-15]` With fresh AK/SK credentials **all three steps passed** (① ~0.2s, returned
-2 chatbi agents; ② non-empty `SessionId`; ③ ~0.3s, `PromptTokens=0`). Two caveats:
-
-- **② can be flaky**: same-shaped input minutes apart — one empty response, one success.
-  Retry once before suspecting configuration.
-- **Three green steps ≠ prompts will run**: ②③ passed but `PromptAgentSession` still
-  returned zero frames. The self-check covers identity, activation and session
-  availability — not whether the upstream dispatches this turn to an executor.
-
-`--mock` explicitly says so in its output: it only proves the project is wired up and the
-samples parse — **not** that your AK/SK, region, instance or resource group are correct.
-
-### 6.1 Human-in-the-loop reply: `ReplyAgentSession` (9th API)
-
-The `PromptAgentSession` stream contains two kinds of frames that **need a human**:
-tool approvals (the agent wants to run a write operation) and `ask_user_question` (the
-agent asks a question). Without a reply, the turn stalls there.
-
-This repo implements the full loop for the 9th API:
-
-- **Mode switch at session creation**: `POST /api/sessions` with `mode` — `yolo`
-  (default: all tool approvals auto-approved) or `default` (approval-triggering tool
-  calls stop and wait). `ask_user_question` is a question, not an approval — it appears
-  in **both** modes.
-- **Reply endpoint**: `POST /api/sessions/:id/reply`, two payload shapes:
-  - Question → `{ "permissionRequestId": "...", "answers": {"0": "<option label or custom text>"} }`
-  - Tool approval → `{ "permissionRequestId": "...", "optionId": "proceed_once", "outcome": "selected" }`
-  - Cancel the interaction → `{ "permissionRequestId": "...", "outcome": "cancelled" }`
-- **Key tested constraints** (full list in [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) and
-  the `shared/src/rest.ts` comments):
-  - After a successful reply, **do not resend the prompt** — the original SSE stream is
-    still alive; subsequent frames continue on it;
-  - An ask_user_question reply **must carry optionId** (the `kind==='allow_once'` entry)
-    plus answers — missing optionId is rejected by the upstream with 400;
-  - POST is not a style choice: a reply really changes server-side execution, and GET is
-    a CORS simple request any web page could fire cross-origin.
-- UI: the interaction card in the chat stream (`InteractionCard`) replies on selection;
-  the stream continues from where it was.
-
----
-
-## Best-practice highlights
-
-The full list of 45 verified behaviors (each with code attribution) lives in
-[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) (Chinese). Ten key ones to read first:
-
-| # | Constraint | Code |
-|---|---|---|
-| 1 | Business errors always return HTTP 200; only transport faults are 5xx | `server/src/routes/rest.ts`, `shared/src/errors.ts` |
-| 3 | Must use the `*WithSSE` variants, or the whole response buffers and times out | `server/src/sdk.ts` `assertSseCapable` |
-| 5 | Auto-retry duplicates writes — must set `autoretry:false, maxAttempts:1` | `server/src/sdk.ts` `runtimeFor` |
-| 6 | `ListAgents` never lists `dataworks_data_agent`, but creating a session with it works | `server/src/live.ts` `liveListAgents` |
-| 19 | `CancelAgentSession` works: cancellation ends the stream with `stopReason=cancelled`; but the cancelled state is **not persisted** (upstream gap) | `server/src/live.ts` `liveCancel` |
-| 21 | `GetAgentSessionTokenUsage` is the only reliable meter, but **the numbers are not constants** | `server/src/selfcheck.ts` |
-| 22 | `load` blocks ~50% of the time during RUNNING turns (measured 178s/81.6s) ⇒ separate 30s readTimeout + no refetch-on-focus | `server/src/live.ts` `liveHistory` |
-| 24 | Concurrent streams may **cross answers between sessions** (3/4 crossed with 4 concurrent turns) — an upstream fan-out issue; attribute turns via injected markers | `shared/src/marker.ts`, `server/src/routes/prompt.ts` |
-| 42 | The session→daemon binding is **ephemeral**: an idle old session answers `Session is not ready` — expect "binding lost, retry/recreate" | `shared/src/errors.ts` `classifyError` |
-| 44 | An ask_user_question reply **must include optionId**, or the upstream rejects with 400 | `shared/src/rest.ts`, `web/src/components/chat/InteractionCard.tsx` |
-
----
-
-## Known limitations (full version in [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md), Chinese)
-
-Both artifact APIs always return empty (no fallback padding); history replay shrinks
-(it is not an audit archive); this project covers the synchronous-session interaction
-shape only — upstream behavior may change; trust measurements, not assumptions.
-
----
-
-## MOCK mode (optional)
-
-Preview every UI shape without credentials: `MOCK=1 npm run dev`. It replays synthetic
-sample frame streams (including demos of stream breaks, ghosted sessions, concurrent
-rejections…). Full details in [docs/MOCK.md](docs/MOCK.md) (Chinese).
-
----
-
-## Docs index
-
-| Doc | Contents |
-|---|---|
-| [docs/FAQ.md](docs/FAQ.md) | Pitfalls written as Q&A (Chinese) |
-| [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md) | All 45 tested constraints with code attribution (Chinese) |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Repo layout, backend HTTP contract, "source of truth" design (Chinese) |
-| [docs/MOCK.md](docs/MOCK.md) | MOCK mode details (Chinese) |
-| [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | Known limitations & disclaimer (Chinese) |
-
-## Contributing
-
-Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Run
-`npm run typecheck && npm test` before submitting.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE). The measurement notes describe behaviors observed at
-specific dates against a live service; they may change without notice.
+This example is meant for local hands-on by default. Before exposing it to other people, configure authentication, access control, and credential isolation yourself.

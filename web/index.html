@@ -7,28 +7,11 @@
       顶栏/底栏为刘海与 home 指示条留的 padding 就白写了。
     -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <title>DataAgent OpenAPI 样板工程</title>
+    <title>Data Agent Workbench</title>
     <!--
-      主题要在首帧之前落到 <html> 上。
-
-      state/theme.ts 的 apply() 是模块副作用，跑在 bundle 下载并执行之后——
-      暗色用户会先看到一整屏亮色再闪成暗色。这段内联脚本同步读同一个
-      localStorage 键（'das.theme'，必须与 theme.ts 一致），在解析 CSS 之前就把
-      类名与 color-scheme 写好。
-
-      刻意不在这里读 prefers-color-scheme：theme.ts 的策略是"只认用户显式选择、
-      默认亮色"，两处判据不一致会出现"脚本判暗、React 判亮"的一帧反向闪烁。
+      主题由 web-shell 自管（themeContext，默认暗色）。旧 UI 的 das.theme 内联脚本
+      已随三栏 UI 一起移除——残留的 localStorage 键不再有任何效果。
     -->
-    <script>
-      try {
-        if (localStorage.getItem('das.theme') === 'dark') {
-          document.documentElement.classList.add('dark');
-          document.documentElement.style.colorScheme = 'dark';
-        }
-      } catch {
-        // localStorage 不可用（隐私模式）：保持亮色，与 theme.ts 的兜底一致
-      }
-    </script>
   </head>
   <body>
     <div id="root"></div>

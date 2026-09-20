@@ -5,8 +5,14 @@ coverage/
 .vite/
 *.tsbuildinfo
 
+# Maven / Python 构建产物与虚拟环境（不入库）
+target/
+.venv/
+__pycache__/
+*.pyc
+
 # 凭证：任何情况下都不要提交
-# .env.* 一并忽略，覆盖多环境的 .env.<name>（如 .env.pre，里面有真 AK/SK）；
+# .env.* 一并忽略，覆盖多环境的 .env.<name>（如 .env.beijing-pre，里面有真 AK/SK）；
 # 只把不含凭证的样例 .env.example 放回版本控制。
 .env
 .env.*
@@ -22,3 +28,7 @@ npm-debug.log*
 .qwen
 
 .agents
+# alidocker 构建产物（aone-build 生成，不入库）。
+# app.env 占位文件（纯注释、无真实值）要入库——它是平台未注入 antx.properties 时
+# Dockerfile COPY 的兜底；含密钥的 app.env 只在构建工作区生成，不会回到这个目录。
+APP-META/docker-config/context/

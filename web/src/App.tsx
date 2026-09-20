@@ -1,143 +1,154 @@
-import { useEffect, useRef, type CSSProperties } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
-import { ChatPanel } from '@/components/chat/ChatPanel';
+import { WebShellWithProviders, type WebShellTheme } from '@qwen-code/web-shell';
+
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { Drawer } from '@/components/layout/Drawer';
-import { ShortcutHelp } from '@/components/layout/ShortcutHelp';
-import { Splitter } from '@/components/layout/Splitter';
-import { TopBar } from '@/components/layout/TopBar';
-import { SessionList } from '@/components/left/SessionList';
-import { ArtifactPanel } from '@/components/right/ArtifactPanel';
-import { Toaster } from '@/components/ui/Toaster';
-import { useDeepLink } from '@/hooks/useDeepLink';
-import { useGlobalShortcuts } from '@/hooks/useGlobalShortcuts';
-import { useSelectedSession } from '@/state/session';
-import { overlayStore, useHelpOpen } from '@/state/overlays';
-import {
-  LEFT_DEFAULT,
-  LEFT_MAX,
-  LEFT_MIN,
-  RIGHT_DEFAULT,
-  RIGHT_MAX,
-  RIGHT_MIN,
-  layoutStore,
-  useLayout,
-} from '@/state/layout';
 
 /**
- * 外壳：顶栏 + 工作区。工作区（三栏）是 flex-1，直接占满到视口最底部——
- * 刻意没有底部状态栏：流式相位/耗时/帧数在顶栏徽章与每轮尾部已有，常驻底栏
- * 只是多占一行并堆出一句空闲时的"未在收流"。
+ * daemon 兼容层挂在后端 `/d` 前缀（@qwen-code/sdk 的 DaemonClient 是
+ * baseUrl + path 字符串拼接，所以带路径前缀的 baseUrl 天然可用）。
  *
- * 工作区有两种形态，由视口宽度决定（`layoutStore` 里的 `narrow`，断点与 index.css
- * 的 `lg` 一致）：
- *  · 宽屏 —— 五列栅格：左栏 / 分隔条 / 中栏 / 分隔条 / 右栏，栏宽可拖；
- *  · 窄屏 —— 单列只放中栏，左右两栏变成浮层抽屉。
- * 窄屏保留三列是行不通的：280+360 就已经吃掉 640px，正文会被挤成一条缝，
- * 实测 511px 宽的窗口就是这样横向溢出的。
+ *  · dev：VITE_API_BASE=http://127.0.0.1:3000（仓库根 .env）→ 直连后端，CORS 已放行；
+ *  · 生产：VITE_API_BASE 为空串（构建期注入，bundle 不烘入本地地址，同旧 UI 的约定）
+ *    → 同源 origin + /d，与单容器部署形态一致。
+ */
+function resolveApiBase(): string {
+  const raw = import.meta.env.VITE_API_BASE?.trim().replace(/\/+$/, '');
+  if (raw) return raw;
+  if (typeof window !== 'undefined') return window.location.origin;
+  return '';
+}
+
+const API_BASE = resolveApiBase();
+const DAEMON_BASE = `${API_BASE}/d`;
+
+/** 深链沿用旧 UI 的 `?session=<id>` 形态：刷新、分享、前进后退都能恢复选中会话。 */
+function sessionIdFromLocation(): string | undefined {
+  return new URLSearchParams(window.location.search).get('session') ?? undefined;
+}
+
+/**
+ * 稳定客户端 id：daemon 兼容层把它盖上 user 回显事件的 originatorClientId，
+ * web-shell 的 suppressOwnUserEcho 靠它与自己的 clientId 精确匹配来抑制
+ * "自己刚发的话"的回显——不传的话 LIVE 下用户消息会显示两遍（实测）。
+ */
+function resolveClientId(): string {
+  const KEY = 'das.clientId.v1';
+  try {
+    const existing = window.localStorage.getItem(KEY);
+    if (existing) return existing;
+    const id = crypto.randomUUID();
+    window.localStorage.setItem(KEY, id);
+    return id;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
+/**
+ * 主题持久化：web-shell 自带的持久化通道是 daemon settings（POST /workspaces/:id/settings），
+ * 本仓的 daemon 兼容层没有这个端点（404），刷新必落回默认 dark。
+ * 宿主侧接管的官方形态：受控 theme + onThemeChange 时写 localStorage。
+ * 注意只用 onThemeChange（用户切换动作），不用 onThemeResolved（settings 解析通道）——
+ * README 明令后者不可用于持久化，否则下次 settings 编辑会被陈旧副本遮蔽。
+ */
+function resolveTheme(): WebShellTheme {
+  const KEY = 'das.theme.v1';
+  try {
+    return window.localStorage.getItem(KEY) === 'light' ? 'light' : 'dark';
+  } catch {
+    return 'dark';
+  }
+}
+
+/**
+ * 前端主界面 = qwen-code Web Shell。
+ *
+ * sessionContext 用 standalone：data agent 的会话是云上资源（无 cwd/工作区概念），
+ * standalone 正是 web-shell 为"产品集成、无 daemon 工作区"准备的形态。
+ * 服务端由 server-node/src/daemon 把 webshell 协议翻译到 data agent OpenAPI 的 8 个接口。
  */
 export default function App() {
-  const { leftCollapsed, rightCollapsed, leftWidth, rightWidth, narrow, leftDrawer, rightDrawer } = useLayout();
-  const sessionId = useSelectedSession();
-  const helpOpen = useHelpOpen();
-  const workspace = useRef<HTMLElement>(null);
+  const [sessionId, setSessionId] = useState<string | undefined>(sessionIdFromLocation);
+  const [clientId] = useState(resolveClientId);
+  const [theme, setTheme] = useState<WebShellTheme>(resolveTheme);
 
-  useGlobalShortcuts();
-  useDeepLink();
+  const handleSessionIdChange = useCallback((next: string | undefined) => {
+    setSessionId(next);
+    const url = new URL(window.location.href);
+    if (next) url.searchParams.set('session', next);
+    else url.searchParams.delete('session');
+    window.history.replaceState(null, '', url);
+  }, []);
 
-  /**
-   * 窗口变小时把两条栏压回可用宽度，保住中栏的最小可读宽度。
-   *
-   * 用 ResizeObserver 而不是 window.resize：真正决定可用宽度的是这个元素的
-   * content box，滚动条出现/消失、浏览器缩放都会改它而不一定触发 window.resize。
-   */
-  useEffect(() => {
-    const el = workspace.current;
-    if (!el || narrow) return;
-    const observer = new ResizeObserver((entries) => {
-      const box = entries[0]?.contentRect;
-      if (box) layoutStore.fitTo(box.width);
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [narrow]);
-
-  /**
-   * 折叠只换栅格列宽，transition 也只动 grid-template-columns。
-   * 动 width 会连带触发中栏整块重排，长对话下明显掉帧。
-   */
-  const gridStyle = {
-    '--left-col': leftCollapsed ? 'var(--rail-col)' : `${leftWidth}px`,
-    '--right-col': rightCollapsed ? 'var(--rail-col)' : `${rightWidth}px`,
-  } as CSSProperties;
-
-  const closeLeft = (): void => layoutStore.closeDrawer('left');
-  const closeRight = (): void => layoutStore.closeDrawer('right');
+  const handleThemeChange = useCallback((next: WebShellTheme) => {
+    setTheme(next);
+    try {
+      window.localStorage.setItem('das.theme.v1', next);
+    } catch {
+      // localStorage 不可用（隐私模式等）：主题只在本次会话内生效，不持久化也能用
+    }
+  }, []);
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      <a
-        href="#chat"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-[80] focus:rounded-md focus:bg-primary focus:px-3 focus:py-1.5 focus:text-sm focus:text-primary-foreground"
-      >
-        跳到对话区
-      </a>
-      <TopBar />
+    <div style={{ height: '100%' }}>
+      <ErrorBoundary label="Web Shell" variant="panel" resetKeys={[sessionId]}>
+        <WebShellWithProviders
+          baseUrl={DAEMON_BASE}
+          sessionContext={{ kind: 'standalone' }}
+          sessionId={sessionId}
+          clientId={clientId}
+          onSessionIdChange={handleSessionIdChange}
+          theme={theme}
+          onThemeChange={handleThemeChange}
+          language="zh-CN"
+          sidebar
+        />
+      </ErrorBoundary>
+      <MockBadge />
+    </div>
+  );
+}
 
-      {narrow ? (
-        <>
-          <main ref={workspace} className="flex min-h-0 flex-1 flex-col overflow-hidden">
-            <ErrorBoundary label="对话区" resetKeys={[sessionId]}>
-              <ChatPanel />
-            </ErrorBoundary>
-          </main>
-          <Drawer side="left" title="会话" open={leftDrawer} onClose={closeLeft}>
-            <ErrorBoundary label="会话列表">
-              <SessionList variant="drawer" onPick={closeLeft} />
-            </ErrorBoundary>
-          </Drawer>
-          <Drawer side="right" title="扩展区" open={rightDrawer} onClose={closeRight}>
-            <ErrorBoundary label="扩展区">
-              <ArtifactPanel variant="drawer" onRequestClose={closeRight} />
-            </ErrorBoundary>
-          </Drawer>
-        </>
-      ) : (
-        <main
-          ref={workspace}
-          style={gridStyle}
-          className="grid min-h-0 flex-1 grid-cols-workspace grid-rows-[minmax(0,1fr)] overflow-x-auto overflow-y-hidden transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
-        >
-          <ErrorBoundary label="会话列表">
-            <SessionList />
-          </ErrorBoundary>
-          <Splitter
-            side="left"
-            width={leftWidth}
-            min={LEFT_MIN}
-            max={LEFT_MAX}
-            reset={LEFT_DEFAULT}
-            active={!leftCollapsed}
-          />
-          <ErrorBoundary label="对话区" resetKeys={[sessionId]}>
-            <ChatPanel />
-          </ErrorBoundary>
-          <Splitter
-            side="right"
-            width={rightWidth}
-            min={RIGHT_MIN}
-            max={RIGHT_MAX}
-            reset={RIGHT_DEFAULT}
-            active={!rightCollapsed}
-          />
-          <ErrorBoundary label="扩展区">
-            <ArtifactPanel />
-          </ErrorBoundary>
-        </main>
-      )}
+/**
+ * MOCK 模式角标：回放模式下必须一眼可辨（旧顶栏徽章的职责由它接管），
+ * 读的还是同一个 /api/health——MOCK 的事实源在后端配置，前端不自判。
+ */
+function MockBadge() {
+  const [mock, setMock] = useState(false);
 
-      <Toaster />
-      <ShortcutHelp open={helpOpen} onClose={() => overlayStore.setHelp(false)} />
+  useEffect(() => {
+    let alive = true;
+    fetch(`${API_BASE}/api/health`)
+      .then((res) => res.json() as Promise<{ result?: { mock?: boolean } }>)
+      .then((body) => {
+        if (alive && body.result?.mock === true) setMock(true);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  if (!mock) return null;
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        right: 12,
+        bottom: 12,
+        zIndex: 60,
+        padding: '2px 10px',
+        borderRadius: 999,
+        fontSize: 12,
+        lineHeight: '20px',
+        background: 'rgba(245, 158, 11, 0.14)',
+        color: '#fbbf24',
+        border: '1px solid rgba(245, 158, 11, 0.4)',
+        pointerEvents: 'none',
+      }}
+    >
+      MOCK · 回放录制件
     </div>
   );
 }
