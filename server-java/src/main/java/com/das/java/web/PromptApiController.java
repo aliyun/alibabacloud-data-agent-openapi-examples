@@ -7,10 +7,10 @@ import com.das.java.core.Frames;
 import com.das.java.live.LiveClient;
 import com.das.java.live.Normalize;
 import com.das.java.live.Normalize.DasApiException;
+import com.das.java.live.SdkSseStream;
 import com.das.java.mock.MockFixtures;
 import com.das.java.mock.MockFixtures.MockScenario;
 import com.das.java.mock.MockReplay;
-import com.das.java.sse.SseFetcher;
 import com.das.java.web.Inflight.AcquireResult;
 import com.das.java.web.Inflight.Acquired;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -144,14 +144,14 @@ public class PromptApiController {
 
     /**
      * live 提示词的帧源：每帧过 frameFromSdkBody；POP 回执（不是帧）收集进 acks。
-     * 构造是惰性的——第一次 next() 才真正发起签名 POST（拿到在途锁之后才碰上游）。
+     * 构造是惰性的——第一次 next() 才真正发起流式调用（拿到在途锁之后才碰上游）。
      */
     private static final class LivePromptSource implements FrameSource {
         private final LiveClient live;
         private final String sessionId;
         private final String outbound;
         private final List<String> acks;
-        private SseFetcher fetcher;
+        private SdkSseStream stream;
 
         LivePromptSource(LiveClient live, String sessionId, String outbound, List<String> acks) {
             this.live = live;
@@ -162,9 +162,9 @@ public class PromptApiController {
 
         @Override
         public Map<String, Object> next() throws DasApiException {
-            if (fetcher == null) {
+            if (stream == null) {
                 try {
-                    fetcher = live.openPromptStream(sessionId, outbound, acks);
+                    stream = live.openPromptStream(sessionId, outbound, acks);
                 } catch (Exception e) {
                     if (e instanceof DasApiException de) throw de;
                     throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
@@ -173,8 +173,8 @@ public class PromptApiController {
             while (true) {
                 String data;
                 try {
-                    data = fetcher.next();
-                } catch (SseFetcher.SseException e) {
+                    data = stream.next();
+                } catch (SdkSseStream.SseException e) {
                     throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
                 }
                 if (data == null) return null;
@@ -197,7 +197,7 @@ public class PromptApiController {
 
         @Override
         public void close() {
-            if (fetcher != null) fetcher.close();
+            if (stream != null) stream.close();
         }
     }
 

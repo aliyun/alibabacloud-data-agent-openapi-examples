@@ -1,36 +1,46 @@
 package com.das.java.live;
 
-import com.aliyun.dataworks_public20240518.Client;
-import com.aliyun.dataworks_public20240518.models.CancelAgentSessionRequest;
-import com.aliyun.dataworks_public20240518.models.CancelAgentSessionResponse;
-import com.aliyun.dataworks_public20240518.models.CreateAgentSessionRequest;
-import com.aliyun.dataworks_public20240518.models.CreateAgentSessionResponse;
-import com.aliyun.dataworks_public20240518.models.GetAgentSessionTokenUsageRequest;
-import com.aliyun.dataworks_public20240518.models.GetAgentSessionTokenUsageResponse;
-import com.aliyun.dataworks_public20240518.models.ListAgentSessionArtifactsRequest;
-import com.aliyun.dataworks_public20240518.models.ListAgentSessionArtifactsResponse;
-import com.aliyun.dataworks_public20240518.models.ListAgentSessionsRequest;
-import com.aliyun.dataworks_public20240518.models.ListAgentSessionsResponse;
-import com.aliyun.dataworks_public20240518.models.ListAgentSessionsResponseBody;
-import com.aliyun.dataworks_public20240518.models.ListAgentsRequest;
-import com.aliyun.dataworks_public20240518.models.ListAgentsResponse;
-import com.aliyun.dataworks_public20240518.models.ReplyAgentSessionRequest;
-import com.aliyun.dataworks_public20240518.models.ReplyAgentSessionResponse;
-import com.aliyun.dataworks_public20240518.models.ReplyAgentSessionResponseBody;
-import com.aliyun.teaopenapi.models.Config;
-import com.aliyun.teautil.models.RuntimeOptions;
+import com.aliyun.auth.credentials.Credential;
+import com.aliyun.auth.credentials.provider.StaticCredentialProvider;
+import com.aliyun.sdk.gateway.pop.Configuration;
+import com.aliyun.sdk.gateway.pop.auth.SignatureAlgorithm;
+import com.aliyun.sdk.gateway.pop.auth.SignatureVersion;
+import com.aliyun.sdk.service.dataworks_public20240518.AsyncClient;
+import com.aliyun.sdk.service.dataworks_public20240518.DefaultAsyncClientBuilder;
+import com.aliyun.sdk.service.dataworks_public20240518.models.CancelAgentSessionRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.CancelAgentSessionResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.CreateAgentSessionRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.CreateAgentSessionResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentSessionTokenUsageRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentSessionTokenUsageResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionArtifactsRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionArtifactsResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionsRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionsResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentsRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentsResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.LoadAgentSessionRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.PromptAgentSessionRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ReplyAgentSessionRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ReplyAgentSessionResponse;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ReplyAgentSessionResponseBody;
 import com.das.java.config.AppConfig;
 import com.das.java.core.ApiError;
 import com.das.java.core.Constants;
 import com.das.java.core.Frames;
 import com.das.java.live.Normalize.DasApiException;
-import com.das.java.sse.SseFetcher;
-import com.das.java.sse.SseFetcher.SseException;
+import com.das.java.live.SdkSseStream.SseException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import darabonba.core.ResponseIterable;
+import darabonba.core.client.ClientOverrideConfiguration;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -38,35 +48,75 @@ import java.util.concurrent.atomic.AtomicLong;
  * 路由只负责"mock 还是 live"的分派与 HTTP 语义。
  * 与 Node 实现的 server-node/live.ts、Python 实现的 live.py 同源同语义。
  *
- * 两个流式接口（PromptAgentSession / LoadAgentSession）不走 SDK：Java SDK 9.8.0
- * 没有 *WithSSE 变体，用 SseFetcher（ACS3 签名 POST + 手写 SSE 解析）代替。
- * 其余 7 个非流式接口走 SDK——SDK 的响应 cast 会静默丢弃模型未声明的键
- * （包括 JsonRpcResponse.Error），所以拿不到代码与 message 时绝不编造（Normalize）。
+ * 全部 9 个接口都走官方异步 SDK（alibabacloud-dataworks_public20240518，
+ * CompletableFuture 风格）：非流式 7 接口 join() 成阻塞语义；两个流式接口
+ * 用官方的 *WithResponseIterable SSE 变体——同步线 SDK 至今没有给 Prompt/
+ * Load 做流式建模，这正是当初自实现 ACS3 签名 HTTP（已删）的原因。
+ *
+ * 重试语义：SDK 默认不装配 RetryPolicy ⇒ 只发一次，与旧 runtimeFor 的
+ * autoretry=false、prompt 绝不重试一致。
+ *
+ * 两个 client 实例：非流式带整个响应的 600s 超时（对齐旧 readTimeout）；
+ * SSE 流上不能有这种超时（RUNNING 期 load 实测阻塞过 178s，中途静默期更长），
+ * 停滞保护由消费端 next(timeoutMs) 逐次执行。
  */
-public final class LiveClient {
+public final class LiveClient implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String JSONRPC_VERSION = "2.0";
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     /** 列表分页的硬上限。上游没承诺页数收敛，不设上限等于把死循环留给线上。 */
     private static final int MAX_PAGES = 10;
     private static final int PAGE_SIZE = 100;
 
-    private final Client client;
+    private final AsyncClient rest;
+    private final AsyncClient sse;
     private final AppConfig cfg;
     private final AtomicLong rpcIdCounter = new AtomicLong();
 
     /** 构造失败让进程直接起不来——带病启动比启动失败难查得多。 */
-    public LiveClient(AppConfig cfg) throws Exception {
+    public LiveClient(AppConfig cfg) {
         this.cfg = cfg;
-        Config config = new Config()
-            .setAccessKeyId(cfg.accessKeyId())
-            .setAccessKeySecret(cfg.accessKeySecret())
-            .setRegionId(cfg.regionId())
-            .setConnectTimeout(10_000);
-        if (cfg.endpoint() != null) {
-            // 留空时 SDK 按 regionId 走内置映射；非空直接当 host，覆盖映射（预发/日常网关靠它）。
-            config.setEndpoint(cfg.endpoint());
+        this.rest = buildClient(cfg, Duration.ofMillis(Constants.DEFAULT_READ_TIMEOUT_MS));
+        this.sse = buildClient(cfg, null);
+    }
+
+    /**
+     * 留空 endpoint 时 SDK 按 regionId 走内置映射（regional 规则，与旧默认一致）；
+     * 非空直接当 host，覆盖映射（预发/日常网关靠它）。
+     *
+     * 签名必须显式 V3(ACS3)：SDK 默认 V1,而 SSE 请求强制走"内容哈希 + canonical
+     * headers"的签名分支,V1 signer 的 getContent()/hash() 恒返回 null——V1 + SSE
+     * 会在签名组装处 NPE(9.0.9 实测,PopV1Signer.getContent()=null)。
+     * V3 对非流式接口同样合法,没必要为它拆两条配置。
+     */
+    private static AsyncClient buildClient(AppConfig cfg, Duration responseTimeout) {
+        ClientOverrideConfiguration override = ClientOverrideConfiguration.create()
+            .setConnectTimeout(CONNECT_TIMEOUT);
+        if (responseTimeout != null) {
+            override.setResponseTimeout(responseTimeout);
         }
-        this.client = new Client(config);
+        if (cfg.endpoint() != null) {
+            override.setEndpointOverride(cfg.endpoint());
+        }
+        return new DefaultAsyncClientBuilder()
+            .credentialsProvider(StaticCredentialProvider.create(
+                Credential.builder()
+                    .accessKeyId(cfg.accessKeyId())
+                    .accessKeySecret(cfg.accessKeySecret())
+                    .build()))
+            .region(cfg.regionId())
+            .overrideConfiguration(override)
+            .serviceConfiguration(Configuration.create()
+                .setSignatureVersion(SignatureVersion.V3)
+                .setSignatureAlgorithmV3(SignatureAlgorithm.ACS3_HMAC_SHA256))
+            .build();
+    }
+
+    /** 进程退出时关掉两个 client（netty 线程池）；MOCK 模式根本不会构造到这一步。 */
+    @Override
+    public void close() {
+        rest.close();
+        sse.close();
     }
 
     private String nextRpcId() {
@@ -74,18 +124,26 @@ public final class LiveClient {
         return String.valueOf(rpcIdCounter.incrementAndGet());
     }
 
-    /** 每次调用现造一个 RuntimeOptions。真正生效的是两个超时；prompt（写操作）绝不重试。 */
-    private RuntimeOptions runtimeFor(int readTimeoutMs) {
-        RuntimeOptions runtime = new RuntimeOptions();
-        runtime.autoretry = false;
-        runtime.maxAttempts = 1;
-        runtime.readTimeout = readTimeoutMs;
-        runtime.connectTimeout = 10_000;
-        return runtime;
+    /** join 出来的异常总被 CompletionException 包一层：先剥掉再归一化。 */
+    private static Throwable unwrap(Throwable t) {
+        while ((t instanceof CompletionException || t instanceof ExecutionException) && t.getCause() != null) {
+            t = t.getCause();
+        }
+        return t;
     }
 
-    private RuntimeOptions runtimeDefault() {
-        return runtimeFor(Constants.DEFAULT_READ_TIMEOUT_MS);
+    private static <T> T join(CompletableFuture<T> future) throws Exception {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            Throwable cause = unwrap(e);
+            if (cause instanceof Exception ex) throw ex;
+            throw e;
+        }
+    }
+
+    private static DasApiException toDas(Throwable e, String api) {
+        return new DasApiException(Normalize.toApiError(unwrap(e), api));
     }
 
     public AppConfig cfg() {
@@ -99,12 +157,12 @@ public final class LiveClient {
     public Map<String, Object> listAgents() throws Exception {
         String api = "ListAgents";
         try {
-            ListAgentsResponse resp = client.listAgentsWithOptions(
-                new ListAgentsRequest()
-                    .setId(nextRpcId())
-                    .setJsonrpc(JSONRPC_VERSION)
-                    .setParams(new ListAgentsRequest.ListAgentsRequestParams().setMaxResults(PAGE_SIZE)),
-                runtimeDefault());
+            ListAgentsResponse resp = join(rest.listAgents(
+                ListAgentsRequest.builder()
+                    .id(nextRpcId())
+                    .jsonrpc(JSONRPC_VERSION)
+                    .params(ListAgentsRequest.Params.builder().maxResults(PAGE_SIZE).build())
+                    .build()));
             var body = resp.getBody();
             var rpc = body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
@@ -123,7 +181,7 @@ public final class LiveClient {
         } catch (DasApiException e) {
             throw e;
         } catch (Exception e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            throw toDas(e, api);
         }
     }
 
@@ -135,8 +193,7 @@ public final class LiveClient {
     public Map<String, Object> createSession(String mode) throws Exception {
         String api = "CreateAgentSession";
         try {
-            CreateAgentSessionResponse resp = client.createAgentSessionWithOptions(
-                buildCreateSessionRequest(mode), runtimeDefault());
+            CreateAgentSessionResponse resp = join(rest.createAgentSession(buildCreateSessionRequest(mode)));
             var body = resp.getBody();
             var rpc = body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
@@ -158,7 +215,7 @@ public final class LiveClient {
         } catch (DasApiException e) {
             throw e;
         } catch (Exception e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            throw toDas(e, api);
         }
     }
 
@@ -167,24 +224,31 @@ public final class LiveClient {
      * meta 之下，agentName 只存在于 meta.agent 之下——塞错层级，序列化会按模型声明静默丢弃。
      */
     CreateAgentSessionRequest buildCreateSessionRequest(String mode) {
-        return new CreateAgentSessionRequest()
-            .setId(nextRpcId())
-            .setJsonrpc(JSONRPC_VERSION)
-            .setParams(new CreateAgentSessionRequest.CreateAgentSessionRequestParams()
-                .setMeta(new CreateAgentSessionRequest.CreateAgentSessionRequestParamsMeta()
-                    .setAgent(new CreateAgentSessionRequest.CreateAgentSessionRequestParamsMetaAgent()
-                        .setAgentName(cfg.agentName()))
-                    .setConfig(new CreateAgentSessionRequest.CreateAgentSessionRequestParamsMetaConfig()
-                        .setSessionSource(cfg.sessionSource())
+        return CreateAgentSessionRequest.builder()
+            .id(nextRpcId())
+            .jsonrpc(JSONRPC_VERSION)
+            .params(CreateAgentSessionRequest.Params.builder()
+                .meta(CreateAgentSessionRequest.Meta.builder()
+                    .agent(CreateAgentSessionRequest.Agent.builder()
+                        .agentName(cfg.agentName())
+                        .build())
+                    .config(CreateAgentSessionRequest.Config.builder()
+                        .sessionSource(cfg.sessionSource())
                         // 类型是 Array<{SessionTagCode}> 而不是 string[]：传字符串数组会被静默忽略。
-                        .setSessionTags(List.of(
-                            new CreateAgentSessionRequest.CreateAgentSessionRequestParamsMetaConfigSessionTags()
-                                .setSessionTagCode(cfg.sessionSource()))))
+                        .sessionTags(List.of(
+                            CreateAgentSessionRequest.SessionTags.builder()
+                                .sessionTagCode(cfg.sessionSource())
+                                .build()))
+                        .build())
                     // ResourceGroupId 走 InitialConfigOptions，且上游**不校验有效性**。
                     // mode：yolo 放行全部工具授权；default 停下等人（人卡，配 /reply 回覆）。
-                    .setInitialConfigOptions(new CreateAgentSessionRequest.CreateAgentSessionRequestParamsMetaInitialConfigOptions()
-                        .setResourceGroupId(cfg.resourceGroupId())
-                        .setMode(mode))));
+                    .initialConfigOptions(CreateAgentSessionRequest.InitialConfigOptions.builder()
+                        .resourceGroupId(cfg.resourceGroupId())
+                        .mode(mode)
+                        .build())
+                    .build())
+                .build())
+            .build();
     }
 
     public Map<String, Object> listSessions() throws Exception {
@@ -196,18 +260,19 @@ public final class LiveClient {
             boolean truncated = false;
 
             for (int page = 0; page < MAX_PAGES; page++) {
-                ListAgentSessionsResponse resp = client.listAgentSessionsWithOptions(
-                    new ListAgentSessionsRequest()
-                        .setId(nextRpcId())
-                        .setJsonrpc(JSONRPC_VERSION)
-                        .setParams(new ListAgentSessionsRequest.ListAgentSessionsRequestParams()
+                ListAgentSessionsResponse resp = join(rest.listAgentSessions(
+                    ListAgentSessionsRequest.builder()
+                        .id(nextRpcId())
+                        .jsonrpc(JSONRPC_VERSION)
+                        .params(ListAgentSessionsRequest.Params.builder()
                             // AgentName 实测**必填**；SessionSourceList 是生效的过滤器；
                             // SessionTitle 过滤器被**静默忽略**——标题搜索一律前端做。
-                            .setAgentName(cfg.agentName())
-                            .setSessionSourceList(List.of(cfg.sessionSource()))
-                            .setMaxResults(PAGE_SIZE)
-                            .setNextToken(nextToken)),
-                    runtimeDefault());
+                            .agentName(cfg.agentName())
+                            .sessionSourceList(List.of(cfg.sessionSource()))
+                            .maxResults(PAGE_SIZE)
+                            .nextToken(nextToken)
+                            .build())
+                        .build()));
                 var body = resp.getBody();
                 var rpc = body.getJsonRpcResponse();
                 var result = rpc == null ? null : rpc.getResult();
@@ -216,8 +281,7 @@ public final class LiveClient {
                 }
                 if (totalCount == null) totalCount = result.getTotalCount();
                 if (result.getAgentSessions() != null) {
-                    for (ListAgentSessionsResponseBody.ListAgentSessionsResponseBodyJsonRpcResponseResultAgentSessions row
-                         : result.getAgentSessions()) {
+                    for (var row : result.getAgentSessions()) {
                         Map<String, Object> summary = toSessionSummary(row);
                         if (summary != null) collected.add(summary);
                     }
@@ -238,12 +302,12 @@ public final class LiveClient {
         } catch (DasApiException e) {
             throw e;
         } catch (Exception e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            throw toDas(e, api);
         }
     }
 
     private Map<String, Object> toSessionSummary(
-        ListAgentSessionsResponseBody.ListAgentSessionsResponseBodyJsonRpcResponseResultAgentSessions row) {
+        com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionsResponseBody.AgentSessions row) {
         if (row.getSessionId() == null || row.getSessionId().isEmpty()) return null;
         var meta = row.getMeta();
         List<String> tags = new ArrayList<>();
@@ -278,13 +342,14 @@ public final class LiveClient {
         String api = "GetAgentSessionTokenUsage";
         long started = System.currentTimeMillis();
         try {
-            GetAgentSessionTokenUsageResponse resp = client.getAgentSessionTokenUsageWithOptions(
-                new GetAgentSessionTokenUsageRequest()
-                    .setId(nextRpcId())
-                    .setJsonrpc(JSONRPC_VERSION)
-                    .setParams(new GetAgentSessionTokenUsageRequest.GetAgentSessionTokenUsageRequestParams()
-                        .setSessionId(sessionId)),
-                runtimeDefault());
+            GetAgentSessionTokenUsageResponse resp = join(rest.getAgentSessionTokenUsage(
+                GetAgentSessionTokenUsageRequest.builder()
+                    .id(nextRpcId())
+                    .jsonrpc(JSONRPC_VERSION)
+                    .params(GetAgentSessionTokenUsageRequest.Params.builder()
+                        .sessionId(sessionId)
+                        .build())
+                    .build()));
             var body = resp.getBody();
             var rpc = body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
@@ -303,7 +368,7 @@ public final class LiveClient {
         } catch (DasApiException e) {
             throw e;
         } catch (Exception e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            throw toDas(e, api);
         }
     }
 
@@ -312,13 +377,14 @@ public final class LiveClient {
         String api = "ListAgentSessionArtifacts";
         long started = System.currentTimeMillis();
         try {
-            ListAgentSessionArtifactsResponse resp = client.listAgentSessionArtifactsWithOptions(
-                new ListAgentSessionArtifactsRequest()
-                    .setId(nextRpcId())
-                    .setJsonrpc(JSONRPC_VERSION)
-                    .setParams(new ListAgentSessionArtifactsRequest.ListAgentSessionArtifactsRequestParams()
-                        .setSessionId(sessionId)),
-                runtimeDefault());
+            ListAgentSessionArtifactsResponse resp = join(rest.listAgentSessionArtifacts(
+                ListAgentSessionArtifactsRequest.builder()
+                    .id(nextRpcId())
+                    .jsonrpc(JSONRPC_VERSION)
+                    .params(ListAgentSessionArtifactsRequest.Params.builder()
+                        .sessionId(sessionId)
+                        .build())
+                    .build()));
             var body = resp.getBody();
             var rpc = body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
@@ -339,7 +405,7 @@ public final class LiveClient {
         } catch (DasApiException e) {
             throw e;
         } catch (Exception e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            throw toDas(e, api);
         }
     }
 
@@ -353,17 +419,18 @@ public final class LiveClient {
         String upstream = "调用未返回";
         Integer status = null;
         try {
-            CancelAgentSessionResponse resp = client.cancelAgentSessionWithOptions(
-                new CancelAgentSessionRequest()
-                    .setId(nextRpcId())
-                    .setJsonrpc(JSONRPC_VERSION)
-                    .setParams(new CancelAgentSessionRequest.CancelAgentSessionRequestParams()
-                        .setSessionId(sessionId)),
-                runtimeDefault());
+            CancelAgentSessionResponse resp = join(rest.cancelAgentSession(
+                CancelAgentSessionRequest.builder()
+                    .id(nextRpcId())
+                    .jsonrpc(JSONRPC_VERSION)
+                    .params(CancelAgentSessionRequest.Params.builder()
+                        .sessionId(sessionId)
+                        .build())
+                    .build()));
             status = resp.getStatusCode();
             upstream = "HTTP " + status;
         } catch (Exception e) {
-            upstream = Normalize.toApiError(e, api).message();
+            upstream = Normalize.toApiError(unwrap(e), api).message();
         }
 
         boolean delivered = status != null && status == 200;
@@ -394,28 +461,26 @@ public final class LiveClient {
     public Map<String, Object> reply(String sessionId, Map<String, Object> input) throws Exception {
         String api = "ReplyAgentSession";
         try {
-            ReplyAgentSessionRequest.ReplyAgentSessionRequestParams params =
-                new ReplyAgentSessionRequest.ReplyAgentSessionRequestParams()
-                    .setSessionId(sessionId)
-                    .setPermissionRequestId((String) input.get("permissionRequestId"));
+            ReplyAgentSessionRequest.Params.Builder params = ReplyAgentSessionRequest.Params.builder()
+                .sessionId(sessionId)
+                .permissionRequestId((String) input.get("permissionRequestId"));
             Object answers = input.get("answers");
             if (answers instanceof Map<?, ?> map && !map.isEmpty()) {
                 Map<String, String> typed = new LinkedHashMap<>();
                 for (Map.Entry<?, ?> e : map.entrySet()) typed.put(String.valueOf(e.getKey()), (String) e.getValue());
-                params.setAnswers(typed);
+                params.answers(typed);
             }
-            ReplyAgentSessionRequest.ReplyAgentSessionRequestParamsOutcome outcome =
-                new ReplyAgentSessionRequest.ReplyAgentSessionRequestParamsOutcome()
-                    .setOutcome((String) input.get("outcome"));
-            if (input.get("optionId") != null) outcome.setOptionId((String) input.get("optionId"));
-            params.setOutcome(outcome);
+            ReplyAgentSessionRequest.Outcome.Builder outcome = ReplyAgentSessionRequest.Outcome.builder()
+                .outcome((String) input.get("outcome"));
+            if (input.get("optionId") != null) outcome.optionId((String) input.get("optionId"));
+            params.outcome(outcome.build());
 
-            ReplyAgentSessionResponse resp = client.replyAgentSessionWithOptions(
-                new ReplyAgentSessionRequest()
-                    .setId(nextRpcId())
-                    .setJsonrpc(JSONRPC_VERSION)
-                    .setParams(params),
-                runtimeDefault());
+            ReplyAgentSessionResponse resp = join(rest.replyAgentSession(
+                ReplyAgentSessionRequest.builder()
+                    .id(nextRpcId())
+                    .jsonrpc(JSONRPC_VERSION)
+                    .params(params.build())
+                    .build()));
 
             ReplyAgentSessionResponseBody body = resp.getBody();
             var rpc = body.getJsonRpcResponse();
@@ -444,12 +509,12 @@ public final class LiveClient {
         } catch (DasApiException e) {
             throw e;
         } catch (Exception e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            throw toDas(e, api);
         }
     }
 
     // ------------------------------------------------------------------
-    // 历史（LoadAgentSession · 手写 SSE）
+    // 历史（LoadAgentSession · 官方 SSE）
     // ------------------------------------------------------------------
 
     /**
@@ -464,22 +529,24 @@ public final class LiveClient {
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> loadFrames(String sessionId) throws Exception {
         String api = "LoadAgentSession";
-        Map<String, Object> params = new LinkedHashMap<>();
-        params.put("SessionId", sessionId);
-        params.put("Meta", Map.of("IsReload", true));
+        ResponseIterable<com.aliyun.sdk.service.dataworks_public20240518.models.LoadAgentSessionResponseBody> iterable =
+            sse.loadAgentSessionWithResponseIterable(
+                LoadAgentSessionRequest.builder()
+                    .id(nextRpcId())
+                    .jsonrpc(JSONRPC_VERSION)
+                    .params(LoadAgentSessionRequest.Params.builder()
+                        .sessionId(sessionId)
+                        .meta(LoadAgentSessionRequest.Meta.builder().isReload(true).build())
+                        .build())
+                    .build());
 
         List<Map<String, Object>> frames = new ArrayList<>();
-        SseFetcher fetcher;
-        try {
-            fetcher = new SseFetcher(cfg, api, params, nextRpcId());
-        } catch (SseException e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
-        }
-        try (fetcher) {
+        SdkSseStream stream = new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode);
+        try (stream) {
             while (true) {
                 String data;
                 try {
-                    data = fetcher.next(Constants.HISTORY_READ_TIMEOUT_MS);
+                    data = stream.next(Constants.HISTORY_READ_TIMEOUT_MS);
                 } catch (SseException e) {
                     throw new DasApiException(Normalize.toApiError(e, api));
                 }
@@ -507,18 +574,25 @@ public final class LiveClient {
      * 帧到达顺序即上游顺序；POP 回执的 RequestId 填进 acks（零帧场景唯一可查的线索）。
      * 抛出的异常不在这里吞，交给流管道归一化。
      */
-    public SseFetcher openPromptStream(String sessionId, String outboundText, List<String> acks) throws Exception {
+    public SdkSseStream openPromptStream(String sessionId, String outboundText, List<String> acks) throws Exception {
         String api = "PromptAgentSession";
-        Map<String, Object> prompt = new LinkedHashMap<>();
-        prompt.put("Type", "text");
-        prompt.put("Text", outboundText);
-        Map<String, Object> params = new LinkedHashMap<>();
-        params.put("SessionId", sessionId);
-        params.put("Prompt", List.of(prompt));
         try {
-            return new SseFetcher(cfg, api, params, nextRpcId());
-        } catch (SseException e) {
-            throw new DasApiException(Normalize.toApiError(e, api));
+            ResponseIterable<com.aliyun.sdk.service.dataworks_public20240518.models.PromptAgentSessionResponseBody> iterable =
+                sse.promptAgentSessionWithResponseIterable(
+                    PromptAgentSessionRequest.builder()
+                        .id(nextRpcId())
+                        .jsonrpc(JSONRPC_VERSION)
+                        .params(PromptAgentSessionRequest.Params.builder()
+                            .sessionId(sessionId)
+                            .prompt(List.of(PromptAgentSessionRequest.Prompt.builder()
+                                .type("text")
+                                .text(outboundText)
+                                .build()))
+                            .build())
+                        .build());
+            return new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode);
+        } catch (Exception e) {
+            throw toDas(e, api);
         }
     }
 }
