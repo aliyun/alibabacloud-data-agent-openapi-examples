@@ -76,6 +76,34 @@ PORT=3100 WEB_PORT=5180 npm start -- python
 
 端口已被占用时，启动命令会报错。先停止原来的服务或换端口；不会自动关闭其他进程。
 
+## 单独启动后端与网页（不走一键脚本）
+
+封装为一键的 `npm start` 只做了三件互不相干的事：构建 jar（要重构的场合）、起后端、向前传参数起网页。把它们分开手动起也有同样效果：
+
+```bash
+# 1) 构建 jar（第一次或源码有改动时）
+mvn -f server-java/pom.xml -q -DskipTests package
+
+# 2) 后端（终端一）：默认 http://127.0.0.1:3000
+java -jar server-java/target/das-server-java-0.1.0.jar
+#   MOCK 免凭证（回放合成样例）：
+#   mac/Linux/Git Bash：`MOCK=1 java -jar ...`
+#   Windows PowerShell：`$env:MOCK="1"; java -jar ...`
+#   Windows cmd.exe：`set MOCK=1 && java -jar ...`
+#   LIVE 链路：从仓库根 `.env`（或 `DAS_ENV=<name>`）读配置
+#   变端口：`java -jar ... --server.port=3999` 或 PORT=3999
+
+# 3) 前端（终端二）：指向后端后轮的地址
+cd web && VITE_API_BASE=http://127.0.0.1:3000 npm run dev
+#   Windows PowerShell：`cd web; $env:VITE_API_BASE="http://127.0.0.1:3000"; npm run dev`
+#   Windows cmd.exe：`cd web && set VITE_API_BASE=http://127.0.0.1:3000 && npm run dev`
+```
+
+打开 <http://127.0.0.1:5173>。如果看到 **"daemon server 无法链接"**，按下面两步排查：
+
+1. `curl http://127.0.0.1:3000/api/health`——后端还活着没；命令没回 = 后端没起
+2. `VITE_API_BASE` 跟后端的 PORT 必须对应（改了就**重启 web dev server**：dev server 在启动时吃 compile env，hot-reload 不重新读 VITE_API_BASE）
+
 可以为不同账号或环境分别创建 `.env.<name>`，例如 `.env.demo`，然后：
 
 ```bash

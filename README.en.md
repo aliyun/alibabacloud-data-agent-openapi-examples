@@ -70,6 +70,34 @@ PORT=3100 WEB_PORT=5180 npm start -- python
 
 If a port is taken, the starter reports an error. Stop the existing service or pick another port — it won't kill other processes for you.
 
+## Start Backend and Web Separately (Skip the one-command launcher)
+
+A single `npm start` does three independent things for you: build the jar when sources changed, boot the backend, and launch the web dev server pointed at it. Splitting them manually has the same effect:
+
+```bash
+# 1) Build the jar (first run or after source change)
+mvn -f server-java/pom.xml -q -DskipTests package
+
+# 2) Backend (terminal 1): defaults to http://127.0.0.1:3000
+java -jar server-java/target/das-server-java-0.1.0.jar
+#   MOCK credential-free (replays synthetic scenarios):
+#   mac/Linux/Git Bash: MOCK=1 java -jar ...
+#   Windows PowerShell: $env:MOCK="1"; java -jar ...
+#   Windows cmd.exe: set MOCK=1 && java -jar ...
+#   LIVE against your real DataAgent: reads .env at repo root (or DEMO via DAS_ENV=<name>)
+#   Other port: java -jar ... --server.port=3999  (or PORT=3999)
+
+# 3) Frontend (terminal 2): point it at your backend
+cd web && VITE_API_BASE=http://127.0.0.1:3000 npm run dev
+#   Windows PowerShell: cd web; $env:VITE_API_BASE="http://127.0.0.1:3000"; npm run dev
+#   Windows cmd.exe: cd web && set VITE_API_BASE=http://127.0.0.1:3000 && npm run dev
+```
+
+Open <http://127.0.0.1:5173>. If you hit **"daemon server unreachable"**, take these two steps:
+
+1. `curl http://127.0.0.1:3000/api/health` — prove the backend is alive; no response = start the backend first.
+2. `VITE_API_BASE` must match the backend port (and **restart the web dev server** when you change it — the dev server reads compile env at startup, not on hot reload).
+
 Create self-contained profiles per account or environment as `.env.<name>` (e.g., `.env.demo`), then:
 
 ```bash
