@@ -67,6 +67,44 @@ public final class Translate {
         return out;
     }
 
+    // ------------------------------------------------------------------
+    // permission：把 `_qwen/notify` 帧翻译成 daemon 的 permission 事件。
+    // 上游的通知不能当 session_update 发——它有专门的 permission 事件契约；
+    // 此前这些帧被整帧丢弃（updateOf 拿不到 → return null），这就是「没有弹框」的根因。
+    // ------------------------------------------------------------------
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> frameToPermissionEvent(Map<String, Object> frame, String sessionId) {
+        Map<String, Object> pending = Frames.pendingInteractionOf(frame);
+        if (pending != null) {
+            Map<String, Object> params = Frames.paramsOf(frame);
+            Object data = params != null ? params.get("data") : null;
+            Map<String, Object> dataMap = data instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
+            Map<String, Object> toolCall = dataMap != null && dataMap.get("toolCall") instanceof Map<?, ?> m
+                ? (Map<String, Object>) m : null;
+            Object title = pending.get("toolCallTitle");
+            return Events.permissionRequest(
+                sessionId,
+                String.valueOf(pending.get("requestId")),
+                toolCall,
+                title instanceof String s ? s : null,
+                (java.util.List<Map<String, Object>>) pending.get("options")
+            );
+        }
+        Map<String, String> resolved = Frames.permissionResolvedOf(frame);
+        if (resolved != null) {
+            Map<String, Object> params = Frames.paramsOf(frame);
+            Object data = params != null ? params.get("data") : null;
+            Map<String, Object> outcome = null;
+            if (data instanceof Map<?, ?> dataMap && dataMap.get("outcome") instanceof Map<?, ?> o) {
+                outcome = (Map<String, Object>) o;
+            }
+            if (outcome == null) outcome = java.util.Map.of("outcome", "selected");
+            return Events.permissionResolved(sessionId, resolved.get("requestId"), outcome);
+        }
+        return null;
+    }
+
     /**
      * 历史帧 → journal 种子事件：过滤（同 reduceHistory 判据）+ 翻译 + user 回显去重。
      *
@@ -84,6 +122,11 @@ public final class Translate {
             if (!isTurn) continue;
             String userText = "";
             for (Map<String, Object> frame : group) {
+                Map<String, Object> permissionEvent = frameToPermissionEvent(frame, sessionId);
+                if (permissionEvent != null) {
+                    out.add(permissionEvent);
+                    continue;
+                }
                 Map<String, Object> event = frameToSessionUpdate(frame, sessionId, true, null);
                 if (event == null) continue;
                 Map<String, Object> update = (Map<String, Object>) ((Map<String, Object>) event.get("data")).get("update");

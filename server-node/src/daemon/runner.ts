@@ -18,7 +18,7 @@ import { replayFrames } from '../mock/replay.js';
 import { redactApiError, toApiError } from '../normalize.js';
 import { sessionUpdateEvent, turnCompleteEvent, turnErrorEvent } from './events.js';
 import type { SessionRecord } from './registry.js';
-import { errorOfFrame, frameToSessionUpdate, terminalOfFrame } from './translate.js';
+import { errorOfFrame, frameToPermissionEvent, frameToSessionUpdate, terminalOfFrame } from './translate.js';
 
 export interface PromptDeps {
   cfg: AppConfig;
@@ -167,6 +167,22 @@ async function runTurn(
           ridBackfilled = true;
           // 在途锁条目的 rid 回填：撞锁的日志要能报出"正在跑的是哪一轮"
           acquired.entry.rid = rid;
+        }
+      }
+      // permission 通知帧先于 session_update 处理（到达序的真实顺序）；
+      // 这是把 `_qwen/notify` 接到 web-shell 弹卡的唯一通道（此前被整帧丢弃→没有弹框）。
+      if (!errorSent) {
+        const permissionEvent = frameToPermissionEvent(frame, clientFacingId);
+        if (permissionEvent !== undefined) {
+          journal.append(permissionEvent);
+          const requestId = permissionEvent.data.requestId;
+          if (typeof requestId === 'string') {
+            if (permissionEvent.type === 'permission_request') {
+              record.pendingPermissions.set(requestId, permissionEvent.data);
+            } else {
+              record.pendingPermissions.delete(requestId);
+            }
+          }
         }
       }
       if (!errorSent) {

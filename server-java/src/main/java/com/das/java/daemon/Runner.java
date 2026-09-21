@@ -154,6 +154,20 @@ public class Runner {
                     }
                 }
                 if (!errorSent) {
+                    // permission 通知帧先于 session_update 处理（到达序的真实顺序）；
+                    // 此前这些帧被整帧丢弃就在这条吞掉的——「没有弹框」的根因。
+                    Map<String, Object> permissionEvent = Translate.frameToPermissionEvent(frame, clientFacingId);
+                    if (permissionEvent != null) {
+                        journal.append(permissionEvent);
+                        if (permissionEvent.get("data") instanceof Map<?, ?> dataMap
+                            && dataMap.get("requestId") instanceof String requestId) {
+                            if ("permission_request".equals(permissionEvent.get("type"))) {
+                                record.pendingPermissions.put(requestId, permissionEvent);
+                            } else {
+                                record.pendingPermissions.remove(requestId);
+                            }
+                        }
+                    }
                     Map<String, Object> event = Translate.frameToSessionUpdate(frame, clientFacingId, true, clientId);
                     boolean duplicateUserChunk = false;
                     if (event != null) {

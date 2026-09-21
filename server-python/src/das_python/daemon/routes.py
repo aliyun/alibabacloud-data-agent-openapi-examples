@@ -17,10 +17,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..config import AppConfig
 from ..constants import HEARTBEAT_MS, STREAM_HARD_LIMIT_MS
-from ..live import LiveContext, _cancel_result, _create_session_result, _load_frames
+from ..live import LiveContext, _cancel_result, _create_session_result, _load_frames, _reply_result
 from ..mock_fixtures import find_scenario, mock_create_session, read_fixture_frames
 from ..normalize import to_api_error
-from .events import prompt_cancelled_event, session_snapshot_event
+from .events import permission_resolved_event, prompt_cancelled_event, session_snapshot_event
 from .journal import MAX_EVENTS, JournalEntry, SessionJournal
 from .registry import WORKSPACE_CWD, SessionRecord, SessionRegistry
 from .runner import admit_prompt, submit_turn
@@ -80,7 +80,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         return {
             "v": 1,
             "mode": "standalone",
-            "features": ["standalone_sessions_v1", "standalone_session_options_v1"],
+            "features": ["standalone_sessions_v1", "standalone_session_options_v1", "session_permission_vote"],
             "modelServices": ["data-agent"],
             "workspaces": [],
             "policy": {},
@@ -131,7 +131,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             },
             "capabilities": {
                 "protocolVersions": {"current": "1", "supported": ["1"]},
-                "features": ["standalone_sessions_v1", "standalone_session_options_v1"],
+                "features": ["standalone_sessions_v1", "standalone_session_options_v1", "session_permission_vote"],
             },
             "runtime": {
                 "sessions": {"active": stats["sessions"]},
@@ -350,17 +350,67 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         return Response(status_code=204)
 
     # ------------------------------------------------------------------
-    # permission：上游没有 Respond 通道（ReplyAgentSession 已由 /api 承载，
-    # 这里按 web-shell 的 permission 协议如实 404）
+    # permission：弹卡的回覆通道（与 /api/sessions/:id/reply 同一上游 ReplyAgentSession）。
+    # 契约：200 = 已受理；404 = 未知/已被处理（SDK 按赛跑语义分发）。
     # ------------------------------------------------------------------
 
+    async def _respond_permission(record: Any, session_id: str, request_id: str, body: dict[str, Any] | None) -> Any:
+        pending = record.pending_permissions.get(request_id)
+        if not pending:
+            return _error(404, f"没有这个待处理的人卡请求（requestId={request_id}，未知/已被处理）", "permission_not_found")
+
+        outcome_raw = body.get("outcome") if isinstance(body, dict) and isinstance(body.get("outcome"), dict) else None
+        outcome_kind = "cancelled" if outcome_raw and outcome_raw.get("outcome") == "cancelled" else "selected"
+        option_id = (outcome_raw.get("optionId") or "").strip() if outcome_raw else ""
+        answers = body.get("answers") if isinstance(body, dict) and isinstance(body.get("answers"), dict) else None
+        if outcome_kind == "selected" and not option_id and not answers:
+            return _error(400, "outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）", "invalid_permission_response")
+
+        if live:
+            try:
+                result = await _reply_result(live, record.real_id, {
+                    "permissionRequestId": request_id,
+                    "answers": answers,
+                    "optionId": option_id or None,
+                    "outcome": outcome_kind,
+                })
+                if result.get("accepted"):
+                    record.pending_permissions.pop(request_id, None)
+                    record.journal.append(permission_resolved_event(session_id, request_id, {
+                        "outcome": outcome_kind,
+                        **({"optionId": option_id} if option_id else {}),
+                    }))
+                    return {}
+                # 上游明确不接：按赛跑失败对待——本地移除并走 404 语义
+                record.pending_permissions.pop(request_id, None)
+                return _error(404, "上游明确 accepted=false（requestId 可能已过期或已被他人回覆）", "permission_not_accepted")
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({"error": f"回覆上游失败：{exc}", "code": "permission_upstream_error"}, status_code=502)
+
+        # MOCK：回覆是本地教学闭环——上游无真通道，直接当已受理
+        record.pending_permissions.pop(request_id, None)
+        record.journal.append(permission_resolved_event(session_id, request_id, {
+            "outcome": outcome_kind,
+            "optionId": option_id or "proceed_once",
+        }))
+        return {}
+
     @app.post("/d/session/{session_id}/permission/{request_id}")
-    async def d_permission_on_session() -> JSONResponse:
-        return _error(404, "上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求", "permission_not_found")
+    async def d_permission_on_session(request: Request, session_id: str, request_id: str) -> Any:
+        record = resolve_session(session_id)
+        if record is None:
+            return _not_found(session_id)
+        body = await _body(request) or {}
+        return await _respond_permission(record, session_id, request_id, body)
 
     @app.post("/d/permission/{request_id}")
-    async def d_permission_direct() -> JSONResponse:
-        return _error(404, "上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求", "permission_not_found")
+    async def d_permission_direct(request: Request, request_id: str) -> Any:
+        # 历史兼容路由：requestId 在全注册表里反查会话
+        entry = next((r for r in registry.all_records() if request_id in r.pending_permissions), None)
+        if entry is None:
+            return _error(404, f"没有这个待处理的人卡请求（requestId={request_id}，未知/已被处理）", "permission_not_found")
+        body = await _body(request) or {}
+        return await _respond_permission(entry, entry.alias_id or entry.real_id, request_id, body)
 
     # ------------------------------------------------------------------
     # 降级端点

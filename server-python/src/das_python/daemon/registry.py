@@ -38,6 +38,9 @@ class SessionRecord:
     # real id 重新出现，journal 已丢，属已知降级（见 OPENAPI-GAPS）。
     alias_id: str | None = None
     journal: SessionJournal = field(default_factory=SessionJournal)
+    # 在途 permission 请求：requestId → permission_request 的事件本体。
+    # 用户点卡时 /session/:id/permission/:requestId 共享这份状态；回覆成功或上游 resolved 时删除。
+    pending_permissions: dict[str, dict[str, Any]] = field(default_factory=dict)
     # rename 覆盖（进程级：上游没有改名接口，SessionTitle 恒为首条 prompt 原文）。
     display_name: str | None = None
     archived: bool = False
@@ -159,3 +162,25 @@ class SessionRegistry:
             "sourceType": "standalone",
             "context": {"kind": "standalone"},
         }
+
+
+def rebuild_pending_permissions(record: SessionRecord) -> None:
+    """**重启/置换场景**：用 journal 里的事件量重新看清 `pending_permissions`。
+
+    后端重启后 journal 丢光，pending_permissions 自然也丢。用户重开会话时 load 会把
+    上游历史播种回来——里面可能含着**仍然待解答**的 permission_request。
+    不重建的话，那张卡的 DOM requestId 会向一个空表回应 → 404「无法 response」。
+    重建规则：按 requestId 配对，permission_request 加，permission_resolved 减。
+    """
+    record.pending_permissions.clear()
+    for entry in record.journal.all():
+        ev = entry.event
+        type_ = ev.get("type")
+        data = ev.get("data") or {}
+        request_id = data.get("requestId")
+        if not isinstance(request_id, str):
+            continue
+        if type_ == "permission_request":
+            record.pending_permissions[request_id] = ev
+        elif type_ in ("permission_resolved", "permission_already_resolved"):
+            record.pending_permissions.pop(request_id, None)

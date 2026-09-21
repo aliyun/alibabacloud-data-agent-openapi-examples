@@ -66,3 +66,64 @@ export function sessionSnapshotEvent(sessionId: string): DaemonEvent {
     data: { sessionId, currentModelId: 'data-agent', currentApprovalMode: null },
   };
 }
+
+// ------------------------------------------------------------------
+// permission：上游 `_qwen/notify` 帧 → daemon `permission_request` / `permission_resolved`
+//
+// 事件类型名与 data 键名以 @qwen-code/sdk 的事件契约为准（dist/daemon/events.d.ts：
+// DAEMON_KNOWN_EVENT_TYPE_VALUES 与 DaemonPermissionRequestData/ResolvedData）。
+// toolCall 原样透传（含 _meta.toolName / rawInput / content），web-shell 按
+// `_meta.toolName` 判别工具、按 `rawInput` 取 ask_user_question 的问卷。
+// options 映射为 web-shell normalizer 期望的 `{optionId, label, raw:{kind}}` 形状。
+// ------------------------------------------------------------------
+
+export function permissionRequestEvent(
+  sessionId: string,
+  pending: {
+    requestId: string;
+    toolCall?: Record<string, unknown>;
+    title?: string | null;
+    options: Array<{ optionId: string; name?: string; kind?: string }>;
+  },
+): DaemonEvent {
+  const data: Record<string, unknown> = {
+    requestId: pending.requestId,
+    sessionId,
+    toolCall: pending.toolCall ?? null,
+    options: pending.options.map((option) => ({
+      optionId: option.optionId,
+      label: option.name ?? option.optionId,
+      raw: { kind: pickOptionKind(option) },
+    })),
+  };
+  if (pending.title != null) data.title = pending.title;
+  return { v: 1, type: 'permission_request', data };
+}
+
+/**
+ * 合成 raw.kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
+ *
+ * 上游 DataAgent 的选项不带 kind 字段，只能从 optionId 的文本语义合成：
+ *  reject：cancel/reject/deny 出现 → reject_once（reject 一刀斩，不加 "always" 担心记住拒绝）
+ *  allow_always：optionId 含 always → allow_always
+ *  其它一律 allow_once（没它 "提交" 按钮恒 disabled——web-shell 提交选项不可用的真正根因）
+ */
+function pickOptionKind(option: { optionId: string; kind?: string }): string {
+  if (option.kind) return option.kind;
+  const id = option.optionId.toLowerCase();
+  if (/cancel|reject|deny|拒绝/.test(id)) return 'reject_once';
+  if (id.includes('always')) return 'allow_always';
+  return 'allow_once';
+}
+
+export function permissionResolvedEvent(
+  sessionId: string,
+  requestId: string,
+  outcome: Record<string, unknown>,
+): DaemonEvent {
+  return {
+    v: 1,
+    type: 'permission_resolved',
+    data: { requestId, sessionId, outcome },
+  };
+}

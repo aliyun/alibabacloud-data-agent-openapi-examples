@@ -45,6 +45,12 @@ public class Registry {
          */
         public String aliasId;
         public final Journal journal = new Journal();
+        /**
+         * 在途 permission 请求：requestId → permission_request 的事件本体。
+         * 用户点卡时 /session/:id/permission/:requestId 共享这份状态；回覆成功或上游
+         * permission_resolved 时删除。
+         */
+        public final Map<String, Map<String, Object>> pendingPermissions = new java.util.concurrent.ConcurrentHashMap<>();
         /** rename 覆盖（进程级：上游没有改名接口，SessionTitle 恒为首条 prompt 原文）。 */
         public volatile String displayName;
         public volatile boolean archived;
@@ -76,6 +82,31 @@ public class Registry {
             records.add(record);
         }
         return record;
+    }
+
+    /**
+     * **重启/置换场景**：用 journal 里的事件量重新看清 `pendingPermissions`。
+     *
+     * 后端重启后 journal 丢光，pendingPermissions 自然也丢。用户重开会话时 load 会把
+     * 上游历史播种回来——里面可能含着**仍然待解答**的 permission_request。
+     * 不重建的话，那张卡的 DOM requestId 会向一个空表回应 → 404「无法 response」。
+     * 重建规则：按 requestId 配对，permission_request 加，permission_resolved 减。
+     */
+    public static void rebuildPendingPermissions(Record record) {
+        record.pendingPermissions.clear();
+        for (Journal.Entry entry : record.journal.all()) {
+            Map<String, Object> ev = entry.event();
+            Object type = ev.get("type");
+            Object data = ev.get("data");
+            if (!(data instanceof Map<?, ?> dataMap)) continue;
+            Object requestId = dataMap.get("requestId");
+            if (!(requestId instanceof String rid)) continue;
+            if ("permission_request".equals(type)) {
+                record.pendingPermissions.put(rid, ev);
+            } else if ("permission_resolved".equals(type) || "permission_already_resolved".equals(type)) {
+                record.pendingPermissions.remove(rid);
+            }
+        }
     }
 
     public synchronized Record link(String aliasId, String realId) {

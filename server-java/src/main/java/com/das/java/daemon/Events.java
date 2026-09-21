@@ -78,4 +78,63 @@ public final class Events {
         out.put("id", id);
         return out;
     }
+
+    // ------------------------------------------------------------------
+    // permission：上游 `_qwen/notify` 帧 → daemon `permission_request` / `permission_resolved`
+    // （事件类型名与 data 键名以 @qwen-code/sdk 的事件契约为准；toolCall 原样透传含
+    //  _meta.toolName / rawInput，options 映射成 web-shell 期望的 {optionId,label,raw:{kind}}）。
+    // ------------------------------------------------------------------
+
+    /**
+     * 合成 raw.kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
+     * 上游 DataAgent 选项不带 kind 字段，只能按 optionId 文本语义合成：
+     * cancel/reject/deny → reject_once；含 always → allow_always；其它一律 allow_once
+     * （没它"提交"按钮恒 disabled——「提交选项不可用」的真正根因）。
+     */
+    private static String pickOptionKind(String optionId, String kind) {
+        if (kind != null && !kind.isEmpty()) return kind;
+        String id = optionId.toLowerCase();
+        if (id.matches(".*(cancel|reject|deny).*$")) return "reject_once";
+        if (id.contains("always")) return "allow_always";
+        return "allow_once";
+    }
+
+    public static Map<String, Object> permissionRequest(
+        String sessionId,
+        String requestId,
+        Map<String, Object> toolCall,
+        String title,
+        java.util.List<Map<String, Object>> options
+    ) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("requestId", requestId);
+        data.put("sessionId", sessionId);
+        data.put("toolCall", toolCall);
+        java.util.List<Map<String, Object>> mappedOptions = new java.util.ArrayList<>();
+        for (Map<String, Object> option : options) {
+            Object optionId = option.get("optionId");
+            if (optionId == null || String.valueOf(optionId).isEmpty()) continue;
+            Map<String, Object> mapped = new LinkedHashMap<>();
+            mapped.put("optionId", String.valueOf(optionId));
+            Object name = option.get("name");
+            mapped.put("label", name != null && !String.valueOf(name).isEmpty()
+                ? String.valueOf(name) : String.valueOf(optionId));
+            String kindStr = String.valueOf(optionId);
+            Object kind = option.get("kind");
+            mapped.put("raw", java.util.Map.of("kind",
+                pickOptionKind(kindStr, kind instanceof String s ? s : "")));
+            mappedOptions.add(mapped);
+        }
+        data.put("options", mappedOptions);
+        if (title != null) data.put("title", title);
+        return event("permission_request", data, null);
+    }
+
+    public static Map<String, Object> permissionResolved(String sessionId, String requestId, Map<String, Object> outcome) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("requestId", requestId);
+        data.put("sessionId", sessionId);
+        data.put("outcome", outcome);
+        return event("permission_resolved", data, null);
+    }
 }

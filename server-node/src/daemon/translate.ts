@@ -1,6 +1,9 @@
 import {
   errorOf,
+  paramsOf,
   partitionByRid,
+  pendingInteractionOf,
+  permissionResolvedOf,
   sessionUpdateOf,
   stripMarkerInstruction,
   terminalOf,
@@ -9,7 +12,16 @@ import {
   type AcpFrame,
 } from '@das/shared';
 
-import { sessionUpdateEvent, type DaemonEvent } from './events.js';
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+import {
+  permissionRequestEvent,
+  permissionResolvedEvent,
+  sessionUpdateEvent,
+  type DaemonEvent,
+} from './events.js';
 
 export interface TranslateOptions {
   /**
@@ -96,6 +108,13 @@ export function historyFramesToEvents(frames: AcpFrame[], sessionId: string): Da
     if (!group.some((frame) => sessionUpdateOf(frame) === 'user_message_chunk')) continue;
     let userText = '';
     for (const frame of group) {
+      // permission 通知也进种子：错过 resolution 的屏后到达事件照样有 journal、
+      // 载荷上的 pending 状态才能被负载后的 load 还原（含 requestId 配对删 pending）。
+      const permissionEvent = frameToPermissionEvent(frame, sessionId);
+      if (permissionEvent !== undefined) {
+        out.push(permissionEvent);
+        continue;
+      }
       const event = frameToSessionUpdate(frame, sessionId);
       if (!event) continue;
       const update = event.data.update as { sessionUpdate?: string; content?: { text?: string } };
@@ -118,4 +137,34 @@ export function terminalOfFrame(frame: AcpFrame): ReturnType<typeof terminalOf> 
 
 export function errorOfFrame(frame: AcpFrame): ReturnType<typeof errorOf> {
   return errorOf(frame);
+}
+
+// ------------------------------------------------------------------
+// permission：把 `_qwen/notify` 帧翻译成 daemon 的 permission 事件。
+// 上游的通知不能当 session_update 发——它有专门的 permission 事件契约
+// （DAEMON_KNOWN_EVENT_TYPE_VALUES 里的 permission_request/resolved），
+// 否则 web-shell 就不会弹卡（此前这些帧被默默丢弃，即「没有弹框」的根因）。
+// ------------------------------------------------------------------
+
+export function frameToPermissionEvent(frame: AcpFrame, sessionId: string): DaemonEvent | undefined {
+  const pending = pendingInteractionOf(frame);
+  if (pending) {
+    const params = paramsOf(frame);
+    const data = params && isObject(params.data) ? params.data : undefined;
+    const toolCall = data && isObject(data.toolCall) ? data.toolCall : undefined;
+    return permissionRequestEvent(sessionId, {
+      requestId: pending.requestId,
+      toolCall,
+      title: pending.toolCallTitle ?? null,
+      options: pending.options,
+    });
+  }
+  const resolved = permissionResolvedOf(frame);
+  if (resolved) {
+    const params = paramsOf(frame);
+    const data = params && isObject(params.data) ? params.data : undefined;
+    const outcome = data && isObject(data.outcome) ? data.outcome : { outcome: 'selected' };
+    return permissionResolvedEvent(sessionId, resolved.requestId, outcome);
+  }
+  return undefined;
 }

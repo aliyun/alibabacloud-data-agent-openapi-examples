@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..frames import session_update_of, text_of, update_of
+from ..frames import params_of, pending_interaction_of, permission_resolved_of, session_update_of, text_of, update_of
 from ..marker import strip_marker_instruction
 from ..rid import partition_by_rid
-from .events import DaemonEvent, session_update_event
+from .events import DaemonEvent, permission_request_event, permission_resolved_event, session_update_event
 
 Frame = dict[str, Any]
 
@@ -73,6 +73,11 @@ def history_frames_to_events(frames: list[Frame], session_id: str) -> list[Daemo
             continue
         user_text = ""
         for frame in group:
+            # permission 通知也进种子：刷新后要能还原 pending/pendingResolved 的由来。
+            permission_event = frame_to_permission_event(frame, session_id)
+            if permission_event is not None:
+                out.append(permission_event)
+                continue
             event = frame_to_session_update(frame, session_id, strip_marker=True)
             if event is None:
                 continue
@@ -86,3 +91,32 @@ def history_frames_to_events(frames: list[Frame], session_id: str) -> list[Daemo
             # agent 思考/回答的 chunk 文本原样透传（marker 剥离机制已退役，不再有任何剥除器）
             out.append(event)
     return out
+
+
+# ------------------------------------------------------------------
+# permission：把 `_qwen/notify` 帧翻译成 daemon 的 permission 事件。
+# 上游的通知不能当 session_update 发——它有专门的 permission 事件契约；
+# 此前这些帧被整帧丢弃（update_of 拿不到 → return None），这就是「没有弹框」的根因。
+# ------------------------------------------------------------------
+
+
+def frame_to_permission_event(frame: Frame, session_id: str) -> DaemonEvent | None:
+    pending = pending_interaction_of(frame)
+    if pending is not None:
+        params = params_of(frame)
+        data = params.get("data") if params else None
+        tool_call = data.get("toolCall") if isinstance(data, dict) and isinstance(data.get("toolCall"), dict) else None
+        return permission_request_event(
+            session_id,
+            pending["requestId"],
+            tool_call,
+            pending.get("toolCallTitle"),
+            pending.get("options") or [],
+        )
+    resolved = permission_resolved_of(frame)
+    if resolved is not None:
+        params = params_of(frame)
+        data = params.get("data") if params else None
+        outcome = data.get("outcome") if isinstance(data, dict) and isinstance(data.get("outcome"), dict) else {"outcome": "selected"}
+        return permission_resolved_event(session_id, resolved["requestId"], outcome)
+    return None

@@ -54,7 +54,7 @@ Credentials are used **only by backends**. Never put them in `VITE_*` variables,
 
 ## What You Can Do in the Page
 
-Against any backend (Node.js / Python / Java), you can create or open sessions, send text questions, and watch streaming replies with thought traces and tool call results. Click stop to cancel. Permission-grant and ask-user-question replies aren't wired through yet — don't use tasks that require human confirmation to verify the full flow.
+Against any backend (Node.js / Python / Java), you can create or open sessions, send text questions, and watch streaming replies with thought traces and tool call results. Click stop to cancel. Human-in-the-loop cards (permission confirmations and ask-user-question follow-ups) are wired: when the agent asks for a decision, a card appears; pick an option or type an answer and the reply goes back through ReplyAgentSession while the turn resumes. Note the pending card state lives in the running backend process — a backend restart invalidates that particular card (a fresh prompt will issue a new one); streaming and history playback are unaffected.
 
 History comes from the cloud; save important results promptly. Rename / archive / delete marks are stored only in the running backend process and may revert after restart. Token-usage queries are backend capabilities; the page doesn't promise a full usage dashboard. Context usage and parts of web-shell functionality may be unavailable where backends lack corresponding capabilities.
 

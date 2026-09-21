@@ -92,7 +92,7 @@ public class DaemonController {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("v", 1);
         out.put("mode", "standalone");
-        out.put("features", List.of("standalone_sessions_v1", "standalone_session_options_v1"));
+        out.put("features", List.of("standalone_sessions_v1", "standalone_session_options_v1", "session_permission_vote"));
         out.put("modelServices", List.of("data-agent"));
         out.put("workspaces", List.of());
         out.put("policy", Map.of());
@@ -152,7 +152,7 @@ public class DaemonController {
 
         Map<String, Object> capabilities = new LinkedHashMap<>();
         capabilities.put("protocolVersions", Map.of("current", "1", "supported", List.of("1")));
-        capabilities.put("features", List.of("standalone_sessions_v1", "standalone_session_options_v1"));
+        capabilities.put("features", List.of("standalone_sessions_v1", "standalone_session_options_v1", "session_permission_vote"));
         out.put("capabilities", capabilities);
 
         Map<String, Object> runtime = new LinkedHashMap<>();
@@ -401,20 +401,90 @@ public class DaemonController {
     }
 
     // ------------------------------------------------------------------
-    // permission：上游没有 Respond 通道（ReplyAgentSession 已由 /api 承载，
-    // 这里按 web-shell 的 permission 协议如实 404）
+    // permission：弹卡的回覆通道（与 /api/sessions/:id/reply 同一上游 ReplyAgentSession）。
+    // 契约：200 = 已受理；404 = 未知/已被处理（SDK 按赛跑语义分发）。
     // ------------------------------------------------------------------
 
     @PostMapping("/session/{id}/permission/{requestId}")
-    public ResponseEntity<Map<String, Object>> permissionOnSession(@PathVariable("id") String id, @PathVariable("requestId") String requestId) {
-        return ResponseEntity.status(HttpStatus.NOT_FOUND)
-            .body(errorBody("上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求", "permission_not_found"));
+    public ResponseEntity<Map<String, Object>> permissionOnSession(
+        @PathVariable("id") String id,
+        @PathVariable("requestId") String requestId,
+        @RequestBody(required = false) Map<String, Object> body) {
+        Registry.Record record = resolveSession(id);
+        if (record == null) return notFound(id);
+        Map<String, Object> pending = record.pendingPermissions.get(requestId);
+        if (pending == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody(
+                "没有这个待处理的人卡请求（requestId=" + requestId + "，未知/已被处理）", "permission_not_found"));
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> outcomeRaw = body != null && body.get("outcome") instanceof Map<?, ?> m
+            ? (Map<String, Object>) m : null;
+        String outcomeKind = outcomeRaw != null && "cancelled".equals(outcomeRaw.get("outcome")) ? "cancelled" : "selected";
+        String optionId = outcomeRaw != null && outcomeRaw.get("optionId") instanceof String s && !s.trim().isEmpty()
+            ? s.trim() : null;
+        @SuppressWarnings("unchecked")
+        Map<String, String> answers = body != null && body.get("answers") instanceof Map<?, ?> a && !a.isEmpty()
+            ? (Map<String, String>) a : null;
+        if ("selected".equals(outcomeKind) && optionId == null && answers == null) {
+            return ResponseEntity.badRequest().body(errorBody(
+                "outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）",
+                "invalid_permission_response"));
+        }
+
+        String clientFacingId = record.aliasId != null ? record.aliasId : record.realId;
+        if (live != null) {
+            try {
+                Map<String, Object> input = new LinkedHashMap<>();
+                input.put("permissionRequestId", requestId);
+                if (answers != null && !answers.isEmpty()) input.put("answers", answers);
+                if (optionId != null) input.put("optionId", optionId);
+                input.put("outcome", outcomeKind);
+                Map<String, Object> result = live.reply(record.realId, input);
+                boolean accepted = Boolean.TRUE.equals(result.get("accepted"));
+                if (accepted) {
+                    record.pendingPermissions.remove(requestId);
+                    Map<String, Object> outcomeEvent = new LinkedHashMap<>();
+                    outcomeEvent.put("outcome", outcomeKind);
+                    if (optionId != null) outcomeEvent.put("optionId", optionId);
+                    record.journal.append(Events.permissionResolved(clientFacingId, requestId, outcomeEvent));
+                    return ResponseEntity.ok(Map.of());
+                }
+                // 上游明确不接：按赛跑失败对待——本地移除并走 404 语义
+                record.pendingPermissions.remove(requestId);
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody(
+                    "上游明确 accepted=false（requestId 可能已过期或已被他人回覆）", "permission_not_accepted"));
+            } catch (Exception e) {
+                log.warn("daemon permission 回覆上游失败 sessionId={} requestId={}：{}", record.realId, requestId, e.getMessage());
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("error", "回覆上游失败：" + e.getMessage());
+                out.put("code", "permission_upstream_error");
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(out);
+            }
+        }
+
+        // MOCK：回覆是本地教学闭环——上游无真通道，直接当已受理。
+        record.pendingPermissions.remove(requestId);
+        Map<String, Object> outcomeEvent = new LinkedHashMap<>();
+        outcomeEvent.put("outcome", outcomeKind);
+        outcomeEvent.put("optionId", optionId != null ? optionId : "proceed_once");
+        record.journal.append(Events.permissionResolved(clientFacingId, requestId, outcomeEvent));
+        return ResponseEntity.ok(Map.of());
     }
 
     @PostMapping("/permission/{requestId}")
-    public ResponseEntity<Map<String, Object>> permissionDirect(@PathVariable("requestId") String requestId) {
-        return ResponseEntity.status(HttpStatus.NOT_FOUND)
-            .body(errorBody("上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求", "permission_not_found"));
+    public ResponseEntity<Map<String, Object>> permissionDirect(
+        @PathVariable("requestId") String requestId,
+        @RequestBody(required = false) Map<String, Object> body) {
+        // 历史兼容路由：requestId 在全注册表里反查会话
+        for (Registry.Record record : registry.allRecords()) {
+            if (record.pendingPermissions.containsKey(requestId)) {
+                return permissionOnSession(record.aliasId != null ? record.aliasId : record.realId, requestId, body);
+            }
+        }
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody(
+            "没有这个待处理的人卡请求（requestId=" + requestId + "，未知/已被处理）", "permission_not_found"));
     }
 
     // ------------------------------------------------------------------
@@ -466,6 +536,8 @@ public class DaemonController {
             // bridge-echo 重复回显都不进 journal）
             List<Map<String, Object>> events = Translate.historyFramesToEvents(frames, id);
             record.journal.seed(events);
+            // 用种子事件重建 pending：重启后那张卡能真正回得上去
+            Registry.rebuildPendingPermissions(record);
         }
 
         Map<String, Object> out = new LinkedHashMap<>(standaloneSessionBody(record, id));

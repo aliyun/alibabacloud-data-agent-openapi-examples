@@ -170,7 +170,18 @@ export const MOCK_SCENARIOS: MockScenario[] = [
     createdAt: 1_789_483_174_000,
   },
   {
-    // 合成样例，非录制件：真实抓包里恰好没有围栏代码块，shiki 暗色配色与 mermaid
+    // 合成样例，非录制件：上游 `_qwen/notify` 的 permission_request 通知帧 +
+    // 回覆链路（ReplyAgentSession）。形状按 09-17 实测通知书。
+    sessionId: 'mock-permission',
+    title: '[MOCK] 人卡交互 · 弹卡 + 回覆',
+    promptFixture: 'prompt-permission.jsonl',
+    historyFixture: 'load-clean.jsonl',
+    frameCount: 3,
+    teaches: '权限/ask_user_question 弹卡出现，回覆后卡片消失',
+    createdAt: 1_789_600_000_000,
+  },
+  {
+    // 合成样例，非录制件：真实抓里没有围栏代码块，shiki 暗色配色与 mermaid
     // 渲染这两条路径从未被真实数据走到。这份是手写的，只为让渲染可被截图验证。
     // 溯源见 server-node/test/fixtures/README.md 的「合成样例」一节。
     sessionId: RENDER_SESSION,

@@ -27,7 +27,7 @@ from ..mock_replay import replay_frames
 from ..normalize import to_api_error
 from .events import prompt_cancelled_event, session_update_event, turn_complete_event, turn_error_event
 from .registry import SessionRecord
-from .translate import frame_to_session_update
+from .translate import frame_to_permission_event, frame_to_session_update
 
 
 @dataclass
@@ -68,14 +68,23 @@ class Rejected:
 Admission = Admitted | Rejected
 
 
-# 与 app 同寿命的轮次队列与 worker。loop 引用只取一次：同一进程单事件循环。
+# 与 app 同寿命的轮次队列与 worker。但队列与工作线程都**写死在创建它们的事件循环上**
+# ——测试逐个换 uvicorn 实例时，新实例的 loop 会用旧的队列，队列与死 loop 绑定断裂
+# （实测：getter = self._get_loop() 直接 RuntimeError，worker 死在 get() 上）。
+# 解法：loop 变了就让它们整组重建；队列里还没消化的轮次与上一条 loop 共灭
+# （测试语境里没有跨实例的"丢不掉轮次"语义包袱）。
 _turn_queue: asyncio.Queue[PendingTurn] | None = None
 _turn_worker_task: asyncio.Task | None = None
+_turn_loop: asyncio.AbstractEventLoop | None = None
 
 
 def submit_turn(loop: asyncio.AbstractEventLoop, pending: PendingTurn) -> None:
     """202 之后由路由层调用：把轮次压进队列，后台 worker 拿个执行。"""
-    global _turn_queue, _turn_worker_task
+    global _turn_queue, _turn_worker_task, _turn_loop
+    if _turn_loop is not loop:
+        _turn_queue = None
+        _turn_worker_task = None
+        _turn_loop = loop
     if _turn_queue is None:
         _turn_queue = asyncio.Queue()
     if _turn_worker_task is None or _turn_worker_task.done():
@@ -216,6 +225,18 @@ async def run_turn(
                     rid_backfilled = True
                     # 在途锁条目的 rid 回填：撞锁的日志要能报出"正在跑的是哪一轮"
                     acquired.entry.rid = rid
+            if not error_sent:
+                # permission 通知帧先于 session_update 处理（到达序的真实顺序）；
+                # 此前这些帧被整帧丢弃就在这条线被吞掉的——「没有弹框」的根因。
+                permission_event = frame_to_permission_event(frame, client_facing_id)
+                if permission_event is not None:
+                    journal.append(permission_event)
+                    request_id = permission_event.get("data", {}).get("requestId")
+                    if isinstance(request_id, str):
+                        if permission_event["type"] == "permission_request":
+                            record.pending_permissions[request_id] = permission_event
+                        else:
+                            record.pending_permissions.pop(request_id, None)
             if not error_sent:
                 event = frame_to_session_update(frame, client_facing_id, strip_marker=True, originator_client_id=client_id)
                 duplicate_user_chunk = False

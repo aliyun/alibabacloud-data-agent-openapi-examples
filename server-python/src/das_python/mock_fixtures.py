@@ -159,6 +159,16 @@ MOCK_SCENARIOS: list[MockScenario] = [
         teaches="合成样例：覆盖代码块高亮与 mermaid 图渲染（非样例录制件）",
         createdAt=1_789_500_000_000,
     ),
+    # 人卡交互（合成）：权限/ask_user_question 弹卡与回覆。
+    MockScenario(
+        sessionId="mock-permission",
+        title="[MOCK] 人卡交互 · 弹卡 + 回覆",
+        promptFixture="prompt-permission.jsonl",
+        historyFixture="load-clean.jsonl",
+        frameCount=3,
+        teaches="权限/ask_user_question 弹卡出现，回覆后卡片消失",
+        createdAt=1_789_600_000_000,
+    ),
 ]
 
 # 两条"别的来源"的会话，用于证明 SessionSource 过滤真的生效。

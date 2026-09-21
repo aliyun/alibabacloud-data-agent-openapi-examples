@@ -1,16 +1,16 @@
 import { randomUUID } from 'node:crypto';
 
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import { STREAM_HARD_LIMIT_MS, type AcpFrame } from '@das/shared';
 
 import type { AppConfig } from '../config.js';
-import { liveCancel, liveCreateSession, liveLoadFrames, type LiveContext } from '../live.js';
+import { liveCancel, liveCreateSession, liveLoadFrames, liveReply, type LiveContext } from '../live.js';
 import { findScenario, mockCreateSession, readFixtureFrames } from '../mock/fixtures.js';
 import { toApiError } from '../normalize.js';
 import type { SdkClient } from '../sdk.js';
-import { promptCancelledEvent } from './events.js';
-import { SessionRegistry, WORKSPACE_CWD, type SessionRecord } from './registry.js';
+import { permissionResolvedEvent, promptCancelledEvent } from './events.js';
+import { rebuildPendingPermissions, SessionRegistry, WORKSPACE_CWD, type SessionRecord } from './registry.js';
 import { admitPrompt, type PromptDeps } from './runner.js';
 import { streamSse } from './sse.js';
 import { historyFramesToEvents } from './translate.js';
@@ -26,7 +26,8 @@ import { historyFramesToEvents } from './translate.js';
  *  · standalone 会话 CRUD（创建走 alias 映射——客户端强制回显自带的 sessionId，而上游自生成 id）
  *  · load/resume（历史帧过滤后灌 journal，回放放 compactedReplay / liveJournal）
  *  · prompt 202 + SSE events（Last-Event-ID 续传）+ cancel / heartbeat / transcript
- *  · permission 一律 404（上游没有 Respond 通道，永远不会出现待批准请求）
+ *  · permission：`_qwen/notify` → permission_request/resolved 事件（弹卡的唯一通道），
+ *    回覆走 ReplyAgentSession（200 受理 / 404 未知·已被处理，与 web-shell SDK 契约对齐）
  *  · 未知端点 404 并**记日志**——那是 OPENAPI-GAPS.md 的证据来源
  */
 export async function registerDaemonRoutes(
@@ -69,7 +70,7 @@ export async function registerDaemonRoutes(
       d.get('/capabilities', async () => ({
         v: 1,
         mode: 'standalone',
-        features: ['standalone_sessions_v1', 'standalone_session_options_v1'],
+        features: ['standalone_sessions_v1', 'standalone_session_options_v1', 'session_permission_vote'],
         modelServices: ['data-agent'],
         workspaces: [],
         policy: {},
@@ -126,7 +127,7 @@ export async function registerDaemonRoutes(
           },
           capabilities: {
             protocolVersions: { current: '1', supported: ['1'] },
-            features: ['standalone_sessions_v1', 'standalone_session_options_v1'],
+            features: ['standalone_sessions_v1', 'standalone_session_options_v1', 'session_permission_vote'],
           },
           runtime: {
             sessions: { active: stats.sessions },
@@ -349,23 +350,100 @@ export async function registerDaemonRoutes(
         return reply.code(204).send();
       });
 
-      // ---- permission：上游没有 Respond 通道 ----
+      // ---- permission：弹卡的回覆通道（与 /api/sessions/:id/reply 同一上游 ReplyAgentSession） ----
+      //
+      // 契约（@qwen-code/sdk respondToSessionPermission）：200 = 已受理；404 = 未知/已被处理
+      // （多客户端赛跑输给了别人），SDK 的 boolean 回执按此语义分发。
+
+      async function respondPermission(request: FastifyRequest, reply: FastifyReply, sessionId: string, requestId: string) {
+        const record = resolveSession(sessionId);
+        if (!record) return notFound(reply, sessionId);
+        const pending = record.pendingPermissions.get(requestId);
+        if (!pending) {
+          return reply.code(404).send({
+            error: `没有这个待处理的人卡请求（requestId=${requestId}，未知/已被处理）`,
+            code: 'permission_not_found',
+          });
+        }
+
+        const body = request.body as
+          | { outcome?: { outcome?: string; optionId?: string }; answers?: Record<string, string> }
+          | undefined;
+        const outcomeKind = body?.outcome?.outcome === 'cancelled' ? 'cancelled' : 'selected';
+        const optionId = typeof body?.outcome?.optionId === 'string' ? body.outcome.optionId.trim() : '';
+        const answers = body?.answers && typeof body.answers === 'object' ? body.answers : undefined;
+        if (outcomeKind === 'selected' && optionId === '' && (!answers || Object.keys(answers).length === 0)) {
+          return reply.code(400).send({
+            error: 'outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）',
+            code: 'invalid_permission_response',
+          });
+        }
+
+        if (live) {
+          try {
+            const result = await liveReply(live, record.realId, {
+              permissionRequestId: requestId,
+              answers,
+              optionId: optionId !== '' ? optionId : undefined,
+              outcome: outcomeKind,
+            });
+            if (result.ok && result.result.accepted) {
+              record.pendingPermissions.delete(requestId);
+              record.journal.append(
+                permissionResolvedEvent(record.aliasId ?? record.realId, requestId, {
+                  outcome: outcomeKind,
+                  ...(optionId !== '' ? { optionId } : {}),
+                }),
+              );
+              return reply.code(200).send({});
+            }
+            // 上游明确不接：按赛跑失败对待——本地移除并走 404 语义让客户端刷新
+            record.pendingPermissions.delete(requestId);
+            return reply.code(404).send({
+              error: result.ok
+                ? '上游明确 accepted=false（requestId 可能已过期或已被他人回覆）'
+                : `回覆被拒：${result.error.message}`,
+              code: 'permission_not_accepted',
+            });
+          } catch (err) {
+            app.log.warn({ err, sessionId: record.realId, requestId }, 'daemon permission 回覆上游失败');
+            return reply.code(502).send({
+              error: `回覆上游失败：${String(err instanceof Error ? err.message : err)}`,
+              code: 'permission_upstream_error',
+            });
+          }
+        }
+
+        // MOCK：回覆是本地教学闭环——上游无真通道，直接当已受理（/api 的 mock reply 是拒绝语义，
+        // 那是对 LIVE-only 行为的如实交代；这里的演示价值在"点卡 → 卡片消失 → 事件归档"）
+        record.pendingPermissions.delete(requestId);
+        record.journal.append(
+          permissionResolvedEvent(record.aliasId ?? record.realId, requestId, {
+            outcome: outcomeKind,
+            ...(optionId !== '' ? { optionId } : { optionId: 'proceed_once' }),
+          }),
+        );
+        return reply.code(200).send({});
+      }
 
       d.post<{ Params: { id: string; requestId: string } }>(
         '/session/:id/permission/:requestId',
-        async (_request, reply) =>
-          reply.code(404).send({
-            error: '上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求',
-            code: 'permission_not_found',
-          }),
+        async (request, reply) => respondPermission(request, reply, request.params.id, request.params.requestId),
       );
 
-      d.post<{ Params: { requestId: string } }>('/permission/:requestId', async (_request, reply) =>
-        reply.code(404).send({
-          error: '上游 data agent OpenAPI 没有 permission/Respond 通道，不会出现待批准请求',
-          code: 'permission_not_found',
-        }),
-      );
+      d.post<{ Params: { requestId: string } }>('/permission/:requestId', async (request, reply) => {
+        // 历史兼容路由（SDK 的 respondToPermission legacy 版）：requestId 在全注册表里反查会话
+        const entry = registry
+          .allRecords()
+          .find((record) => record.pendingPermissions.has(request.params.requestId));
+        if (!entry) {
+          return reply.code(404).send({
+            error: `没有这个待处理的人卡请求（requestId=${request.params.requestId}，未知/已被处理）`,
+            code: 'permission_not_found',
+          });
+        }
+        return respondPermission(request, reply, entry.realId, request.params.requestId);
+      });
 
       // ---- 降级端点 ----
 
@@ -408,6 +486,9 @@ export async function registerDaemonRoutes(
           // bridge-echo 重复回显都不进 journal）
           const events = historyFramesToEvents(frames, id);
           record.journal.seed(events);
+          // 用种子事件重建 pending：重启后这张卡能真正回得上去（这个调用必须每次都做——
+          // seed 幂等轮到时也要兜底；pendingPermissions 的因果跟着 journal 变化走）
+          rebuildPendingPermissions(record);
         }
 
         return {

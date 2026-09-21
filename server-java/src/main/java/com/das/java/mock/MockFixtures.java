@@ -122,6 +122,9 @@ public final class MockFixtures {
         new MockScenario(ACK, "[MOCK] prompt 不派发 · 零帧 · 只有 POP 回执",
             null, null, "0dd3b146c75bf132a65efa7a3080e7cd", 0,
             "prompt 根本没派发：只有 POP 回执、零帧；与断流不同，任务没在跑", 1_789_483_174_000L, null),
+        new MockScenario("mock-permission", "[MOCK] 人卡交互 · 弹卡 + 回覆",
+            "prompt-permission.jsonl", "load-clean.jsonl", null, 3,
+            "权限/ask_user_question 弹卡出现，回覆后卡片消失", 1_789_600_000_000L, null),
         new MockScenario(RENDER, "[MOCK] 渲染覆盖 · 代码块 + mermaid（合成）",
             "synthetic-render.jsonl", "synthetic-render.jsonl", null, 4,
             "合成样例：覆盖代码块高亮与 mermaid 图渲染（非录制件）", 1_789_500_000_000L, null)

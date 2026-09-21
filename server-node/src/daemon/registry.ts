@@ -51,6 +51,12 @@ export interface SessionRecord {
    */
   aliasId: string | undefined;
   journal: SessionJournal;
+  /**
+   * 在途 permission 请求：requestId → permission_request 事件本体。
+   * 用户点卡时 /session/:id/permission/:requestId 共享这份状态，
+   * 回覆成功即移除；上游 permission_resolved 到帧时也移除。
+   */
+  pendingPermissions: Map<string, unknown>;
   /** rename 覆盖（进程级：上游没有改名接口，SessionTitle 恒为首条 prompt 原文）。 */
   displayName: string | undefined;
   archived: boolean;
@@ -59,6 +65,29 @@ export interface SessionRecord {
   createdAt: number;
   /** 最近一次列表拉取缓存的上游摘要（createdAt / 标题等真实值），单会话 lookup 兜底用。 */
   cachedSummary: StandaloneSummary | undefined;
+}
+
+/**
+ * **重启/置换场景**：用 journal 里的事件量重新看清 `pendingPermissions`。
+ *
+ * 后端重启后 journal 丢光（进程级），pendingPreferences 自然也丢了。而用户重新打开会话
+ * 时 load 会把上游历史**播种**回来——里面可能含着**仍然待解答**的 permission_request。
+ * 不重建的话，那张卡的 DOM requestId 会向一个空表回应 → 404「无法 response」。
+ * 重建规则按 requestId 配对：permission_request 加，permission_resolved 减。
+ */
+export function rebuildPendingPermissions(record: SessionRecord): void {
+  record.pendingPermissions.clear();
+  for (const entry of record.journal.all()) {
+    const ev = entry.event;
+    if (ev.type === 'permission_request') {
+      const requestId = typeof ev.data.requestId === 'string' ? ev.data.requestId : undefined;
+      // 与 runner.set(requestId, event.data) 存同样的载荷形态，别存整个信封
+      if (requestId !== undefined) record.pendingPermissions.set(requestId, ev.data);
+    } else if (ev.type === 'permission_resolved' || ev.type === 'permission_already_resolved') {
+      const requestId = typeof ev.data.requestId === 'string' ? ev.data.requestId : undefined;
+      if (requestId !== undefined) record.pendingPermissions.delete(requestId);
+    }
+  }
 }
 
 /**
@@ -83,6 +112,7 @@ export class SessionRegistry {
         clientId: randomUUID(),
         aliasId: undefined,
         journal: new SessionJournal(),
+        pendingPermissions: new Map(),
         displayName: undefined,
         archived: false,
         deleted: false,
@@ -157,6 +187,11 @@ export class SessionRegistry {
     };
     if (summary.mockScenario !== undefined) base.mockScenario = summary.mockScenario;
     return base;
+  }
+
+  /** 去重后的记录全量（byKey 双键去重；permission 反查与列表口径共用）。 */
+  allRecords(): SessionRecord[] {
+    return [...this.records];
   }
 
   /** 归档视图（`?archiveState=archived`）：注册表里 archived 且未删除的记录。 */
