@@ -140,7 +140,105 @@ function shellRun(command, args) {
   });
 }
 
+// ------------------------------------------------------------------
+// 启动前检查表：每一条都自带「天使要装什么」的提示。此处是唯一的失败早出局点。
+// ------------------------------------------------------------------
+
+function runProbe(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    child.once('error', () => resolve(null));
+    child.once('exit', () => resolve(out));
+  });
+}
+
+function report(ok, name, detail = '', hint = '') {
+  const icon = ok ? '✓' : '✗';
+  console.log(`  ${icon} ${name}${detail ? '：' + detail : ''}${!ok && hint ? '\n      提示：' + hint : ''}`);
+}
+
+let hardMissing = false;
+function blockOn(ok, name, detail = '', hint = '') {
+  report(ok, name, detail, hint);
+  if (!ok) hardMissing = true;
+}
+
+async function preflight(lang) {
+  console.log('\n启动前检查：');
+
+  // node（这是 launcher 自己的运行时）
+  blockOn(
+    (() => { const m = process.version.match(/^v(\d+)/); return m && Number(m[1]) >= 20; })(),
+    `node ${process.version}`,
+    '（需要 >= 20.19）',
+    '请装新 Node：https://nodejs.org/ 或 fnm/nvm'
+  );
+
+  // npm 整体依赖到位
+  const hasNodeModules = existsSync(path.join(root, 'node_modules'));
+  blockOn(hasNodeModules, 'JS 依赖（node_modules）', hasNodeModules ? '已安装' : '未安装', '请先 npm ci（按 package-lock.json 完整安装）');
+
+  // 前端：vite 是否就位（node_modules/vite）
+  const hasVite = existsSync(path.join(root, 'node_modules', 'vite'));
+  if (hasNodeModules) {
+    blockOn(hasVite, '前端（vite）', hasVite ? '已装' : '未装', 'npm ci 没有装齐；请确认 npm 版本 >= 10');
+  }
+
+  if (lang === 'java') {
+    const javaOut = await runProbe('java', ['-version']);
+    let javaMajor = null;
+    if (javaOut) {
+      const m = javaOut.match(/(?:version|openjdk)\s*"?(\d+)(?:\.(\d+))?/);
+      if (m) javaMajor = Number(m[1]);
+    }
+    blockOn(
+      javaOut != null && javaMajor != null && javaMajor >= 17,
+      'JDK',
+      javaOut == null ? '不在 PATH' : ((javaOut.match(/(?:version|openjdk)\s*"?([^\s"]+)/) || [])[1] ?? javaOut.split('\n')[0] ?? '(未知版本)'),
+      '需 JDK >= 17。装：brew install openjdk@17（mac）、https://adoptium.net/ 或 Oracle JDK 17+'
+    );
+
+    // maven：只有源码改动了或第一次构建才需要用
+    const jar = path.join(root, 'server-java', 'target', 'das-server-java-0.1.0.jar');
+    const mustRebuild = !existsSync(jar) || newerExists(path.join(root, 'server-java', 'src'), jar);
+    if (mustRebuild) {
+      const mvnOut = await runProbe('mvn', ['-version']);
+      blockOn(
+        mvnOut != null,
+        'Maven',
+        mvnOut ? (mvnOut.match(/Apache Maven ([\d.]+)/) || [])[1] ?? '(无法解析版本)' : '不在 PATH',
+        '首次构建要跑 Maven Central，需 mvn 在 PATH；装：brew install maven 或 https://maven.apache.org/'
+      );
+      report(true, 'server-java 源码与 jar 新鲜度', '需要重新构建（源码 / pom 已更新，会自动跑 mvn package）', '');
+    } else {
+      report(true, 'server-java 源码与 jar 新鲜度', 'jar 已是新构建，直接启动');
+    }
+  }
+
+  if (lang === 'python') {
+    const venvPy = path.join(root, 'server-python', '.venv', 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
+    const venvPyWin = path.join(root, 'server-python', '.venv', 'Scripts', 'python.exe');
+    const py = existsSync(venvPy) ? venvPy : (process.platform === 'win32' && existsSync(venvPyWin)) ? venvPyWin : (process.platform === 'win32' ? 'python' : 'python3');
+    const pyOut = await runProbe(py, ['-c', 'import fastapi, alibabacloud_dataworks_public20240518; print("ok")']);
+    blockOn(
+      pyOut != null && pyOut.includes('ok'),
+      'Python 依赖组合（fastapi + DataAgent SDK）',
+      pyOut != null && pyOut.includes('ok') ? '已装' : `${py} 中此项失败`,
+      '首次请执行：pip install -e server-python（在 server-python 手册）'
+    );
+  }
+
+  if (hardMissing) {
+    console.error('\n启动失败：带 ✗ 的项目先补齐再重新启动。');
+    process.exit(1);
+  }
+}
+
 console.log(`启动 ${language} 后端；首次 Java 构建可能需要几分钟。`);
+await preflight(language);
 const spec = backendSpec(language);
 if (language === 'java' && process.platform === 'win32' && spec.needsBuild) {
   console.log('Windows：源码比 jar 新，先跑 mvn -DskipTests package');
