@@ -5,7 +5,15 @@ import { existsSync, statSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import net from 'node:net';
-import { config } from 'dotenv';
+
+let dotenvConfig;
+try {
+  ({ config: dotenvConfig } = await import('dotenv'));
+} catch {
+  console.error('\n⚠ 没有找到 JS 依赖（node_modules）。');
+  console.error('  先在仓库根执行 `npm ci`（按 package-lock.json 完整安装）；如果它曾半途失败，删 node_modules 再跑一次。\n');
+  process.exit(1);
+}
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
@@ -28,7 +36,7 @@ const envName = process.env.DAS_ENV?.trim();
 if (envName && !/^[\w.-]+$/.test(envName)) throw new Error('DAS_ENV 只能包含字母、数字、下划线、点和短横线');
 const envFile = path.join(root, envName ? `.env.${envName}` : '.env');
 if (envName && !existsSync(envFile)) throw new Error(`找不到 ${envFile}`);
-if (existsSync(envFile)) config({ path: envFile, override: false });
+if (existsSync(envFile)) dotenvConfig({ path: envFile, override: false });
 const port = Number(process.env.PORT || 3000);
 const webPort = Number(process.env.WEB_PORT || 5173);
 for (const value of [port, webPort]) {
