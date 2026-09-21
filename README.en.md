@@ -8,7 +8,7 @@ You run exactly one backend and one frontend at a time. Picking a language chang
 
 ## Quick Start
 
-Every backend needs **Node.js 20.19+ (or 22.12+)** and **npm 10+** to run the frontend. Commands below work on macOS, Linux, and Windows WSL; on Windows, use a WSL terminal.
+Every backend needs **Node.js 20.19+ (or 22.12+)** and **npm 10+** to run the frontend. Commands below work on macOS, Linux, Windows native (cmd / PowerShell), Git Bash, and WSL.
 
 Install shared dependencies at the repository root:
 
