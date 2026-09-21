@@ -8,7 +8,7 @@
 
 ## 快速体验
 
-所有语言都需要 Node.js 20.19+（或 22.12+）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux 和 Windows WSL；Windows 请在 WSL 终端中执行。
+所有语言都需要 Node.js 20.19+（或 22.12+）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux、Windows（原生 cmd / PowerShell）、Git Bash 和 WSL。
 
 在项目根目录安装公共依赖：
 
@@ -25,6 +25,12 @@ npm ci
 | Java | JDK 17+、Maven 3.6.3+；见 [Java 说明](server-java/README.md) | `MOCK=1 npm start -- java` | 已接入 |
 
 打开终端提示的地址，默认是 <http://127.0.0.1:5173>。选择一个示例会话并发送问题，就能看到回复过程。MOCK 模式回放示例数据，不调用云服务；回答不会根据你输入的内容重新生成。
+
+免凭证体验的外壳写法：
+- macOS / Linux / Git Bash：`MOCK=1 npm start -- java`
+- Windows PowerShell：`$env:MOCK="1"; npm start -- java`
+- Windows cmd.exe：`set MOCK=1 && npm start -- java`
+- 双平台通用的快捷方式：`npm start -- java --mock`（`.env` 里已配置时也用 `--mock` 一键切换回放）
 
 首次启动 Java 会下载依赖并构建，可能需要几分钟。出现网页地址后再打开浏览器。按 `Ctrl+C` 同时停止后端和网页；要换语言，先停止再执行对应命令。
 
