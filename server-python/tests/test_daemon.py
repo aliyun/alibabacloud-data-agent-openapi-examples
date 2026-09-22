@@ -10,6 +10,7 @@ TestClient 下首个事件后 asyncio.sleep 必抛 CancelledError）。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import threading
@@ -21,6 +22,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from das_python.config import AppConfig
+from das_python.daemon import runner as daemon_runner
 from das_python.main import create_app
 from das_python.mock_fixtures import _created_scenarios
 
@@ -247,18 +249,29 @@ def test_prompt_202_then_sse_streams_session_updates_to_turn_complete(live_url: 
         _transcript_until(client.get, which, "turn_complete")
 
 
-def test_inflight_prompt_rejects_second_with_409(live_url: str) -> None:
+def test_inflight_prompt_rejects_second_with_409(live_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Hold the first replay open until the second request checks admission.
+    # At mockSpeed=1000 a short public fixture can otherwise finish before it arrives.
+    release = threading.Event()
+    original_replay = daemon_runner.replay_frames
+
+    async def held_replay(*args, **kwargs):
+        assert await asyncio.to_thread(release.wait, 10), "test did not release the first turn"
+        async for frame in original_replay(*args, **kwargs):
+            yield frame
+
+    monkeypatch.setattr(daemon_runner, "replay_frames", held_replay)
     with httpx.Client(base_url=live_url, timeout=15.0) as client:
         created = client.post("/d/standalone/sessions", json={}).json()
         session_id = created["sessionId"]
-
-        first = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第一轮"}]})
-        assert first.status_code == 202
-
-        second = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第二轮"}]})
-        assert second.status_code == 409
-        assert second.json()["code"] == "session_concurrent_operation_in_progress"
-
+        try:
+            first = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第一轮"}]})
+            assert first.status_code == 202
+            second = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第二轮"}]})
+            assert second.status_code == 409
+            assert second.json()["code"] == "session_concurrent_operation_in_progress"
+        finally:
+            release.set()
         _transcript_until(client.get, session_id, "turn_complete")
 
 
