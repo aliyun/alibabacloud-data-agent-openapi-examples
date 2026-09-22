@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyBaseLogger } from 'fastify';
 
 import {
-  STREAM_HARD_LIMIT_MS,
   classifyError,
   promptNotDispatched,
   requestIdOf,
@@ -159,11 +158,9 @@ async function runTurn(
   /** 本轮 user 回显的累积文本：上游会把 echo 发两份（bridge-echo，与归档态同款），
    *  去重判据与 historyFramesToEvents 同源，否则 LIVE 下用户消息显示两遍（实测）。 */
   let userText = '';
-  const deadline = Date.now() + STREAM_HARD_LIMIT_MS;
 
   try {
     for await (const frame of frames) {
-      if (Date.now() > deadline) { outcome = 'local_hard_limit'; break; }
       frameCount += 1;
       lastFrameAt = Date.now();
       if (!ridBackfilled) {

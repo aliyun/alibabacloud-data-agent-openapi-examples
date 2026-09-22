@@ -120,7 +120,7 @@ public class Runner {
      *  · 帧内 Error → 首个错误归一成 turn_error（后续帧继续收）；
      *  · Result.stopReason → turn_complete；
      *  · 无终态：有帧 ⇒ stream_break（绝不重发）；零帧+有回执 ⇒ prompt_not_dispatched。
-     * 硬上限 330s 对齐实测断流墙，到点主动按 stream_break 收尾。
+     * 不设整轮时长上限；等待真实终态或明确的传输错误。
      */
     @SuppressWarnings("unchecked")
     private void runTurn(
@@ -142,11 +142,9 @@ public class Runner {
         boolean ridBackfilled = false;
         /** 本轮 user 回显的累积文本：上游把 echo 发两份（bridge-echo），去重判据与 historyFramesToEvents 同源。 */
         String userText = "";
-        long deadline = System.currentTimeMillis() + Constants.STREAM_HARD_LIMIT_MS;
 
         try {
             while (true) {
-                if (System.currentTimeMillis() > deadline) { outcome = "local_hard_limit"; break; }
                 Map<String, Object> frame = source.next();
                 if (frame == null) break;
                 frameCount += 1;

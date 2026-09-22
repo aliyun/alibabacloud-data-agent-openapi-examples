@@ -13,8 +13,8 @@ public final class Constants {
 
     // 时序（毫秒）
     public static final int HEARTBEAT_MS = 15_000;
-    /** 实测 17 轮里 SSE 在 218.3~257.8s 被掐断；到点主动收尾成 stream_break。 */
-    public static final int STREAM_HARD_LIMIT_MS = 330_000;
+    /** 0 disables the whole-turn deadline, including human confirmation waits. */
+    public static final int STREAM_HARD_LIMIT_MS = 0;
     public static final int DEFAULT_READ_TIMEOUT_MS = 600_000;
     /** load 专用：RUNNING 期 load 有 2/4 概率阻塞到轮次结束，快速失败好过挂死。 */
     public static final int HISTORY_READ_TIMEOUT_MS = 30_000;

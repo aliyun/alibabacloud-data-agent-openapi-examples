@@ -20,7 +20,7 @@ HEARTBEAT_MS = 15_000  # 心跳间隔：防中间层空闲回收连接，同时�
 
 # 实测 17 轮里 SSE 连接在 218.3~257.8s 之间被服务端掐断，超过这个时长拿不到终态。
 # 到点主动收尾成 stream_break，比让连接吊死好——静默截断不能当成功。
-STREAM_HARD_LIMIT_MS = 330_000
+STREAM_HARD_LIMIT_MS = 0  # No whole-turn deadline, including human confirmation waits.
 
 # 普通 API 调用的 readTimeout。prompt 一轮实测最长 191s，要给足余量。
 DEFAULT_READ_TIMEOUT_MS = 600_000

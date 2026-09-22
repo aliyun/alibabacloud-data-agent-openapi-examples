@@ -22,12 +22,10 @@ export const DEFAULT_AGENT_NAME = 'dataworks_data_agent';
 export const HEARTBEAT_MS = 15_000;
 
 /**
- * 单轮流式响应的硬上限。
- *
- * 实测 17 轮里 SSE 连接在 218.3~257.8s 之间被服务端掐断，超过这个时长拿不到终态。
- * 到点主动收尾成 stream_break，比让连接吊死好——静默截断不能当成功。
+ * 默认不限制单轮总时长。0 表示关闭，状态接口同样使用这个值。
+ * 长任务和用户确认等待不能因累计时长被当成断流。
  */
-export const STREAM_HARD_LIMIT_MS = 330_000;
+export const STREAM_HARD_LIMIT_MS = 0;
 
 /**
  * 普通接口调用的 readTimeout。

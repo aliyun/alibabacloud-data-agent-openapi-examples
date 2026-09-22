@@ -22,7 +22,7 @@ export async function buildServer(cfg: AppConfig): Promise<FastifyInstance> {
      * 的时长，不管响应写多久，所以它并不是长轮的天敌；真正会掐长响应的是
      * `server.timeout`（socket 不活动超时，Node 13 起默认 0）与反向代理的 read timeout。
      * 这里仍显式写 0（与 Fastify 默认一致），下面断言的则是 `server.timeout`。
-     * 挂反代时必须把 read timeout 配到大于 STREAM_HARD_LIMIT_MS，否则 330s 的流会被中间层先断。
+     * 反代需允许长流；空闲超时应与心跳配合，不设置响应总时长上限。
      */
     requestTimeout: 0,
   });

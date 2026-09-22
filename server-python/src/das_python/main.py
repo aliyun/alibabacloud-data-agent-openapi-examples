@@ -63,7 +63,6 @@ from .pipeline import PipelineInput, to_wire_events
 from .protocol import WIRE_CONTENT_TYPE, serialize
 
 HEARTBEAT_S = 15
-HARD_LIMIT_S = 330  # 对齐实测 218~258s 的断流墙（STREAM_HARD_LIMIT_MS）
 
 
 def create_app(cfg: AppConfig | None = None) -> FastAPI:
@@ -354,13 +353,13 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
                 return send({"ok": False, "error": rejected.error.to_dict()})
 
             async def stream() -> AsyncGenerator[bytes, None]:
-                """wire 事件 + 心跳 + 硬上限，全部在生成器里完成。
+                """wire 事件 + 心跳，不设整轮时长上限。
 
                 FastAPI 的 StreamingResponse 是 pull 模型：客户端断开时生成器被取消
                 （GeneratorExit），finally 释放在途锁与上游迭代器——不重发、不 cancel。
                 """
                 release = acquired.release
-                deadline = asyncio.get_event_loop().time() + HARD_LIMIT_S
+                pending_next = None
                 last_activity = asyncio.get_event_loop().time()
                 try:
                     events = to_wire_events(
@@ -379,29 +378,11 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
                         if now - last_activity >= HEARTBEAT_S:
                             yield (serialize({"type": "hb", "t": int(time.time() * 1000)}) + "\n").encode()
                             last_activity = asyncio.get_event_loop().time()
-                        if asyncio.get_event_loop().time() >= deadline:
-                            # 硬上限：对齐实测断流墙，主动收尾成 stream_break，而不是无限挂着。
-                            yield (
-                                serialize(
-                                    {
-                                        "type": "error",
-                                        "rid": "",
-                                        "error": {
-                                            "kind": "stream_break",
-                                            "code": None,
-                                            "errorCode": None,
-                                            "message": "session stream ended without turn terminal (hard limit reached)",
-                                            "retryable": False,
-                                            "fatalForSession": False,
-                                            "upstreamStatus": None,
-                                        },
-                                    }
-                                )
-                                + "\n"
-                            ).encode()
-                            break
                         try:
-                            event = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.5, HEARTBEAT_S))
+                            if pending_next is None:
+                                pending_next = asyncio.create_task(iterator.__anext__())
+                            event = await asyncio.wait_for(asyncio.shield(pending_next), timeout=max(0.5, HEARTBEAT_S))
+                            pending_next = None
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
@@ -412,6 +393,9 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
                         yield (serialize(event) + "\n").encode()
                         last_activity = asyncio.get_event_loop().time()
                 finally:
+                    if pending_next is not None:
+                        pending_next.cancel()
+                        await asyncio.gather(pending_next, return_exceptions=True)
                     # 客户端断开（GeneratorExit）时释放上游迭代器：不 cancel、不重发——
                     # 服务端那一轮还在跑，重发等于写两遍。
                     release()

@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
 from ..config import AppConfig
-from ..constants import STREAM_HARD_LIMIT_MS
 from ..errors import classify_error, prompt_not_dispatched, redact_api_error, stream_break_without_terminal
 from ..frames import error_of, request_id_of, session_update_of, terminal_of, text_of
 from ..inflight import Acquired, Rejected as InflightRejected, try_acquire
@@ -191,7 +190,7 @@ async def run_turn(
       · 帧内 Error → 首个错误归一成 turn_error（后续帧继续收）；
       · Result.stopReason → turn_complete；
       · 无终态：有帧 ⇒ stream_break（绝不重发）；零帧+有回执 ⇒ prompt_not_dispatched。
-    硬上限 330s 对齐实测断流墙，到点主动按 stream_break 收尾。
+    不设整轮硬上限；等待真实终态或明确传输错误。
     """
     journal = record.journal
     print(json.dumps({"event": "prompt_stream_start", "backend": "python", "pid": os.getpid(),
@@ -219,13 +218,9 @@ async def run_turn(
     terminal: dict[str, Any] | None = None
     rid_backfilled = False
     user_text = ""
-    deadline = time.time_ns() // 1_000_000 + STREAM_HARD_LIMIT_MS
 
     try:
         async for frame in frames:
-            if time.time_ns() // 1_000_000 > deadline:
-                outcome = "local_hard_limit"
-                break
             frame_count += 1
             last_frame_at = int(time.time() * 1000)
             if not rid_backfilled:

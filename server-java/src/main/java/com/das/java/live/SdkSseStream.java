@@ -61,7 +61,7 @@ public final class SdkSseStream implements AutoCloseable {
      * @param statusCode  HTTP 状态码来源（ResponseIterable::getStatusCode；出错时附上）
      *
      * 停滞上限不在迭代器上设（SDK 没有读超时概念，READ_TIMEOUT 在 builder 里被注释掉了），
-     * 由消费端用 next(timeoutMs) 逐次执行（load 30s 快速失败；prompt 由流管道的硬上限兜底）。
+     * 由消费端用 next(timeoutMs) 逐次执行（load 30s 快速失败；prompt 不设整轮硬上限）。
      */
     public SdkSseStream(String api, Iterator<? extends TeaModel> source, Supplier<Integer> statusCode) {
         reader = new Thread(() -> readLoop(api, source, statusCode), "sdk-sse-" + api);

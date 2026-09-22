@@ -68,8 +68,7 @@ function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT
  *     不 await drain 就是往 Node 侧内存里堆。
  *  3. **close 时 `it.return()`**：客户端断开要释放上游迭代器；
  *     但**绝不调用 cancel、绝不重发**——服务端那一轮还在跑，重发等于写两遍。
- *  4. **硬上限**（默认 330s）：对齐实测 218~258s 的断流墙，主动收尾成 stream_break，
- *     而不是让连接无限挂着。用 Promise.race 是因为上游可能卡在 `next()` 里不返回。
+ *  4. 默认不设整轮硬上限；仅显式传入正数 hardLimitMs 时启用调用方截止时间。
  */
 export async function streamWire(
   reply: FastifyReply,
@@ -124,10 +123,10 @@ export async function streamWire(
   const raceWithClose = <T>(p: Promise<T>): Promise<T | typeof CLOSED> =>
     Promise.race([p, closeSignal]);
 
-  const deadlineTimer = setTimeout(() => {
+  const deadlineTimer = hardLimitMs > 0 ? setTimeout(() => {
     timedOut = true;
     resolveDeadline(DEADLINE);
-  }, hardLimitMs);
+  }, hardLimitMs) : undefined;
 
   /**
    * close / error 都走这里，因为 hijack 之后这条 socket 的错误没有任何人会接：
@@ -230,7 +229,7 @@ export async function streamWire(
     }
   } finally {
     clearInterval(heartbeat);
-    // 每条流都留一个 330s 的定时器，不清理的话事件循环要等它自己走完才可能退出。
+    // 清理调用方显式配置的截止时间（默认没有定时器）。
     clearTimeout(deadlineTimer);
     raw.off('close', onClose);
     raw.off('error', onClose);

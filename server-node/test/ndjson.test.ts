@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { OutgoingHttpHeaders } from 'node:http';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { FastifyBaseLogger, FastifyReply } from 'fastify';
 
@@ -106,6 +106,24 @@ async function* sourceOf(events: WireEvent[], onReturn?: () => void): AsyncGener
 }
 
 describe('streamWire：正常收尾', () => {
+  it('默认等待超过330秒仍保持连接，客户端关闭后释放源', async () => {
+    vi.useFakeTimers();
+    try {
+      const { raw, reply } = harness();
+      let released = false;
+      const result = streamWire(reply, hangingSource(() => { released = true; }), {
+        log: reply.log, sessionId: 'long-human-wait',
+      });
+      await vi.advanceTimersByTimeAsync(700_000);
+      expect(raw.ended).toBe(false);
+      expect(raw.events.some(e => e.type === 'error')).toBe(false);
+      raw.emit('close');
+      expect((await result).endedBy).toBe('client-close');
+      expect(released).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('响应头带上 CORS 与 no-transform，写完 end()，量都记对', async () => {
     const { raw, reply } = harness();
 

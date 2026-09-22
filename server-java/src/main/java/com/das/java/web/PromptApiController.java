@@ -245,17 +245,12 @@ public class PromptApiController {
         producer.setDaemon(true);
         producer.start();
 
-        long deadline = System.currentTimeMillis() + Constants.STREAM_HARD_LIMIT_MS;
         long lastWrite = System.currentTimeMillis();
         try {
             while (true) {
                 Object item = events.poll(1, java.util.concurrent.TimeUnit.SECONDS);
                 long now = System.currentTimeMillis();
                 if (item == null) {
-                    if (now >= deadline) {
-                        writeLine(output, pipeline.hardLimitEvent());
-                        break;
-                    }
                     if (now - lastWrite >= Constants.HEARTBEAT_MS) {
                         writeLine(output, Wire.heartbeat(now));
                         lastWrite = now;
