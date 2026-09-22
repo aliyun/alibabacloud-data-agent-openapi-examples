@@ -87,7 +87,7 @@ rg 'prompt_stream_start|prompt_stream_end' /tmp/data-agent-node.log
 | `upstream_error_frame` | 上游发来了业务错误帧 | 结合本轮错误事件与 requestId 查上游 |
 | `transport_exception` | SDK/读取路径抛出异常 | 看异常类型、Node error code 和 idleMs；仅 `aborted` / `ECONNRESET` 无法证明是超时或谁断开 |
 | `eof_without_terminal` | 流正常结束，但缺少协议终态 | 查网关和上游结束记录；不要自动重发 prompt |
-| `local_hard_limit` | 本地循环命中了 330 秒限制 | 检查是否长时间等待用户；当前检查发生在循环迭代处，不是精确的 socket 定时器 |
+| `local_hard_limit` | 旧版命中本地整轮限制 | 当前版本已移除 daemon 的整轮 330 秒截止时间；看到此项时核对实际部署版本 |
 | `ack_without_frames` | 只有 POP 回执，没有业务帧 | 用 popRequestId 查派发链路 |
 | `task_cancelled`（Python） | 后台任务被取消 | 结合进程退出/服务生命周期日志判断；不等同于用户点取消 |
 
@@ -98,3 +98,18 @@ rg 'prompt_stream_start|prompt_stream_end' /tmp/data-agent-node.log
 新增回归验证了三种 daemon 收到 `Result.stopReason` 后立即结束消费，不会因继续等待连接关闭而报错；终态前异常仍然失败。这是独立的客户端修复，不能据此认定某一次线上 `aborted` 的根因。历史 Load 必须继续读取多个轮次，不应用“首个终态即停止”的规则。
 
 Java `SdkIdleTimeoutTest` 与 Python `test_sdk_idle_timeout.py` 使用真实 SDK、合成凭证和只绑定本机的 SSE 服务，验证当前配置在首帧后静默 22 秒仍能收取终态。它们只验证该空闲窗口，不证明更长等待或真实代理链路不会断开。
+
+
+### 刷新后一直加载
+
+同一个后端进程仍在执行会话时，`load` 直接回放本地 journal 和待回答卡片，不再等待上游历史接口。完整历史到达后会补齐先前缓存的历史快照，并保持已有事件游标。进程重启或请求到另一实例后，本地 journal 不存在，仍需要上游历史接口；这项修复不提供跨实例持久化。
+
+历史请求失败时，网页会显示加载失败和真实会话 ID，并继续现有重连流程。请保留发生时间、后端类型、HTTP 状态以及脱敏后的 `prompt_stream_end` 诊断字段。一次刷新成功不代表先前的流中断已恢复；失败轮次仍明确显示失败。
+
+### 交付边界
+
+- 已移除三种后端的整轮 330 秒截止时间，包括等待人工回答的时间。SDK/socket 等待超时、反向代理和上游服务限制仍然存在；不能据此保证无限时长。
+- 本样例不自动重发有歧义的提示词，不把缺少终态的流记为成功。上游 SSE 游标续传、远端错误归档和创建错误透传取决于所连接服务的部署版本，无法由下载本仓库代码完成升级。
+- 消息串行队列尚未实现，同一会话已有活动提示词时仍拒绝重复提交；`pending-prompts` 查询、删除接口尚不支持。
+- 上游创建会话不保证自动加载用户规则。需要规则时可显式附在首条提示词中，这属于应用绕过方案，不代表平台行为已修复。
+- 若连接服务存在 600 秒执行限制，本样例无法取消该服务限制。客户验收应使用其实际部署区域和网络代理，不应仅依赖 MOCK 契约测试。
