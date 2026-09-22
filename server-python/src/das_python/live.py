@@ -318,7 +318,7 @@ async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any
                 permission_request_id=input_["permissionRequestId"],
                 **({"answers": input_["answers"]} if input_.get("answers") else {}),
                 outcome=sdk_models.ReplyAgentSessionRequestParamsOutcome(
-                    **({"optionId": input_["optionId"]} if input_.get("optionId") else {}),
+                    **({"option_id": input_["optionId"]} if input_.get("optionId") else {}),
                     outcome=input_["outcome"],
                 ),
             ),

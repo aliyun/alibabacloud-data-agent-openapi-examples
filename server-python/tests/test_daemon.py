@@ -499,3 +499,20 @@ def test_restored_question_sends_only_answers_upstream(monkeypatch) -> None:
     reply.assert_awaited_once_with(live, session_id, {
         "permissionRequestId": "question-1", "outcome": "selected", "answers": {"0": "A"}, "optionId": None,
     })
+
+
+@pytest.mark.parametrize('option_id,answers', [('proceed_once', None), ('submit', {'0': 'synthetic freeform'}), (None, {'0': 'A'})])
+def test_reply_uses_real_python_sdk_parameter_names(option_id, answers):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from das_python.live import _reply_result
+    body = SimpleNamespace(to_map=lambda: {'JsonRpcResponse': {'Result': {'Accepted': True}}})
+    client = SimpleNamespace(reply_agent_session_with_options_async=AsyncMock(return_value=SimpleNamespace(body=body)))
+    result = asyncio.run(_reply_result(SimpleNamespace(client=client), 'synthetic-session', {
+        'permissionRequestId': 'synthetic-question', 'optionId': option_id, 'answers': answers, 'outcome': 'selected',
+    }))
+    assert result['accepted'] is True
+    request = client.reply_agent_session_with_options_async.call_args.args[0]
+    assert request.params.outcome.option_id == option_id
+    assert request.params.answers == answers
+    assert request.params.permission_request_id == 'synthetic-question'
