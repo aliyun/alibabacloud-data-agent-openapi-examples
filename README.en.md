@@ -6,7 +6,7 @@ Run a React web interface with your choice of Java, Python, or Node.js backend t
 
 ## Requirements and quick start
 
-All options require Node.js 20.19+ (or 22.12+) and npm 10+ for the frontend. Java additionally requires JDK 17+ and Maven 3.6.3+. Python requires Python 3.11+.
+All options require Node.js 22.x (at least 22.12) or 24.x (22.x recommended) and npm 10+ for the frontend. Java additionally requires JDK 17+ and Maven 3.6.3+. Python requires Python 3.11+.
 
 ```bash
 git clone https://github.com/aliyun/alibabacloud-data-agent-openapi-examples.git

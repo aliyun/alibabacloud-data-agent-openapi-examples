@@ -10,7 +10,7 @@
 
 ## 选择语言，一键启动
 
-所有语言都需要 Node.js 20.19+（或 22.12+）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux、Windows（原生 cmd / PowerShell）、Git Bash 和 WSL。
+所有语言都需要 Node.js 22.x（至少 22.12）或 24.x（推荐 22.x）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux、Windows（原生 cmd / PowerShell）、Git Bash 和 WSL。
 
 在项目根目录安装公共依赖：
 

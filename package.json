@@ -5,7 +5,7 @@
   "type": "module",
   "description": "DataWorks DataAgent OpenAPI 样板工程：Fastify 代理 + React 三栏前端，把实测出来的接口约束固化成代码",
   "engines": {
-    "node": ">=20.19.0"
+    "node": "^22.12.0 || ^24.0.0"
   },
   "workspaces": [
     "shared",

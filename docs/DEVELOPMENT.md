@@ -13,6 +13,10 @@
 
 三种后端读取根 `.env` 或 `DAS_ENV` 选中的文件。Python、Java 自己实现帧解析与错误分类，不依赖 Node 进程。当前 MOCK 数据共同读取 `server-node/test/fixtures/`；目录改名后必须同步检查三种语言的定位逻辑。
 
+## Node.js 版本
+
+支持 Node.js 22.x（至少 22.12）和 24.x，推荐使用 22.x。根目录 `.nvmrc` 选择 22，已安装 nvm 时执行 `nvm install && nvm use`；使用 fnm 时执行 `fnm install 22 && fnm use 22`。随后运行 `npm ci`，安装 Vitest 5 和对应依赖。Node 20 不再受支持；启动前检查也会拒绝旧版本。公共 CI 在 Node 22、24 上分别验证。
+
 ## 验证命令
 
 ```bash
