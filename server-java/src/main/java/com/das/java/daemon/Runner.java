@@ -128,10 +128,15 @@ public class Runner {
         String clientId, Acquired acquired, long startedAt
     ) {
         Journal journal = record.journal;
+        log.info("prompt_stream_start backend=java pid={} sessionId={} promptId={} startedAt={}",
+            ProcessHandle.current().pid(), record.realId, promptId, startedAt);
         List<String> acks = new ArrayList<>();
         FrameSource source = openSource(record.realId, outbound, acks);
 
         int frameCount = 0;
+        Long lastFrameAt = null;
+        String outcome = "eof_without_terminal";
+        String exceptionType = null;
         boolean errorSent = false;
         Frames.TerminalInfo terminal = null;
         boolean ridBackfilled = false;
@@ -141,10 +146,11 @@ public class Runner {
 
         try {
             while (true) {
-                if (System.currentTimeMillis() > deadline) break;
+                if (System.currentTimeMillis() > deadline) { outcome = "local_hard_limit"; break; }
                 Map<String, Object> frame = source.next();
                 if (frame == null) break;
                 frameCount += 1;
+                lastFrameAt = System.currentTimeMillis();
                 if (!ridBackfilled) {
                     String rid = Frames.requestIdOf(frame);
                     if (rid != null) {
@@ -190,6 +196,7 @@ public class Runner {
                 Map<String, Object> frameError = Frames.errorOf(frame);
                 if (frameError != null && !errorSent) {
                     errorSent = true;
+                    outcome = "upstream_error_frame";
                     Object code = frameError.get("code");
                     ApiError api = ApiError.redact(ApiError.classify(
                         frameError.get("message") instanceof String s ? s : null,
@@ -199,6 +206,7 @@ public class Runner {
                     journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
                 }
                 if (terminal == null) terminal = Frames.terminalOf(frame);
+                if (terminal != null) break; // Do not wait for HTTP EOF after protocol completion.
             }
 
             if (!errorSent) {
@@ -206,6 +214,8 @@ public class Runner {
                     journal.append(Events.turnComplete(clientFacingId,
                         terminal.rawStopReason() != null ? terminal.rawStopReason() : "end_turn", promptId));
                 } else {
+                    errorSent = true;
+                    if (frameCount == 0 && !acks.isEmpty()) outcome = "ack_without_frames";
                     ApiError api = frameCount == 0 && !acks.isEmpty()
                         ? ApiError.promptNotDispatched(acks.get(0), System.currentTimeMillis() - startedAt)
                         : ApiError.streamBreakWithoutTerminal(frameCount);
@@ -213,12 +223,18 @@ public class Runner {
                 }
             }
         } catch (DasApiException e) {
+            exceptionType = exceptionTypes(e);
             if (!errorSent) {
+                outcome = "transport_exception";
+                errorSent = true;
                 ApiError api = ApiError.redact(e.apiError());
                 journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
             }
         } catch (Throwable t) {
+            exceptionType = exceptionTypes(t);
             if (!errorSent) {
+                outcome = "transport_exception";
+                errorSent = true;
                 ApiError api = Normalize.toApiError(t, "PromptAgentSession");
                 journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
             }
@@ -228,6 +244,18 @@ public class Runner {
             journal.activePrompt = false;
             journal.activePromptId = null;
             Map<String, Object> stats = new LinkedHashMap<>();
+            stats.put("event", "prompt_stream_end");
+            stats.put("backend", "java");
+            stats.put("pid", ProcessHandle.current().pid());
+            stats.put("startedAt", startedAt);
+            stats.put("endedAt", System.currentTimeMillis());
+            stats.put("lastFrameAt", lastFrameAt);
+            stats.put("idleMs", System.currentTimeMillis() - (lastFrameAt == null ? startedAt : lastFrameAt));
+            stats.put("outcome", terminal != null && !errorSent ? "terminal" : outcome);
+            stats.put("upstreamRequestId", acquired.entry().rid);
+            stats.put("popRequestId", acks.isEmpty() ? null : acks.get(0));
+            stats.put("exceptionType", exceptionType);
+            stats.put("pendingPermissions", record.pendingPermissions.size());
             stats.put("sessionId", record.realId);
             stats.put("clientFacingId", clientFacingId);
             stats.put("promptId", promptId);
@@ -243,14 +271,14 @@ public class Runner {
     // 但 daemon 侧要带 userText 去重 + scrubber，所以不进同一个类）
     // ------------------------------------------------------------------
 
-    private interface FrameSource extends AutoCloseable {
+    interface FrameSource extends AutoCloseable {
         Map<String, Object> next() throws DasApiException;
 
         @Override
         void close();
     }
 
-    private FrameSource openSource(String realId, String outbound, List<String> acks) {
+    FrameSource openSource(String realId, String outbound, List<String> acks) {
         if (live != null) {
             return new LivePromptSource(live, realId, outbound, acks);
         }
@@ -299,7 +327,7 @@ public class Runner {
                     stream = live.openPromptStream(sessionId, outbound, acks);
                 } catch (Exception e) {
                     if (e instanceof DasApiException de) throw de;
-                    throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
+                    throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"), e);
                 }
             }
             while (true) {
@@ -307,7 +335,7 @@ public class Runner {
                 try {
                     data = stream.next();
                 } catch (SdkSseStream.SseException e) {
-                    throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
+                    throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"), e);
                 }
                 if (data == null) return null;
                 Object parsed;
@@ -329,6 +357,15 @@ public class Runner {
         public void close() {
             if (stream != null) stream.close();
         }
+    }
+
+    // Class names only; exception messages may contain prompts, URLs or credentials.
+    static String exceptionTypes(Throwable error) {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; error != null && i < 4; i++, error = error.getCause()) {
+            names.add(error.getClass().getSimpleName());
+        }
+        return String.join(" <- ", names);
     }
 
     @SuppressWarnings("unchecked")

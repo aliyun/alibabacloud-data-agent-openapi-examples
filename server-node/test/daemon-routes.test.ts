@@ -362,11 +362,16 @@ describe('daemon 兼容层 /d（MOCK）', () => {
     expect(requestFrame).toBeDefined();
     const requestData = requestFrame!.envelope.data as {
       requestId: string; sessionId: string; toolCall: Record<string, unknown> | null;
-      options: Array<{ optionId: string }>;
+      options: Array<{ optionId: string; kind: string }>;
     };
     expect(requestData.requestId).toBe('req-keep-1');
     expect(requestData.sessionId).toBe(which);
     expect(requestData.toolCall?._meta ?? null).not.toBeNull();
+    const submit = requestData.options.find(option => option.kind === 'allow_once')!;
+    expect(submit.optionId).toBe('__openapi_answers__');
+    const invalid = await app.inject({ method: 'POST', url: `/d/session/${which}/permission/req-keep-1`,
+      payload: { outcome: { outcome: 'selected', optionId: submit.optionId } } });
+    expect(invalid.statusCode).toBe(400);
 
     await waitUntil(async () => {
       const transcript = (await app.inject({ method: 'GET', url: `/d/session/${which}/transcript` })).json();
@@ -386,7 +391,7 @@ describe('daemon 兼容层 /d（MOCK）', () => {
     const respond = await app.inject({
       method: 'POST',
       url: `/d/session/${which}/permission/req-keep-1`,
-      payload: { outcome: { outcome: 'selected', optionId: 'proceed_once' } },
+      payload: { outcome: { outcome: 'selected', optionId: submit.optionId }, answers: { '0': '先列大纲' } },
     });
     expect(respond.statusCode).toBe(200);
 

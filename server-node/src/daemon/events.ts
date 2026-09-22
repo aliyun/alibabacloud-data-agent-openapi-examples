@@ -74,8 +74,10 @@ export function sessionSnapshotEvent(sessionId: string): DaemonEvent {
 // DAEMON_KNOWN_EVENT_TYPE_VALUES 与 DaemonPermissionRequestData/ResolvedData）。
 // toolCall 原样透传（含 _meta.toolName / rawInput / content），web-shell 按
 // `_meta.toolName` 判别工具、按 `rawInput` 取 ask_user_question 的问卷。
-// options 映射为 web-shell normalizer 期望的 `{optionId, label, raw:{kind}}` 形状。
+// options 映射为 web-shell normalizer 期望的 `{optionId, label, kind}`（SDK 归一化后才成为 option.raw.kind） 形状。
 // ------------------------------------------------------------------
+
+export const OPENAPI_ANSWERS_OPTION = '__openapi_answers__';
 
 export function permissionRequestEvent(
   sessionId: string,
@@ -93,15 +95,23 @@ export function permissionRequestEvent(
     options: pending.options.map((option) => ({
       optionId: option.optionId,
       label: option.name ?? option.optionId,
-      raw: { kind: pickOptionKind(option) },
+      kind: pickOptionKind(option),
     })),
   };
+  const meta = pending.toolCall?._meta as Record<string, unknown> | undefined;
+  const isQuestion = meta?.qwenInteractionKind === 'user_question' || meta?.toolName === 'ask_user_question';
+  const options = data.options as Array<{ optionId: string; label: string; kind: string }>;
+  if (isQuestion && !options.some(option => option.kind === 'allow_once')) {
+    // UI-only action: OpenAPI accepts answers without an upstream optionId.
+    options.push({ optionId: OPENAPI_ANSWERS_OPTION, label: '提交回答', kind: 'allow_once' });
+    data.openApiAnswersOnly = true;
+  }
   if (pending.title != null) data.title = pending.title;
   return { v: 1, type: 'permission_request', data };
 }
 
 /**
- * 合成 raw.kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
+ * 合成线协议 kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
  *
  * 上游 DataAgent 的选项不带 kind 字段，只能从 optionId 的文本语义合成：
  *  reject：cancel/reject/deny 出现 → reject_once（reject 一刀斩，不加 "always" 担心记住拒绝）

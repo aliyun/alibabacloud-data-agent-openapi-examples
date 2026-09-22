@@ -11,6 +11,8 @@ Java 实现的 Runner.java 同源同语义。
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -192,6 +194,8 @@ async def run_turn(
     硬上限 330s 对齐实测断流墙，到点主动按 stream_break 收尾。
     """
     journal = record.journal
+    print(json.dumps({"event": "prompt_stream_start", "backend": "python", "pid": os.getpid(),
+                      "sessionId": record.real_id, "promptId": prompt_id, "startedAt": started_at}), flush=True)
     acks: list[str] = []
 
     frames: AsyncGenerator[dict[str, Any], None]
@@ -208,6 +212,9 @@ async def run_turn(
             acks.append(scenario.popAck)
 
     frame_count = 0
+    last_frame_at = None
+    outcome = "eof_without_terminal"
+    exception_types = []
     error_sent = False
     terminal: dict[str, Any] | None = None
     rid_backfilled = False
@@ -217,8 +224,10 @@ async def run_turn(
     try:
         async for frame in frames:
             if time.time_ns() // 1_000_000 > deadline:
+                outcome = "local_hard_limit"
                 break
             frame_count += 1
+            last_frame_at = int(time.time() * 1000)
             if not rid_backfilled:
                 rid = request_id_of(frame)
                 if rid is not None:
@@ -259,6 +268,7 @@ async def run_turn(
             frame_error = error_of(frame)
             if frame_error is not None and not error_sent:
                 error_sent = True
+                outcome = "upstream_error_frame"
                 api = redact_api_error(
                     classify_error(
                         message=frame_error.get("message") if isinstance(frame_error.get("message"), str) else None,
@@ -269,11 +279,16 @@ async def run_turn(
                 journal.append(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
             if terminal is None:
                 terminal = terminal_of(frame)
+            if terminal is not None:
+                break  # Protocol terminal, not HTTP EOF, ends the turn.
 
         if not error_sent:
             if terminal is not None:
                 journal.append(turn_complete_event(client_facing_id, terminal.get("rawStopReason") or "end_turn", prompt_id))
             else:
+                error_sent = True
+                if frame_count == 0 and acks:
+                    outcome = "ack_without_frames"
                 api = (
                     prompt_not_dispatched(acks[0] if acks else None, int(time.time() * 1000) - started_at)
                     if frame_count == 0 and acks
@@ -281,11 +296,28 @@ async def run_turn(
                 )
                 journal.append(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
     except Exception as err:  # noqa: BLE001
-        if not error_sent:
+        cause = err
+        while cause is not None and len(exception_types) < 4:
+            exception_types.append(type(cause).__name__)
+            cause = cause.__cause__ or cause.__context__
+        if not error_sent and terminal is not None:
+            journal.append(turn_complete_event(client_facing_id, terminal.get("rawStopReason") or "end_turn", prompt_id))
+        elif not error_sent:
+            outcome = "transport_exception"
             error_sent = True
             api = to_api_error(err if isinstance(err, Exception) else RuntimeError(str(err)), "PromptAgentSession")
             journal.append(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
+    except asyncio.CancelledError:
+        outcome = "task_cancelled"
+        raise
     finally:
         acquired.release()
         journal.active_prompt = False
         journal.active_prompt_id = None
+        ended_at = int(time.time() * 1000)
+        print(json.dumps({"event": "prompt_stream_end", "backend": "python", "pid": os.getpid(),
+            "sessionId": record.real_id, "promptId": prompt_id, "startedAt": started_at,
+            "endedAt": ended_at, "lastFrameAt": last_frame_at, "idleMs": ended_at - (last_frame_at or started_at),
+            "frames": frame_count, "upstreamRequestId": acquired.entry.rid, "popRequestId": acks[0] if acks else None,
+            "pendingPermissions": len(record.pending_permissions), "exceptionTypes": exception_types,
+            "outcome": "terminal" if terminal is not None and not error_sent else outcome}), flush=True)

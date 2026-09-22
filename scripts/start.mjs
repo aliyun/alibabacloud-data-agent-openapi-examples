@@ -186,9 +186,9 @@ async function preflight(lang) {
 
   // node（这是 launcher 自己的运行时）
   blockOn(
-    (() => { const m = process.version.match(/^v(\d+)/); return m && Number(m[1]) >= 20; })(),
+    (() => { const [major, minor] = process.versions.node.split('.').map(Number); return (major === 22 && minor >= 12) || major === 24; })(),
     `node ${process.version}`,
-    '（需要 >= 20.19）',
+    '（需要 Node.js 22.x >= 22.12 或 24.x）',
     '请装新 Node：https://nodejs.org/ 或 fnm/nvm'
   );
 

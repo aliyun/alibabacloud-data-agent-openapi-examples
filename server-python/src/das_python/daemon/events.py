@@ -70,12 +70,12 @@ def with_id(event: DaemonEvent, entry_id: int) -> DaemonEvent:
 # ------------------------------------------------------------------
 # permission：上游 `_qwen/notify` 帧 → daemon `permission_request` / `permission_resolved`
 # （事件类型名与 data 键名以 @qwen-code/sdk 的事件契约为准；toolCall 原样透传含
-#  _meta.toolName / rawInput，options 映射成 web-shell 期望的 {optionId,label,raw:{kind}}）。
+#  _meta.toolName / rawInput，options 映射成 web-shell 期望的 {optionId,label,kind}（SDK 归一化后才成为 option.raw.kind））。
 # ------------------------------------------------------------------
 
 
 def _pick_option_kind(option: dict[str, Any]) -> str:
-    """合成 raw.kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
+    """合成线协议 kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
     上游 DataAgent 选项不带 kind 字段，按 optionId 文本语义合成：
     cancel/reject/deny → reject_once；含 always → allow_always；其它一律 allow_once
     （没它"提交"按钮恒 disabled——「提交选项不可用」的真正根因）。"""
@@ -87,6 +87,9 @@ def _pick_option_kind(option: dict[str, Any]) -> str:
     if "always" in option_id:
         return "allow_always"
     return "allow_once"
+
+
+OPENAPI_ANSWERS_OPTION = "__openapi_answers__"
 
 
 def permission_request_event(
@@ -104,12 +107,17 @@ def permission_request_event(
             {
                 "optionId": option["optionId"],
                 "label": option.get("name") or option["optionId"],
-                "raw": {"kind": _pick_option_kind(option)},
+                "kind": _pick_option_kind(option),
             }
             for option in options
             if option.get("optionId")
         ],
     }
+    meta = tool_call.get("_meta", {}) if tool_call else {}
+    is_question = isinstance(meta, dict) and (meta.get("qwenInteractionKind") == "user_question" or meta.get("toolName") == "ask_user_question")
+    if is_question and not any(o["kind"] == "allow_once" for o in data["options"]):
+        data["options"].append({"optionId": OPENAPI_ANSWERS_OPTION, "label": "提交回答", "kind": "allow_once"})
+        data["openApiAnswersOnly"] = True
     if title is not None:
         data["title"] = title
     return _event("permission_request", data)

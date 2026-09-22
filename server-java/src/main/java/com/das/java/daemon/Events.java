@@ -82,11 +82,11 @@ public final class Events {
     // ------------------------------------------------------------------
     // permission：上游 `_qwen/notify` 帧 → daemon `permission_request` / `permission_resolved`
     // （事件类型名与 data 键名以 @qwen-code/sdk 的事件契约为准；toolCall 原样透传含
-    //  _meta.toolName / rawInput，options 映射成 web-shell 期望的 {optionId,label,raw:{kind}}）。
+    //  _meta.toolName / rawInput，options 映射成 web-shell 期望的 {optionId,label,kind}（SDK 归一化后才成为 option.raw.kind））。
     // ------------------------------------------------------------------
 
     /**
-     * 合成 raw.kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
+     * 合成线协议 kind（web-shell 提交按钮只认 allow_once/allow_always/reject_once/reject_always）。
      * 上游 DataAgent 选项不带 kind 字段，只能按 optionId 文本语义合成：
      * cancel/reject/deny → reject_once；含 always → allow_always；其它一律 allow_once
      * （没它"提交"按钮恒 disabled——「提交选项不可用」的真正根因）。
@@ -98,6 +98,8 @@ public final class Events {
         if (id.contains("always")) return "allow_always";
         return "allow_once";
     }
+
+    public static final String OPENAPI_ANSWERS_OPTION = "__openapi_answers__";
 
     public static Map<String, Object> permissionRequest(
         String sessionId,
@@ -121,9 +123,16 @@ public final class Events {
                 ? String.valueOf(name) : String.valueOf(optionId));
             String kindStr = String.valueOf(optionId);
             Object kind = option.get("kind");
-            mapped.put("raw", java.util.Map.of("kind",
-                pickOptionKind(kindStr, kind instanceof String s ? s : "")));
+            mapped.put("kind", pickOptionKind(kindStr, kind instanceof String s ? s : ""));
             mappedOptions.add(mapped);
+        }
+        Object meta = toolCall != null ? toolCall.get("_meta") : null;
+        boolean isQuestion = meta instanceof Map<?, ?> m &&
+            ("user_question".equals(m.get("qwenInteractionKind")) || "ask_user_question".equals(m.get("toolName")));
+        if (isQuestion && mappedOptions.stream().noneMatch(o ->
+                "allow_once".equals(o.get("kind")))) {
+            mappedOptions.add(Map.of("optionId", OPENAPI_ANSWERS_OPTION, "label", "提交回答", "kind", "allow_once"));
+            data.put("openApiAnswersOnly", true);
         }
         data.put("options", mappedOptions);
         if (title != null) data.put("title", title);

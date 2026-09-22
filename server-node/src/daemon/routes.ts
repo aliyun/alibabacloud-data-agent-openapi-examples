@@ -9,7 +9,7 @@ import { liveCancel, liveCreateSession, liveLoadFrames, liveReply, type LiveCont
 import { findScenario, mockCreateSession, readFixtureFrames } from '../mock/fixtures.js';
 import { toApiError } from '../normalize.js';
 import type { SdkClient } from '../sdk.js';
-import { permissionResolvedEvent, promptCancelledEvent } from './events.js';
+import { OPENAPI_ANSWERS_OPTION, permissionResolvedEvent, promptCancelledEvent } from './events.js';
 import { rebuildPendingPermissions, SessionRegistry, WORKSPACE_CWD, type SessionRecord } from './registry.js';
 import { admitPrompt, type PromptDeps } from './runner.js';
 import { streamSse } from './sse.js';
@@ -368,8 +368,16 @@ export async function registerDaemonRoutes(
           | { outcome?: { outcome?: string; optionId?: string }; answers?: Record<string, string> }
           | undefined;
         const outcomeKind = body?.outcome?.outcome === 'cancelled' ? 'cancelled' : 'selected';
-        const optionId = typeof body?.outcome?.optionId === 'string' ? body.outcome.optionId.trim() : '';
+        let optionId = typeof body?.outcome?.optionId === 'string' ? body.outcome.optionId.trim() : '';
         const answers = body?.answers && typeof body.answers === 'object' ? body.answers : undefined;
+        if (optionId === OPENAPI_ANSWERS_OPTION) {
+          if (typeof pending !== 'object' || !('openApiAnswersOnly' in pending) ||
+              pending.openApiAnswersOnly !== true || outcomeKind !== 'selected' ||
+              !answers || Object.keys(answers).length === 0) {
+            return reply.code(400).send({ error: '问答提交必须包含 answers', code: 'invalid_permission_response' });
+          }
+          optionId = ''; // Never send a UI-only option identifier to OpenAPI.
+        }
         if (outcomeKind === 'selected' && optionId === '' && (!answers || Object.keys(answers).length === 0)) {
           return reply.code(400).send({
             error: 'outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）',
@@ -418,7 +426,7 @@ export async function registerDaemonRoutes(
         record.journal.append(
           permissionResolvedEvent(record.realId, requestId, {
             outcome: outcomeKind,
-            ...(optionId !== '' ? { optionId } : { optionId: 'proceed_once' }),
+            ...(optionId !== '' ? { optionId } : {}),
           }),
         );
         return reply.code(200).send({});

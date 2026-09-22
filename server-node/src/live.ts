@@ -52,7 +52,7 @@ import {
 
 import type { AppConfig } from './config.js';
 import { missingResultError, readNonStreamBody, toApiError } from './normalize.js';
-import { SdkError, runtimeFor, type SdkClient } from './sdk.js';
+import { SdkError, runtimeFor, runtimeForSse, type SdkClient } from './sdk.js';
 
 /**
  * 真实上游调用。**所有 LIVE 路径都在这里，一处也不散到路由里**——
@@ -354,7 +354,7 @@ export async function liveLoadFrames(ctx: LiveContext, sessionId: string): Promi
         meta: new LoadAgentSessionRequestParamsMeta({ isReload: true }),
       }),
     }),
-    runtimeFor(HISTORY_READ_TIMEOUT_MS),
+    runtimeForSse(HISTORY_READ_TIMEOUT_MS),
   );
 
   for await (const resp of guardAsyncIterable(stream, 'LoadAgentSession')) {
@@ -692,7 +692,7 @@ export async function* livePromptFrames(
         prompt: [new PromptAgentSessionRequestParamsPrompt({ type: 'text', text: outboundText })],
       }),
     }),
-    runtimeFor(),
+    runtimeForSse(),
   );
 
   let unrecognized = 0;

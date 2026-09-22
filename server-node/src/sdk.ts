@@ -10,7 +10,7 @@ import type { AppConfig } from './config.js';
 
 export type SdkClient = import('@alicloud/dataworks-public20240518').default;
 
-/** 建立 TCP+TLS 的上限。readTimeout 才是长轮的那道闸，connectTimeout 只该管"连不上"。 */
+/** 普通请求的连接超时；SSE 须避开 httpx 将其同时用作 socket 空闲超时的行为。 */
 const CONNECT_TIMEOUT_MS = 10_000;
 
 /** SSE 变体从 8.2.0 起才有；低于它就没有增量帧，只能整体 buffer 到超时。 */
@@ -95,6 +95,19 @@ export function runtimeFor(readTimeoutMs: number = DEFAULT_READ_TIMEOUT_MS): $da
     readTimeout: readTimeoutMs,
     connectTimeout: CONNECT_TIMEOUT_MS,
   });
+}
+
+/**
+ * httpx passes connectTimeout to node:http's socket timeout and never clears it
+ * after connection. Keeping it at 10s aborts established SSE streams during a
+ * question/model pause, even with a 600s readTimeout. Use the stream's budget
+ * for both timers. This also allows connection setup to wait that long; retries
+ * stay disabled and a real stream failure remains an error.
+ */
+export function runtimeForSse(readTimeoutMs: number = DEFAULT_READ_TIMEOUT_MS): $dara.RuntimeOptions {
+  const runtime = runtimeFor(readTimeoutMs);
+  runtime.connectTimeout = readTimeoutMs;
+  return runtime;
 }
 
 /**

@@ -20,9 +20,9 @@ from ..constants import HEARTBEAT_MS, STREAM_HARD_LIMIT_MS
 from ..live import LiveContext, _cancel_result, _create_session_result, _load_frames, _reply_result
 from ..mock_fixtures import find_scenario, mock_create_session, read_fixture_frames
 from ..normalize import to_api_error
-from .events import permission_resolved_event, prompt_cancelled_event, session_snapshot_event
+from .events import OPENAPI_ANSWERS_OPTION, permission_resolved_event, prompt_cancelled_event, session_snapshot_event
 from .journal import MAX_EVENTS, JournalEntry, SessionJournal
-from .registry import WORKSPACE_CWD, SessionRecord, SessionRegistry
+from .registry import WORKSPACE_CWD, SessionRecord, SessionRegistry, rebuild_pending_permissions
 from .runner import admit_prompt, submit_turn
 from .translate import history_frames_to_events
 
@@ -360,6 +360,10 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         outcome_kind = "cancelled" if outcome_raw and outcome_raw.get("outcome") == "cancelled" else "selected"
         option_id = (outcome_raw.get("optionId") or "").strip() if outcome_raw else ""
         answers = body.get("answers") if isinstance(body, dict) and isinstance(body.get("answers"), dict) else None
+        if option_id == OPENAPI_ANSWERS_OPTION:
+            if not pending.get("data", {}).get("openApiAnswersOnly") or outcome_kind != "selected" or not answers:
+                return _error(400, "问答提交必须包含 answers", "invalid_permission_response")
+            option_id = ""  # UI-only option must never reach OpenAPI.
         if outcome_kind == "selected" and not option_id and not answers:
             return _error(400, "outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）", "invalid_permission_response")
 
@@ -388,7 +392,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         record.pending_permissions.pop(request_id, None)
         record.journal.append(permission_resolved_event(session_id, request_id, {
             "outcome": outcome_kind,
-            "optionId": option_id or "proceed_once",
+            **({"optionId": option_id} if option_id else {}),
         }))
         return {}
 
@@ -448,6 +452,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             # bridge-echo 重复回显都不进 journal）
             events = history_frames_to_events(frames, session_id)
             record.journal.seed(events)
+            rebuild_pending_permissions(record)
 
         return {
             **standalone_session_body(record, session_id),

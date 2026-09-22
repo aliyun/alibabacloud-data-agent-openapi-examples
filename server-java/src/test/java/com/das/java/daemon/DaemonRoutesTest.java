@@ -442,6 +442,12 @@ class DaemonRoutesTest {
         assertEquals("req-keep-1", requestData.get("requestId"));
         assertEquals("mock-permission", requestData.get("sessionId"));
         assertTrue(requestData.get("toolCall") != null);
+        var options = (List<Map<String, Object>>) requestData.get("options");
+        var submit = options.stream().filter(o -> "allow_once".equals(o.get("kind"))).findFirst().orElseThrow();
+        assertEquals(Events.OPENAPI_ANSWERS_OPTION, submit.get("optionId"));
+        Res invalid = post("/session/mock-permission/permission/req-keep-1",
+            Map.of("outcome", Map.of("outcome", "selected", "optionId", submit.get("optionId"))));
+        assertEquals(400, invalid.status());
 
         transcriptUntil("mock-permission", "turn_complete");
 
@@ -453,7 +459,7 @@ class DaemonRoutesTest {
 
         // 3) 回覆 → 200，journal 追加 permission_resolved
         Res respond = post("/session/mock-permission/permission/req-keep-1",
-            Map.of("outcome", Map.of("outcome", "selected", "optionId", "proceed_once")));
+            Map.of("outcome", Map.of("outcome", "selected", "optionId", submit.get("optionId")), "answers", Map.of("0", "先列大纲")));
         assertEquals(200, respond.status());
         transcriptUntil("mock-permission", "permission_resolved");
 

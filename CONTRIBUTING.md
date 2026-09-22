@@ -1,6 +1,6 @@
 # Contributing / 贡献指南
 
-Use Node.js 20.19+ (or 22.12+) and npm 10+. See [development](docs/DEVELOPMENT.md) for Python and Java requirements and all validation commands.
+Use Node.js 22.x (at least 22.12) or 24.x (22.x recommended) and npm 10+. See [development](docs/DEVELOPMENT.md) for Python and Java requirements and all validation commands.
 
 1. Run `npm ci`, `npm run build`, and `npm test`.
 2. For backend changes, run the corresponding language tests and `bash scripts/contract-test.sh node|python|java`.

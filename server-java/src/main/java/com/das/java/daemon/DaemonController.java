@@ -425,6 +425,14 @@ public class DaemonController {
         @SuppressWarnings("unchecked")
         Map<String, String> answers = body != null && body.get("answers") instanceof Map<?, ?> a && !a.isEmpty()
             ? (Map<String, String>) a : null;
+        if (Events.OPENAPI_ANSWERS_OPTION.equals(optionId)) {
+            Object pendingData = pending.get("data");
+            if (!(pendingData instanceof Map<?, ?> data) || !Boolean.TRUE.equals(data.get("openApiAnswersOnly"))
+                    || !"selected".equals(outcomeKind) || answers == null) {
+                return ResponseEntity.badRequest().body(errorBody("问答提交必须包含 answers", "invalid_permission_response"));
+            }
+            optionId = null; // UI-only option must never reach OpenAPI.
+        }
         if ("selected".equals(outcomeKind) && optionId == null && answers == null) {
             return ResponseEntity.badRequest().body(errorBody(
                 "outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）",
@@ -466,7 +474,7 @@ public class DaemonController {
         record.pendingPermissions.remove(requestId);
         Map<String, Object> outcomeEvent = new LinkedHashMap<>();
         outcomeEvent.put("outcome", outcomeKind);
-        outcomeEvent.put("optionId", optionId != null ? optionId : "proceed_once");
+        if (optionId != null) outcomeEvent.put("optionId", optionId);
         record.journal.append(Events.permissionResolved(clientFacingId, requestId, outcomeEvent));
         return ResponseEntity.ok(Map.of());
     }

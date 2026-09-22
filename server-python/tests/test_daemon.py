@@ -10,6 +10,7 @@ TestClient 下首个事件后 asyncio.sleep 必抛 CancelledError）。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import threading
@@ -21,6 +22,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from das_python.config import AppConfig
+from das_python.daemon import runner as daemon_runner
 from das_python.main import create_app
 from das_python.mock_fixtures import _created_scenarios
 
@@ -247,18 +249,29 @@ def test_prompt_202_then_sse_streams_session_updates_to_turn_complete(live_url: 
         _transcript_until(client.get, which, "turn_complete")
 
 
-def test_inflight_prompt_rejects_second_with_409(live_url: str) -> None:
+def test_inflight_prompt_rejects_second_with_409(live_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Hold the first replay open until the second request checks admission.
+    # At mockSpeed=1000 a short public fixture can otherwise finish before it arrives.
+    release = threading.Event()
+    original_replay = daemon_runner.replay_frames
+
+    async def held_replay(*args, **kwargs):
+        assert await asyncio.to_thread(release.wait, 10), "test did not release the first turn"
+        async for frame in original_replay(*args, **kwargs):
+            yield frame
+
+    monkeypatch.setattr(daemon_runner, "replay_frames", held_replay)
     with httpx.Client(base_url=live_url, timeout=15.0) as client:
         created = client.post("/d/standalone/sessions", json={}).json()
         session_id = created["sessionId"]
-
-        first = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第一轮"}]})
-        assert first.status_code == 202
-
-        second = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第二轮"}]})
-        assert second.status_code == 409
-        assert second.json()["code"] == "session_concurrent_operation_in_progress"
-
+        try:
+            first = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第一轮"}]})
+            assert first.status_code == 202
+            second = client.post(f"/d/session/{session_id}/prompt", json={"prompt": [{"type": "text", "text": "第二轮"}]})
+            assert second.status_code == 409
+            assert second.json()["code"] == "session_concurrent_operation_in_progress"
+        finally:
+            release.set()
         _transcript_until(client.get, session_id, "turn_complete")
 
 
@@ -320,6 +333,11 @@ def test_permission_flow_respond_and_replay(live_url: str) -> None:
         assert request_data["requestId"] == "req-keep-1"
         assert request_data["sessionId"] == which
         assert request_data.get("toolCall") is not None
+        submit = next(o for o in request_data["options"] if o["kind"] == "allow_once")
+        assert submit["optionId"] == "__openapi_answers__"
+        invalid = client.post(f"/d/session/{which}/permission/req-keep-1",
+                              json={"outcome": {"outcome": "selected", "optionId": submit["optionId"]}})
+        assert invalid.status_code == 400
 
         _transcript_until(client.get, which, "turn_complete")
 
@@ -334,7 +352,7 @@ def test_permission_flow_respond_and_replay(live_url: str) -> None:
         # 3) 回覆 → 200，journal 追加 permission_resolved
         respond = client.post(
             f"/d/session/{which}/permission/req-keep-1",
-            json={"outcome": {"outcome": "selected", "optionId": "proceed_once"}},
+            json={"outcome": {"outcome": "selected", "optionId": submit["optionId"]}, "answers": {"0": "先列大纲"}},
         )
         assert respond.status_code == 200
         _transcript_until(client.get, which, "permission_resolved")
@@ -441,3 +459,43 @@ def test_rebuild_wipes_out_of_band_pending() -> None:
     record.pending_permissions["req-ghost"] = permission_request_event("sess-1", "req-ghost", None, None, [])
     rebuild_pending_permissions(record)
     assert list(record.pending_permissions.keys()) == ["req-a"]
+
+
+def test_question_options_do_not_invent_tool_approval() -> None:
+    from das_python.daemon.events import permission_request_event
+
+    plain = permission_request_event("s", "r", {"_meta": {"toolName": "shell"}}, None, [])
+    assert plain["data"]["options"] == []
+    question = permission_request_event("s", "r", {"_meta": {"toolName": "ask_user_question"}}, None,
+                                        [{"optionId": "real-allow", "kind": "allow_once"}])
+    assert [o["optionId"] for o in question["data"]["options"]] == ["real-allow"]
+    assert "openApiAnswersOnly" not in question["data"]
+
+
+def test_restored_question_sends_only_answers_upstream(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+    from fastapi import FastAPI
+    from das_python.daemon import routes
+
+    frames = [
+        {"RequestId": "turn-1", "Params": {"update": {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "Ask a question"}}}},
+        {"RequestId": "turn-1", "Params": {"kind": "permission_request", "data": {"requestId": "question-1", "toolCall": {"_meta": {"toolName": "ask_user_question"}}}}},
+    ]
+    monkeypatch.setattr(routes, "_load_frames", AsyncMock(return_value=frames))
+    reply = AsyncMock(return_value={"accepted": True})
+    monkeypatch.setattr(routes, "_reply_result", reply)
+    app = FastAPI()
+    live = object()
+    cfg = _mock_cfg()
+    cfg.mock = False
+    routes.register_daemon_routes(app, cfg, live)
+    session_id = "00000000-0000-4000-8000-000000000001"
+    with TestClient(app) as client:
+        assert client.post(f"/d/standalone/sessions/{session_id}/load", json={}).status_code == 200
+        response = client.post(f"/d/session/{session_id}/permission/question-1", json={
+            "outcome": {"outcome": "selected", "optionId": "__openapi_answers__"}, "answers": {"0": "A"},
+        })
+        assert response.status_code == 200
+    reply.assert_awaited_once_with(live, session_id, {
+        "permissionRequestId": "question-1", "outcome": "selected", "answers": {"0": "A"}, "optionId": None,
+    })

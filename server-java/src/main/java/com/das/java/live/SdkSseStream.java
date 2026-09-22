@@ -90,7 +90,9 @@ public final class SdkSseStream implements AutoCloseable {
             } catch (Exception ignored) {
                 status = null;
             }
-            queue.offer(new Failure(new SseException(api + " SSE 读取故障：" + describe(t), status)));
+            SseException failure = new SseException(api + " SSE 读取故障：" + describe(t), status);
+            failure.initCause(t);
+            queue.offer(new Failure(failure));
         }
     }
 

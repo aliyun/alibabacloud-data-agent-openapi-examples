@@ -31,6 +31,11 @@ public final class Normalize {
             this.apiError = error;
         }
 
+        public DasApiException(ApiError error, Throwable cause) {
+            super(error.message(), cause);
+            this.apiError = error;
+        }
+
         public ApiError apiError() {
             return apiError;
         }

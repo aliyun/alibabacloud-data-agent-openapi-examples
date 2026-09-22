@@ -134,6 +134,7 @@ async function runTurn(
   startedAt: number,
 ): Promise<void> {
   const journal = record.journal;
+  deps.log.info({ event: 'prompt_stream_start', backend: 'node', pid: process.pid, sessionId: record.realId, promptId, startedAt }, 'prompt stream start');
   const acks: string[] = [];
 
   let frames: AsyncIterable<AcpFrame>;
@@ -149,6 +150,9 @@ async function runTurn(
   }
 
   let frameCount = 0;
+  let lastFrameAt: number | undefined;
+  let outcome = 'eof_without_terminal';
+  let exception: { name: string; code?: string }[] = [];
   let errorSent = false;
   let terminal: ReturnType<typeof terminalOfFrame> = undefined;
   let ridBackfilled = false;
@@ -159,8 +163,9 @@ async function runTurn(
 
   try {
     for await (const frame of frames) {
-      if (Date.now() > deadline) break;
+      if (Date.now() > deadline) { outcome = 'local_hard_limit'; break; }
       frameCount += 1;
+      lastFrameAt = Date.now();
       if (!ridBackfilled) {
         const rid = requestIdOf(frame);
         if (rid !== undefined) {
@@ -209,23 +214,29 @@ async function runTurn(
       const frameError = errorOfFrame(frame);
       if (frameError !== undefined && !errorSent) {
         errorSent = true;
+        outcome = 'upstream_error_frame';
         const api = redactApiError(classifyError(frameError));
         journal.append(
           turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
         );
       }
       if (terminal === undefined) terminal = terminalOfFrame(frame);
+      // Protocol completion must not wait for HTTP EOF (which can stall or reset).
+      if (terminal !== undefined) break;
     }
 
     if (!errorSent) {
       if (terminal !== undefined) {
         journal.append(turnCompleteEvent(clientFacingId, terminal.rawStopReason ?? 'end_turn', promptId));
       } else if (frameCount === 0 && acks.length > 0) {
+        errorSent = true;
+        outcome = 'ack_without_frames';
         const api = promptNotDispatched(acks[0], Date.now() - startedAt);
         journal.append(
           turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
         );
       } else {
+        errorSent = true;
         const api = streamBreakWithoutTerminal(frameCount);
         journal.append(
           turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
@@ -233,7 +244,11 @@ async function runTurn(
       }
     }
   } catch (err) {
-    if (!errorSent) {
+    exception = exceptionFacts(err);
+    if (!errorSent && terminal !== undefined) {
+      journal.append(turnCompleteEvent(clientFacingId, terminal.rawStopReason ?? 'end_turn', promptId));
+    } else if (!errorSent) {
+      outcome = 'transport_exception';
       errorSent = true;
       const api = toApiError(err, 'PromptAgentSession');
       journal.append(
@@ -246,6 +261,12 @@ async function runTurn(
     journal.activePromptId = undefined;
     deps.log.info(
       {
+        event: 'prompt_stream_end', backend: 'node', pid: process.pid,
+        startedAt, endedAt: Date.now(), lastFrameAt,
+        idleMs: Date.now() - (lastFrameAt ?? startedAt),
+        outcome: terminal !== undefined && !errorSent ? 'terminal' : outcome,
+        upstreamRequestId: acquired.entry.rid, popRequestId: acks[0],
+        pendingPermissions: record.pendingPermissions.size, exception,
         sessionId: record.realId,
         clientFacingId,
         promptId,
@@ -257,4 +278,20 @@ async function runTurn(
       'daemon prompt 轮次收尾',
     );
   }
+}
+
+/** Only bounded type/code metadata: never serialize SDK request, headers or message. */
+export function exceptionFacts(error: unknown): { name: string; code?: string }[] {
+  const facts: { name: string; code?: string }[] = [];
+  const seen = new Set<unknown>();
+  while (error instanceof Error && facts.length < 4 && !seen.has(error)) {
+    seen.add(error);
+    const code = (error as Error & { code?: unknown }).code;
+    const name = /^(Error|TypeError|AbortError|TimeoutError|RequestTimeoutError|ResponseError|ClientError|ServerError|ThrottlingError)$/.test(error.name) ? error.name : error.constructor.name;
+    facts.push({ name,
+      ...(typeof code === 'string' && /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE|ABORT_ERR)$/.test(code) ? { code } : {}),
+    });
+    error = error.cause;
+  }
+  return facts;
 }

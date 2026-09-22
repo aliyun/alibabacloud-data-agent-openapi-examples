@@ -76,4 +76,37 @@ class PendingRebuildTest {
         Registry.rebuildPendingPermissions(record);
         assertEquals(java.util.Set.of("req-a"), record.pendingPermissions.keySet());
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void questionOptionsDoNotInventToolApproval() {
+        var plain = Events.permissionRequest("s", "r", Map.of("_meta", Map.of("toolName", "shell")), null, List.of());
+        assertEquals(List.of(), ((Map<String, Object>) plain.get("data")).get("options"));
+        var question = Events.permissionRequest("s", "r", Map.of("_meta", Map.of("toolName", "ask_user_question")), null,
+            List.of(Map.of("optionId", "real-allow", "kind", "allow_once")));
+        var data = (Map<String, Object>) question.get("data");
+        assertEquals(List.of(Map.of("optionId", "real-allow", "label", "real-allow", "kind", "allow_once")), data.get("options"));
+        assertTrue(!data.containsKey("openApiAnswersOnly"));
+    }
+
+    @Test
+    void restoredQuestionSendsOnlyAnswersUpstream() throws Exception {
+        var live = org.mockito.Mockito.mock(com.das.java.live.LiveClient.class);
+        var cfg = org.mockito.Mockito.mock(com.das.java.config.AppConfig.class);
+        String id = "00000000-0000-4000-8000-000000000001";
+        org.mockito.Mockito.when(live.loadFrames(id)).thenReturn(List.of(
+            Map.of("RequestId", "turn-1", "Params", Map.of("update", Map.of(
+                "sessionUpdate", "user_message_chunk", "content", Map.of("type", "text", "text", "Ask a question")))),
+            Map.of("RequestId", "turn-1", "Params", Map.of("kind", "permission_request", "data", Map.of(
+                "requestId", "question-1", "toolCall", Map.of("_meta", Map.of("toolName", "ask_user_question")))))
+        ));
+        Map<String, Object> input = Map.of("permissionRequestId", "question-1", "outcome", "selected", "answers", Map.of("0", "A"));
+        org.mockito.Mockito.when(live.reply(id, input)).thenReturn(Map.of("accepted", true));
+        var controller = new DaemonController(cfg, new com.das.java.live.LiveClientHolder(live), new com.das.java.web.Inflight());
+        assertEquals(200, controller.loadSession(id).getStatusCode().value());
+        assertEquals(200, controller.permissionOnSession(id, "question-1", Map.of(
+            "outcome", Map.of("outcome", "selected", "optionId", Events.OPENAPI_ANSWERS_OPTION), "answers", Map.of("0", "A")
+        )).getStatusCode().value());
+        org.mockito.Mockito.verify(live).reply(id, input);
+    }
 }
