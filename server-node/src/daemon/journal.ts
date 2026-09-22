@@ -1,4 +1,5 @@
 import type { DaemonEvent } from './events.js';
+import { isDeepStrictEqual } from 'node:util';
 
 export interface JournalEntry {
   id: number;
@@ -46,12 +47,19 @@ export class SessionJournal {
   }
 
   /**
-   * 用历史帧翻译出的事件做种子。只在 journal 为空时执行——第二次 load 幂等返回
-   * 同一份日志（种子 + 期间发生的 live 轮次），不会把历史重复灌一遍。
+   * Refresh a pure history snapshot only by extending its exact prefix.
+   * Preserve cursors and never overwrite live events or regress to an older snapshot.
    */
   seed(events: DaemonEvent[]): void {
-    if (this.entries.length > 0) return;
-    for (const event of events) this.append(event);
+    if (this.activePrompt || this.entries.length !== this.seedCount || this.firstId() > 1) return;
+    const existing = this.entries.length;
+    if (events.length <= existing) return;
+    for (let i = 0; i < existing; i += 1) {
+      const { id: _oldId, ...prior } = this.entries[i]!.event;
+      const { id: _newId, ...incoming } = events[i]!;
+      if (!isDeepStrictEqual(prior, incoming)) return;
+    }
+    for (const event of events.slice(existing)) this.append(event);
     this.seedCount = this.entries.length;
   }
 

@@ -522,7 +522,8 @@ public class DaemonController {
         Registry.Record record = resolveSession(id);
         if (record == null || record.deleted) return notFound(id);
 
-        if ("load".equals(mode)) {
+        // Do not block restoring an active conversation on upstream history.
+        if ("load".equals(mode) && !record.journal.activePrompt) {
             List<Map<String, Object>> frames;
             if (live != null) {
                 try {

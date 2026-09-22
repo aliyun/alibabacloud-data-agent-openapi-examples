@@ -36,3 +36,30 @@ it('keeps bounded error codes and causes without messages or SDK request objects
   expect(exceptionFacts(Object.assign(new Error('private'), { name: 'RequestTimeoutError' }))).toEqual([{ name: 'RequestTimeoutError' }]);
   expect(exceptionFacts(err)).toEqual([{ name: 'Error' }, { name: 'Error', code: 'ECONNRESET' }]);
 });
+
+
+it('reloads an active question from its journal without blocking on upstream history', async () => {
+  const { SessionRegistry } = await import('../src/daemon/registry.js');
+  const { permissionRequestEvent } = await import('../src/daemon/events.js');
+  const registry = new SessionRegistry();
+  const record = registry.ensure('active-load');
+  const question = permissionRequestEvent(record.realId, { requestId: 'question', options: [] });
+  record.journal.append(question);
+  record.journal.activePrompt = true;
+  record.pendingPermissions.set('question', question.data);
+  vi.spyOn(SessionRegistry.prototype, 'resolve').mockReturnValue(record);
+  const load = vi.spyOn(live, 'liveLoadFrames').mockRejectedValue(new Error('upstream busy'));
+  const app = Fastify();
+  await registerDaemonRoutes(app, { mock: false, corsOrigin: [] } as unknown as AppConfig, {} as live.LiveContext['client']);
+  try {
+    const result = await app.inject({ method: 'POST', url: '/d/standalone/sessions/active-load/load', payload: {} });
+    expect(result.statusCode).toBe(200);
+    expect(result.json().liveJournal).toEqual([{ ...question, id: 1 }]);
+    expect(result.json().lastEventId).toBe(1);
+    expect(record.pendingPermissions.has('question')).toBe(true);
+    expect(load).not.toHaveBeenCalled();
+    record.journal.activePrompt = false;
+    expect((await app.inject({ method: 'POST', url: '/d/standalone/sessions/active-load/load', payload: {} })).statusCode).not.toBe(200);
+    expect(load).toHaveBeenCalledTimes(1);
+  } finally { await app.close(); }
+});

@@ -37,3 +37,25 @@ function isStandaloneSession(value: unknown): value is DaemonStandaloneSession {
     && typeof s.projectlessOutputDirectory === 'string'
     && (directory?.state === 'ready' || directory?.state === 'recreated');
 }
+
+
+export interface SessionLoadNotice { sessionId: string; message?: string }
+
+/** Keep a failed history request visible while the shell reconnects. */
+export function installSessionLoadNotice(client: DaemonClient, notify: (notice: SessionLoadNotice) => void): () => void {
+  const original = client.loadStandaloneSession;
+  client.loadStandaloneSession = async (sessionId, request, clientId) => {
+    try {
+      const restored = await original.call(client, sessionId, {
+        ...request, timeoutMs: request?.timeoutMs && request.timeoutMs > 0 ? Math.min(request.timeoutMs, 35_000) : 35_000,
+      }, clientId);
+      notify({ sessionId });
+      return restored;
+    } catch (error) {
+      const status = error instanceof DaemonHttpError ? `（HTTP ${error.status}）` : '';
+      notify({ sessionId, message: `会话历史加载失败${status}，正在重试。若持续失败，请向管理员提供会话 ID：${sessionId}。` });
+      throw error;
+    }
+  };
+  return () => { client.loadStandaloneSession = original; };
+}

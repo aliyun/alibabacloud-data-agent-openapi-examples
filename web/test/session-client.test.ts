@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DaemonClient, DaemonSessionClient } from '@qwen-code/sdk/daemon';
-import { installOpenApiSessionCreation } from '../src/session-client';
+import { installOpenApiSessionCreation, installSessionLoadNotice } from '../src/session-client';
 
 const session = {
   sessionId: 'openapi-real-session-id', clientId: 'client-id', workspaceCwd: '/data-agent',
@@ -43,4 +43,22 @@ describe('OpenAPI session creation with the actual SDK', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     client.dispose();
   });
+});
+
+
+it('exposes load failure without swallowing it and clears the notice after recovery', async () => {
+  const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+  const original = vi.spyOn(client, 'loadStandaloneSession')
+    .mockRejectedValueOnce(new Error('upstream timeout'))
+    .mockResolvedValueOnce({ ...session } as any);
+  const notify = vi.fn();
+  const restore = installSessionLoadNotice(client, notify);
+  await expect(client.loadStandaloneSession('test-session')).rejects.toThrow('upstream timeout');
+  expect(notify.mock.calls[0]?.[0]).toMatchObject({ sessionId: 'test-session', message: expect.stringContaining('加载失败') });
+  expect(original).toHaveBeenCalledWith('test-session', { timeoutMs: 35_000 }, undefined);
+  await client.loadStandaloneSession('test-session');
+  expect(notify).toHaveBeenLastCalledWith({ sessionId: 'test-session' });
+  restore();
+  expect(client.loadStandaloneSession).toBe(original);
+  client.dispose();
 });

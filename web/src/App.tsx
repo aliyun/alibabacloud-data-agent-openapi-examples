@@ -5,7 +5,7 @@ import {
 } from '@qwen-code/web-shell';
 
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { installOpenApiSessionCreation } from './session-client';
+import { installOpenApiSessionCreation, installSessionLoadNotice, type SessionLoadNotice } from './session-client';
 import { sessionIdFromLocation, writeSessionRoute } from './session-route';
 import { resolveClientId } from './client-id';
 
@@ -81,7 +81,7 @@ export default function App() {
     <div style={{ height: '100%' }}>
       <ErrorBoundary label="Web Shell" variant="panel" resetKeys={[sessionId]}>
         <DaemonWorkspaceProvider baseUrl={DAEMON_BASE}>
-          <OpenApiSessionCreation>
+          <OpenApiSessionCreation sessionId={sessionId}>
             <DaemonSessionProvider
               sessionContext={{ kind: 'standalone' }}
               sessionId={sessionId}
@@ -105,15 +105,20 @@ export default function App() {
 }
 
 /** Install before mounting the session provider, including StrictMode remounts. */
-function OpenApiSessionCreation({ children }: { children: ReactNode }) {
+function OpenApiSessionCreation({ children, sessionId }: { children: ReactNode; sessionId?: string }) {
+  const [notice, setNotice] = useState<SessionLoadNotice>();
   const { client, baseUrl } = useWorkspace();
   const [readyClient, setReadyClient] = useState<typeof client>();
   useEffect(() => {
     const restore = installOpenApiSessionCreation(client, baseUrl);
+    const restoreLoad = installSessionLoadNotice(client, setNotice);
     setReadyClient(client);
-    return restore;
+    return () => { restoreLoad(); restore(); };
   }, [client, baseUrl]);
-  return readyClient === client ? children : null;
+  return readyClient === client ? <>
+    {notice?.sessionId === sessionId && notice?.message && <div role="alert" style={{ position: 'fixed', top: 12, right: 12, maxWidth: 520, zIndex: 100, padding: 12, borderRadius: 8, background: '#4a2020', color: '#fff' }}>{notice.message}</div>}
+    {children}
+  </> : null;
 }
 
 /**

@@ -8,6 +8,24 @@ function updateEvent(n: number) {
 }
 
 describe('daemon journal', () => {
+  it('refreshes a partial history prefix while preserving cursors and live events', () => {
+    const journal = new SessionJournal();
+    journal.seed([updateEvent(1)]);
+    journal.seed([updateEvent(1), updateEvent(2)]);
+    expect(journal.since(1).map(e => e.id)).toEqual([2]);
+    journal.seed([updateEvent(1)]);
+    journal.seed([updateEvent(1), updateEvent(2)]);
+    expect(journal.lastId()).toBe(2);
+    journal.activePrompt = true;
+    journal.seed([updateEvent(1), updateEvent(2), updateEvent(3)]);
+    expect(journal.lastId()).toBe(2);
+    journal.activePrompt = false;
+    journal.seed([updateEvent(9), updateEvent(2), updateEvent(3)]);
+    expect(journal.lastId()).toBe(2);
+    journal.append(updateEvent(3));
+    journal.seed([updateEvent(1), updateEvent(2), updateEvent(3), updateEvent(4)]);
+    expect(journal.lastId()).toBe(3);
+  });
   it('append 分配单调 id；since 按 id 过滤', () => {
     const journal = new SessionJournal();
     const a = journal.append(updateEvent(1));

@@ -48,12 +48,21 @@ public class Journal {
     }
 
     /**
-     * 用历史帧翻译出的事件做种子。只在 journal 为空时执行——第二次 load 幂等返回
-     * 同一份日志（种子 + 期间发生的 live 轮次），不会把历史重复灌一遍。
+     * 历史快照可能在上游仍执行时只包含用户消息。对纯历史日志允许追加严格
+     * 前缀之后的新事件，保留已发出的游标；不能覆盖 live 事件或倒退到旧快照。
      */
     public synchronized void seed(List<Map<String, Object>> events) {
-        if (!entries.isEmpty()) return;
-        for (Map<String, Object> event : events) append(event);
+        if (activePrompt || entries.size() != seedCount || firstId() > 1) return;
+        int existing = entries.size();
+        if (events.size() <= existing) return;
+        for (int i = 0; i < existing; i++) {
+            var prior = new java.util.LinkedHashMap<>(entries.get(i).event());
+            prior.remove("id");
+            var incoming = new java.util.LinkedHashMap<>(events.get(i));
+            incoming.remove("id");
+            if (!prior.equals(incoming)) return;
+        }
+        for (int i = existing; i < events.size(); i++) append(events.get(i));
         seedCount = entries.size();
     }
 

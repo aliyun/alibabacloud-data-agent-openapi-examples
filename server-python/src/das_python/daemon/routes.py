@@ -437,7 +437,8 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         if record is None or record.deleted:
             return _not_found(session_id)
 
-        if mode == "load":
+        # Restore the live journal immediately while upstream is awaiting a reply.
+        if mode == "load" and not record.journal.active_prompt:
             frames: list[dict[str, Any]]
             if live:
                 try:

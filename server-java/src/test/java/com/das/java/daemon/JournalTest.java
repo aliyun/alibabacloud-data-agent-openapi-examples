@@ -43,6 +43,29 @@ class JournalTest {
     }
 
     @Test
+    void partialHistoryRefreshAppendsMissingRepliesWithoutResettingCursor() {
+        Journal journal = new Journal();
+        journal.seed(List.of(updateEvent(1)));
+        journal.seed(List.of(updateEvent(1), updateEvent(2), updateEvent(3)));
+        assertEquals(3, journal.compacted().size());
+        assertEquals(List.of(2L, 3L), journal.since(1).stream().map(Journal.Entry::id).toList());
+        journal.seed(List.of(updateEvent(1), updateEvent(2), updateEvent(3)));
+        journal.seed(List.of(updateEvent(1))); // delayed older response cannot truncate
+        assertEquals(3, journal.lastId());
+        journal.seed(List.of(updateEvent(9), updateEvent(2), updateEvent(3), updateEvent(4)));
+        assertEquals(3, journal.lastId()); // not a prefix: never append conflicting replay
+    }
+
+    @Test
+    void activePromptDoesNotAcceptHistoryRefresh() {
+        Journal journal = new Journal();
+        journal.seed(List.of(updateEvent(1)));
+        journal.activePrompt = true;
+        journal.seed(List.of(updateEvent(1), updateEvent(2)));
+        assertEquals(1, journal.lastId());
+    }
+
+    @Test
     void waitForMoreReturnsImmediatelyOnNewEventsAndEmptyOnTimeout() throws Exception {
         Journal journal = new Journal();
         journal.append(updateEvent(1));

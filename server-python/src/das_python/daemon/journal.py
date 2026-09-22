@@ -59,11 +59,18 @@ class SessionJournal:
         return entry
 
     def seed(self, events: list[DaemonEvent]) -> None:
-        """用历史帧翻译出的事件做种子。只在 journal 为空时执行——第二次 load 幂等返回
-        同一份日志（种子 + 期间发生的 live 轮次），不会把历史重复灌一遍。"""
-        if self._entries:
+        """Extend a pure historical prefix without resetting IDs or overwriting live events."""
+        if self.active_prompt or len(self._entries) != self._seed_count or self.first_id() > 1:
             return
-        for event in events:
+        existing = len(self._entries)
+        if len(events) <= existing:
+            return
+        for index, entry in enumerate(self._entries):
+            prior = {k: v for k, v in entry.event.items() if k != 'id'}
+            incoming = {k: v for k, v in events[index].items() if k != 'id'}
+            if prior != incoming:
+                return
+        for event in events[existing:]:
             self.append(event)
         self._seed_count = len(self._entries)
 

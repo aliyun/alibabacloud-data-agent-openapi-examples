@@ -472,7 +472,8 @@ export async function registerDaemonRoutes(
         const record = resolveSession(id);
         if (!record || record.deleted) return notFound(reply, id);
 
-        if (mode === 'load') {
+        // An active prompt owns the live journal. Upstream load can block awaiting its reply.
+        if (mode === 'load' && !record.journal.activePrompt) {
           let frames: AcpFrame[] = [];
           if (live) {
             try {
