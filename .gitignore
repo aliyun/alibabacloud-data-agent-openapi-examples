@@ -32,3 +32,7 @@ npm-debug.log*
 # app.env 占位文件（纯注释、无真实值）要入库——它是平台未注入 antx.properties 时
 # Dockerfile COPY 的兜底；含密钥的 app.env 只在构建工作区生成，不会回到这个目录。
 APP-META/docker-config/context/
+
+# Internal public-release candidates and private validation reports
+.public-candidate/
+.public-candidate.report.json

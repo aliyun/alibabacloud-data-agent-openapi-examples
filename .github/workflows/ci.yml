@@ -1,12 +1,13 @@
-name: CI
-
+name: Public verification
 on:
   push:
     branches: [main]
   pull_request:
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  node-web:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,17 +15,22 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci --ignore-scripts
-      - run: npm run typecheck
-      - run: npm run build --workspace web
-
-  java-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - run: mvn -B -q -DskipTests package
-        working-directory: server-java
+          cache: maven
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test
+      - run: python -m venv server-python/.venv && server-python/.venv/bin/python -m pip install -e './server-python[test]'
+      - run: server-python/.venv/bin/python -m pytest server-python/tests
+        env:
+          MOCK: '1'
+      - run: mvn -B -f server-java/pom.xml verify
+        env:
+          MOCK: '1'
+      - run: bash scripts/contract-test.sh node && bash scripts/contract-test.sh python && bash scripts/contract-test.sh java

@@ -32,7 +32,7 @@ public class DasApplication {
     @Bean(destroyMethod = "close")
     public com.das.java.live.LiveClientHolder liveClientHolder(AppConfig cfg) throws Exception {
         if (!cfg.mock()) {
-            log.info("SDK Client 已构造（LIVE 模式；官方异步 SDK 9.0.9，流式走 *WithResponseIterable SSE）");
+            log.info("SDK Client 已构造（LIVE 模式；官方异步 SDK，流式走 *WithResponseIterable SSE）");
         }
         return new com.das.java.live.LiveClientHolder(cfg.mock() ? null : new LiveClient(cfg));
     }

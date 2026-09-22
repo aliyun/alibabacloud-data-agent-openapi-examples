@@ -1,7 +1,4 @@
-"""会话注册表：real id 与 alias id 都作键指向同一条记录，journal 因此天然共享——
-侧栏用 real id 打开、而 web-shell 还握着 alias id 时，两边看到同一条事件日志。
-与 Node 实现的 server/daemon/registry.ts、Java 实现的 Registry.java 同源同语义。
-"""
+"""会话注册表：始终以 OpenAPI 返回的真实 sessionId 为身份。"""
 
 from __future__ import annotations
 
@@ -33,10 +30,6 @@ class SessionRecord:
     # prompt 时经 X-Qwen-Client-Id 带回——我们再盖上 user 回显事件的 originatorClientId，
     # web-shell 的 suppressOwnUserEcho 靠它精确匹配抑制自己的回显。
     client_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    # web-shell 创建会话时自带的 id（客户端强制服务端回显同 id，而上游 CreateAgentSession
-    # 自己生成 id），所以只能做 alias 映射。进程级，重启即失——重启后该会话在侧栏以
-    # real id 重新出现，journal 已丢，属已知降级（见 OPENAPI-GAPS）。
-    alias_id: str | None = None
     journal: SessionJournal = field(default_factory=SessionJournal)
     # 在途 permission 请求：requestId → permission_request 的事件本体。
     # 用户点卡时 /session/:id/permission/:requestId 共享这份状态；回覆成功或上游 resolved 时删除。
@@ -57,7 +50,7 @@ StandaloneSummary = dict[str, Any]
 class SessionRegistry:
     def __init__(self) -> None:
         self._by_key: dict[str, SessionRecord] = {}
-        # 去重后的记录集合（by_key 里 alias 与 real 两个键指向同一条记录，不能直接遍历 values）。
+        # 记录集合，用于统计与本地元数据视图。
         self._records: list[SessionRecord] = []
 
     def resolve(self, session_id: str) -> SessionRecord | None:
@@ -70,13 +63,6 @@ class SessionRegistry:
             record = SessionRecord(real_id=real_id)
             self._by_key[key] = record
             self._records.append(record)
-        return record
-
-    def link(self, alias_id: str, real_id: str) -> SessionRecord:
-        record = self.ensure(real_id)
-        if record.alias_id is None:
-            record.alias_id = alias_id.lower()
-            self._by_key[record.alias_id] = record
         return record
 
     def all_records(self) -> list[SessionRecord]:
@@ -138,7 +124,7 @@ class SessionRegistry:
         for record in self._records:
             if not record.archived or record.deleted:
                 continue
-            out.append(self.summary_for(record, record.alias_id or record.real_id))
+            out.append(self.summary_for(record, record.real_id))
         return out
 
     def summary_for(self, record: SessionRecord, client_facing_id: str) -> StandaloneSummary:

@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
-  "alibabacloud-dataworks-public20240518==9.9.0",
+  "alibabacloud-dataworks-public20240518==9.9.1",
   "python-dotenv>=1.0",
 ]
 

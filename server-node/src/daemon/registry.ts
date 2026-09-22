@@ -44,12 +44,6 @@ export interface SessionRecord {
    * web-shell 的 suppressOwnUserEcho 靠它精确匹配抑制自己的回显。
    */
   clientId: string;
-  /**
-   * webshell 创建会话时自带的 id（客户端强制服务端回显同 id，而上游
-   * CreateAgentSession 自己生成 id），所以只能做 alias 映射。进程级，重启即失——
-   * 重启后该会话在侧栏以 real id 重新出现，journal 已丢，属已知降级（见 OPENAPI-GAPS）。
-   */
-  aliasId: string | undefined;
   journal: SessionJournal;
   /**
    * 在途 permission 请求：requestId → permission_request 事件本体。
@@ -90,13 +84,10 @@ export function rebuildPendingPermissions(record: SessionRecord): void {
   }
 }
 
-/**
- * 会话注册表：real id 与 alias id 都作键指向同一条记录，journal 因此天然共享——
- * 侧栏用 real id 打开、而 webshell 还握着 alias id 时，两边看到同一条事件日志。
- */
+/** 会话注册表：始终以 OpenAPI 返回的真实 sessionId 为身份。 */
 export class SessionRegistry {
   private byKey = new Map<string, SessionRecord>();
-  /** 去重后的记录集合（byKey 里 alias 与 real 两个键指向同一条记录，不能直接遍历 values）。 */
+  /** 记录集合，用于统计与本地元数据视图。 */
   private records = new Set<SessionRecord>();
 
   resolve(id: string): SessionRecord | undefined {
@@ -110,7 +101,6 @@ export class SessionRegistry {
       record = {
         realId,
         clientId: randomUUID(),
-        aliasId: undefined,
         journal: new SessionJournal(),
         pendingPermissions: new Map(),
         displayName: undefined,
@@ -125,20 +115,10 @@ export class SessionRegistry {
     return record;
   }
 
-  link(aliasId: string, realId: string): SessionRecord {
-    const record = this.ensure(realId);
-    if (record.aliasId === undefined) {
-      record.aliasId = aliasId.toLowerCase();
-      this.byKey.set(aliasId.toLowerCase(), record);
-    }
-    return record;
-  }
-
   remove(id: string): boolean {
     const record = this.resolve(id);
     if (!record) return false;
     this.byKey.delete(record.realId.toLowerCase());
-    if (record.aliasId !== undefined) this.byKey.delete(record.aliasId);
     return true;
   }
 
@@ -189,7 +169,7 @@ export class SessionRegistry {
     return base;
   }
 
-  /** 去重后的记录全量（byKey 双键去重；permission 反查与列表口径共用）。 */
+  /** 记录全量（permission 反查与列表口径共用）。 */
   allRecords(): SessionRecord[] {
     return [...this.records];
   }
@@ -199,7 +179,7 @@ export class SessionRegistry {
     const out: StandaloneSummary[] = [];
     for (const record of this.records) {
       if (!record.archived || record.deleted) continue;
-      out.push(this.summaryFor(record, record.aliasId ?? record.realId));
+      out.push(this.summaryFor(record, record.realId));
     }
     return out;
   }

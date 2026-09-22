@@ -5,6 +5,7 @@ import { existsSync, statSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import net from 'node:net';
+import { networkInterfaces } from 'node:os';
 
 let dotenvConfig;
 try {
@@ -18,12 +19,14 @@ try {
 const root = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log('用法: npm start -- [node|python|java] [--mock]\n默认 node。\n免凭证体验（回放合成样例）：MOCK=1 npm start -- <lang>（mac/Linux/Git Bash）或\n  · Windows PowerShell：$env:MOCK="1"; npm start -- <lang>\n  · Windows cmd.exe：set MOCK=1&& npm start -- <lang>\n  · 任意外壳：`npm start -- <lang> --mock` 或 `-m`（不用写环境变量，三平台同形）\nDAS_ENV=<name> 选择 .env.<name>。\nCtrl+C 同时停止后端和前端。');
+  console.log('用法: npm start -- [node|python|java] [--mock] [--lan]\n默认 node；--lan 允许同事通过内网 IP 访问网页。\n免凭证体验（回放合成样例）：MOCK=1 npm start -- <lang>（mac/Linux/Git Bash）或\n  · Windows PowerShell：$env:MOCK="1"; npm start -- <lang>\n  · Windows cmd.exe：set MOCK=1&& npm start -- <lang>\n  · 任意外壳：`npm start -- <lang> --mock` 或 `-m`（不用写环境变量，三平台同形）\nDAS_ENV=<name> 选择 .env.<name>。\nCtrl+C 同时停止后端和前端。');
   process.exit(0);
 }
+const lan = args.includes('--lan');
+const webHost = lan ? '0.0.0.0' : '127.0.0.1';
 const mockFlag = args.includes('--mock') || args.includes('-m');
 const language = args.find((v) => ['node', 'python', 'java'].includes(v)) ?? 'node';
-const unknownArgs = args.filter((v) => !['node', 'python', 'java', '--mock', '-m'].includes(v));
+const unknownArgs = args.filter((v) => !['node', 'python', 'java', '--mock', '-m', '--lan'].includes(v));
 if (unknownArgs.length > 0) {
   console.error('无法识别的参数：' + unknownArgs.join(' ') + '（例如 npm start -- python 或 npm start -- python --mock）');
   process.exit(2);
@@ -46,15 +49,19 @@ if (port === webPort) throw new Error('PORT 与 WEB_PORT 不能相同');
 const env = {
   ...process.env,
   PORT: String(port),
-  VITE_API_BASE: `http://127.0.0.1:${port}`,
+  // LAN only exposes the frontend. Its same-origin proxy reaches the local backend.
+  SERVER_HOST: lan ? '127.0.0.1' : (process.env.SERVER_HOST || '127.0.0.1'),
+  DAS_LAN: lan ? '1' : '0',
+  DAS_API_PROXY_TARGET: `http://127.0.0.1:${port}`,
+  VITE_API_BASE: lan ? '' : `http://127.0.0.1:${port}`,
   CORS_ORIGIN: [...new Set([...(process.env.CORS_ORIGIN || '').split(',').filter(Boolean), `http://localhost:${webPort}`, `http://127.0.0.1:${webPort}`])].join(','),
 };
 // Fail before launching either service when the chosen ports are already occupied.
-for (const p of [port, webPort]) {
+for (const [p, host] of [[port, env.SERVER_HOST], [webPort, webHost]]) {
   await new Promise((resolve, reject) => {
     const probe = net.createServer();
     probe.once('error', () => reject(new Error(`端口 ${p} 已占用，请停止原服务或设置 PORT / WEB_PORT`)));
-    probe.listen(p, '127.0.0.1', () => probe.close(resolve));
+    probe.listen(p, host, () => probe.close(resolve));
   });
 }
 
@@ -278,7 +285,15 @@ if (!stopping) {
     } catch {
       console.warn(`提示：${language} 后端已启动，但尚未提供 web-shell 会话接口。网页可以打开，会话交互仍待该语言适配完成。`);
     }
-    launch(process.execPath, [path.join(root, 'node_modules/vite/bin/vite.js'), '--config', 'web/vite.config.ts', '--host', '127.0.0.1', '--port', String(webPort), '--strictPort', 'web']);
+    launch(process.execPath, [path.join(root, 'node_modules/vite/bin/vite.js'), '--config', 'web/vite.config.ts', '--host', webHost, '--port', String(webPort), '--strictPort', 'web']);
     console.log(`打开 http://127.0.0.1:${webPort} · 后端 ${language} · Ctrl+C 同时停止两项服务`);
+    if (lan) {
+      const addresses = [...new Set(Object.values(networkInterfaces()).flat()
+        .filter((entry) => entry && !entry.internal && entry.family === 'IPv4')
+        .map((entry) => entry.address))];
+      for (const address of addresses) console.log(`同事访问：http://${address}:${webPort}`);
+      if (!addresses.length) console.log(`同事访问：http://<本机内网IPv4>:${webPort}`);
+      console.log('内网共享模式：访问者共用当前云账号权限与会话；仅供可信网络内使用。');
+    }
   }
 }

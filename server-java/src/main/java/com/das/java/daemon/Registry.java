@@ -15,11 +15,7 @@ import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * 会话注册表：real id 与 alias id 都作键指向同一条记录，journal 因此天然共享——
- * 侧栏用 real id 打开、而 web-shell 还握着 alias id 时，两边看到同一条事件日志。
- * 与 Node 实现的 server-node/daemon/registry.ts 同源同语义。
- */
+/** 会话注册表：始终以 OpenAPI 返回的真实 sessionId 为身份。 */
 public class Registry {
     private static final Logger log = LoggerFactory.getLogger(Registry.class);
 
@@ -38,12 +34,6 @@ public class Registry {
          * web-shell 的 suppressOwnUserEcho 靠它精确匹配抑制自己的回显。
          */
         public final String clientId = UUID.randomUUID().toString();
-        /**
-         * web-shell 创建会话时自带的 id（客户端强制服务端回显同 id，而上游
-         * CreateAgentSession 自己生成 id），所以只能做 alias 映射。进程级，重启即失——
-         * 重启后该会话在侧栏以 real id 重新出现，journal 已丢，属已知降级（见 OPENAPI-GAPS）。
-         */
-        public String aliasId;
         public final Journal journal = new Journal();
         /**
          * 在途 permission 请求：requestId → permission_request 的事件本体。
@@ -66,7 +56,7 @@ public class Registry {
     }
 
     private final Map<String, Record> byKey = new HashMap<>();
-    /** 去重后的记录集合（byKey 里 alias 与 real 两个键指向同一条记录，不能直接遍历 values）。 */
+    /** 记录集合，用于统计与本地元数据视图。 */
     private final LinkedHashSet<Record> records = new LinkedHashSet<>();
 
     public synchronized Record resolve(String id) {
@@ -107,15 +97,6 @@ public class Registry {
                 record.pendingPermissions.remove(rid);
             }
         }
-    }
-
-    public synchronized Record link(String aliasId, String realId) {
-        Record record = ensure(realId);
-        if (record.aliasId == null) {
-            record.aliasId = aliasId.toLowerCase();
-            byKey.put(record.aliasId, record);
-        }
-        return record;
     }
 
     public synchronized List<Record> allRecords() {
@@ -193,7 +174,7 @@ public class Registry {
         List<Map<String, Object>> out = new ArrayList<>();
         for (Record record : allRecords()) {
             if (!record.archived || record.deleted) continue;
-            out.add(summaryFor(record, record.aliasId != null ? record.aliasId : record.realId));
+            out.add(summaryFor(record, record.realId));
         }
         return out;
     }

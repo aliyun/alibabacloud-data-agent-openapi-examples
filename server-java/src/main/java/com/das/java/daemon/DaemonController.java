@@ -54,7 +54,7 @@ public class DaemonController {
     }
 
     /**
-     * 解析会话：alias 与 real id 都认。LIVE 下未知 id 也放行（深链/重启后直接发话，
+     * 解析会话：使用 OpenAPI 真实 sessionId。LIVE 下未知 id 也放行（深链/重启后直接发话，
      * 存在性交给上游判）；MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
      */
     private Registry.Record resolveSession(String id) {
@@ -213,7 +213,6 @@ public class DaemonController {
 
     @PostMapping("/standalone/sessions")
     public ResponseEntity<?> createSession(@RequestBody(required = false) Map<String, Object> body) {
-        String requested = body != null && body.get("sessionId") instanceof String s ? s : null;
         String realId;
         if (live != null) {
             Map<String, Object> created;
@@ -230,10 +229,9 @@ public class DaemonController {
         } else {
             realId = (String) MockFixtures.mockCreateSession("新建会话").get("sessionId");
         }
-        Registry.Record record = requested != null ? registry.link(requested, realId) : registry.ensure(realId);
-        String clientFacingId = requested != null ? requested : realId;
-        log.info("daemon 兼容层新建会话（alias 已登记）clientFacingId={} realId={} mock={}", clientFacingId, realId, live == null);
-        return ResponseEntity.ok(standaloneSessionBody(record, clientFacingId));
+        Registry.Record record = registry.ensure(realId);
+        log.info("daemon 兼容层新建会话 sessionId={} mock={}", realId, live == null);
+        return ResponseEntity.ok(standaloneSessionBody(record, realId));
     }
 
     @GetMapping("/standalone/sessions/{id}")
@@ -433,7 +431,7 @@ public class DaemonController {
                 "invalid_permission_response"));
         }
 
-        String clientFacingId = record.aliasId != null ? record.aliasId : record.realId;
+        String clientFacingId = record.realId;
         if (live != null) {
             try {
                 Map<String, Object> input = new LinkedHashMap<>();
@@ -480,7 +478,7 @@ public class DaemonController {
         // 历史兼容路由：requestId 在全注册表里反查会话
         for (Registry.Record record : registry.allRecords()) {
             if (record.pendingPermissions.containsKey(requestId)) {
-                return permissionOnSession(record.aliasId != null ? record.aliasId : record.realId, requestId, body);
+                return permissionOnSession(record.realId, requestId, body);
             }
         }
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody(

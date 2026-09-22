@@ -1,134 +1,108 @@
-# DataAgent OpenAPI — Multi-Language Examples
+# DataAgent OpenAPI examples
 
-Experience DataWorks DataAgent in the web-shell: create a session, ask questions, watch the step-by-step reply, stop the run, and review history. The project ships **three independent backend implementations — Node.js, Python, and Java** — all behind the same web frontend.
+[简体中文](README.md) · [GitHub](https://github.com/aliyun/alibabacloud-data-agent-openapi-examples)
 
-You run exactly one backend and one frontend at a time. Picking a language changes nothing about how the pages work, and you never need to install all three runtimes.
+Run a React web interface with your choice of Java, Python, or Node.js backend to create DataWorks DataAgent sessions, send prompts, stream responses and tool results, stop tasks, and reload history. Only one backend is needed. The repository includes synthetic demo data and does not require another repository or private package registry.
 
-> All three backends are fully wired to the web-shell (sessions, streaming replies, stop, history). Each carries parity assertions spanning sessions / streaming / in-flight locking / lifecycle semantics, and all three implementations were verified end-to-end against a live gateway. The internal container deployment stays on Node.js.
+## Requirements and quick start
 
-## Quick Start
-
-Every backend needs **Node.js 20.19+ (or 22.12+)** and **npm 10+** to run the frontend. Commands below work on macOS, Linux, Windows native (cmd / PowerShell), Git Bash, and WSL.
-
-Install shared dependencies at the repository root:
+All options require Node.js 20.19+ (or 22.12+) and npm 10+ for the frontend. Java additionally requires JDK 17+ and Maven 3.6.3+. Python requires Python 3.11+.
 
 ```bash
+git clone https://github.com/aliyun/alibabacloud-data-agent-openapi-examples.git
+cd alibabacloud-data-agent-openapi-examples
 npm ci
+npm start -- node --mock
 ```
 
-Pick a backend:
+Alternatively, run `npm start -- java --mock`. Java dependencies and the JAR are built on the first start.
 
-| Backend | Extra setup | Start frontend + backend | Web support |
-| --- | --- | --- | --- |
-| Node.js | none | `MOCK=1 npm start -- node` | wired |
-| Python | Python 3.11+; install per the [Python notes](server-python/README.md) | `MOCK=1 npm start -- python` | wired |
-| Java | JDK 17+, Maven 3.6.3+; see the [Java notes](server-java/README.md) | `MOCK=1 npm start -- java` | wired |
+For Python, install dependencies first:
 
-Open the URL printed in the terminal — default <http://127.0.0.1:5173>. Pick a sample session, send a question, and watch the reply stream in. `MOCK=1` replays sample data without calling any cloud service; answers don't regenerate based on what you type.
+```bash
+python3 -m venv server-python/.venv
+server-python/.venv/bin/python -m pip install -e ./server-python
+npm start -- python --mock
+```
 
-The first Java start downloads dependencies and builds, which can take a few minutes — wait for the web URL before opening the browser. `Ctrl+C` stops both processes; to switch languages, stop, then run the other command.
+On Windows use `py -3 -m venv server-python/.venv` and `server-python\.venv\Scripts\python.exe -m pip install -e ./server-python`.
 
-`npm start` defaults to Node.js; `npm run dev -- python` is equivalent to `npm start -- python`; `bash scripts/dev.sh java` uses the same entry point. Backend-only startup is covered in each language's notes.
+Open the address printed in the terminal (normally <http://127.0.0.1:5173>). The launcher waits for the backend, then starts the frontend. Press Ctrl+C to stop both. Use `--mock` on all supported shells without platform-specific environment syntax. MOCK replays synthetic scenarios: responses are fixed and do not depend on your prompt. No cloud credentials or API calls are required.
 
-## Use Your Own DataAgent
+## Use your own DataAgent
 
-You need an Alibaba Cloud account with DataWorks enabled, a running DataAgent instance, and an AccessKey for a RAM user with the right permissions. RAM-user credentials are recommended; if the account has no running instance, prepare a Serverless resource group ID.
+You need an Alibaba Cloud account with DataWorks enabled, an available DataAgent instance, and a RAM user's AccessKey with the necessary permissions. If required by your environment, configure an available Serverless resource group.
 
-1. Run `cp .env.example .env` at the repository root.
-2. Edit `.env` with the values below.
-3. Run `npm start -- node`, `npm start -- python`, or `npm start -- java`.
-4. Open the page, create a session, and ask.
+Copy `.env.example` to `.env` (Windows: `copy .env.example .env`) and set:
 
-| Setting | How to fill in |
+| Setting | Value |
 | --- | --- |
-| `MOCK` | `0` for real use; `1` for credential-free replay |
-| `ALIBABA_CLOUD_ACCESS_KEY_ID` | RAM user's AccessKey ID |
-| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | matching AccessKey Secret |
-| `DATAAGENT_REGION_ID` | region of your instance; default `cn-hangzhou` |
-| `RESOURCE_GROUP_ID` | Serverless resource group ID when the account has no instance |
-| `END_POINT` | usually empty; fill a gateway domain when needed (no `https://`) |
-| `DATAAGENT_AGENT_NAME` | leave as `dataworks_data_agent` |
-| `SESSION_SOURCE` | session source tag; changing it hides sessions with other sources |
+| `MOCK` | `0` for real requests; `1` for demo replay |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID` | RAM user AccessKey ID |
+| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | AccessKey secret; never commit it |
+| `DATAAGENT_REGION_ID` | Region containing your resources, e.g. `cn-hangzhou` |
+| `RESOURCE_GROUP_ID` | Your Serverless resource group, when required |
+| `DATAAGENT_AGENT_NAME` | Normally `dataworks_data_agent` |
+| `END_POINT` | Optional hostname override, without protocol/path; otherwise leave empty |
+| `SESSION_SOURCE` | Source marker used to list this application's sessions |
 
-Credentials are used **only by backends**. Never put them in `VITE_*` variables, and never commit `.env`. `MOCK=1` on the command line overrides the file; remove it for real use.
+Run `npm start -- java`, `npm start -- python`, or `npm start -- node`. The backend retains credentials; the browser does not need an AccessKey. Tasks may operate on data your account can access, so verify permissions and behavior with a small task first.
 
-## What You Can Do in the Page
+## Sessions and supported interactions
 
-Against any backend (Node.js / Python / Java), you can create or open sessions, send text questions, and watch streaming replies with thought traces and tool call results. Click stop to cancel. Human-in-the-loop cards (permission confirmations and ask-user-question follow-ups) are wired: when the agent asks for a decision, a card appears; pick an option or type an answer and the reply goes back through ReplyAgentSession while the turn resumes. Note the pending card state lives in the running backend process — a backend restart invalidates that particular card (a fresh prompt will issue a new one); streaming and history playback are unaffected.
+The UI uses the actual `sessionId` returned by OpenAPI. Creating a session and sending a prompt updates the URL to `/session/{sessionId}` without a hash. Reloading, sharing, and browser back/forward restore the selected session. Permission and question cards send replies upstream to continue the task.
 
-History comes from the cloud; save important results promptly. Rename / archive / delete marks are stored only in the running backend process and may revert after restart. Token-usage queries are backend capabilities; the page doesn't promise a full usage dashboard. Context usage and parts of web-shell functionality may be unavailable where backends lack corresponding capabilities.
+Cloud history is reloaded when opening a session. Renaming, archiving, and deleting sessions currently affect local backend state and may reset when the backend restarts. Some web-shell features and usage displays require capabilities not implemented by this example. Save important results separately.
 
-Real tasks may read or modify data you have permissions for. Try small, easy-to-verify questions first, then run the real ones.
+## Share over a trusted LAN
 
-## Ports and Environment Profiles
+```bash
+npm start -- java --lan
+# Credential-free demo:
+npm start -- java --mock --lan
+```
 
-The backend defaults to `3000`, the page to `5173`. The one-command starter wires the page to the backend it just launched:
+Node.js and Python accept the same flags. Colleagues open the printed `http://LAN-IP:5173` address. The frontend listens on all interfaces, while the backend remains on loopback. A same-origin proxy forwards API and streaming requests, so other users do not connect to their own localhost.
+
+Allow inbound TCP 5173 on the host firewall and ensure the network/VPN permits peers to reach the host. A shared LAN must not be assumed secure: this example has no per-user login or credential isolation. All visitors share the host account's permissions and sessions. Do not expose it directly to the internet. Use `--mock --lan` when a credential-free demonstration is sufficient. See the [LAN guide](docs/LAN_ACCESS.md) for detailed troubleshooting and Windows commands.
+
+## Ports, environments, and separate processes
+
+The backend defaults to 3000 and the frontend to 5173. The launcher connects them automatically:
 
 ```bash
 PORT=3100 WEB_PORT=5180 npm start -- python
-```
-
-If a port is taken, the starter reports an error. Stop the existing service or pick another port — it won't kill other processes for you.
-
-## Start Backend and Web Separately (Skip the one-command launcher)
-
-A single `npm start` does three independent things for you: build the jar when sources changed, boot the backend, and launch the web dev server pointed at it. Splitting them manually has the same effect:
-
-```bash
-# 1) Build the jar (first run or after source change)
-mvn -f server-java/pom.xml -q -DskipTests package
-
-# 2) Backend (terminal 1): defaults to http://127.0.0.1:3000
-java -jar server-java/target/das-server-java-0.1.0.jar
-#   MOCK credential-free (replays synthetic scenarios):
-#   mac/Linux/Git Bash: MOCK=1 java -jar ...
-#   Windows PowerShell: $env:MOCK="1"; java -jar ...
-#   Windows cmd.exe: set MOCK=1 && java -jar ...
-#   LIVE against your real DataAgent: reads .env at repo root (or DEMO via DAS_ENV=<name>)
-#   Other port: java -jar ... --server.port=3999  (or PORT=3999)
-
-# 3) Frontend (terminal 2): point it at your backend
-cd web && VITE_API_BASE=http://127.0.0.1:3000 npm run dev
-#   Windows PowerShell: cd web; $env:VITE_API_BASE="http://127.0.0.1:3000"; npm run dev
-#   Windows cmd.exe: cd web && set VITE_API_BASE=http://127.0.0.1:3000 && npm run dev
-```
-
-Open <http://127.0.0.1:5173>. If you hit **"daemon server unreachable"**, take these two steps:
-
-1. `curl http://127.0.0.1:3000/api/health` — prove the backend is alive; no response = start the backend first.
-2. `VITE_API_BASE` must match the backend port (and **restart the web dev server** when you change it — the dev server reads compile env at startup, not on hot reload).
-
-Create self-contained profiles per account or environment as `.env.<name>` (e.g., `.env.demo`), then:
-
-```bash
 DAS_ENV=demo npm start -- java
 ```
 
-The chosen file must contain full configuration; it is not merged with `.env`. A missing named file aborts startup. Process environment variables win over file values.
+`DAS_ENV=demo` selects a complete `.env.demo` file, without merging `.env`. Missing selected files fail startup. Process environment variables take precedence. PowerShell: `$env:DAS_ENV="demo"; npm start -- java`; cmd: `set DAS_ENV=demo&& npm start -- java`.
 
-## FAQ
+To run Java and the frontend separately:
 
-**Page won't open / says backend disconnected?** Check the terminal process is still running and look for missing runtimes, missing credentials, or port conflicts. Use the URL printed by the starter. The one-command entry waits for backend readiness; if you start the frontend alone, you must point it at your backend yourself.
+```bash
+mvn -f server-java/pom.xml -DskipTests package
+java -jar server-java/target/das-server-java-0.1.0.jar
+# In another terminal, from the repository root:
+cd web
+VITE_API_BASE=http://127.0.0.1:3000 npm run dev
+```
 
-**Why are demo answers unrelated to my question?** `MOCK` replays a fixed fixture. Configure a real account and restart with `MOCK=0`.
+Set `MOCK=1` before launching the backend for demo mode. In PowerShell set variables using `$env:NAME="value"`; in cmd use `set NAME=value`. When launching the frontend separately, `VITE_API_BASE` must match the backend port. Restart Vite after changing it. For LAN sharing, prefer the one-command `--lan` launcher.
 
-**Session creation failed?** Check region, RAM permissions, and whether an instance / resource group is available. Healthy local service only proves local availability, not cloud permission or quota.
+## Troubleshooting
 
-**Reply cut off mid-way — send again?** Don't. The cloud turn may still be running, and resending can execute your write twice. Reopen the session and check history first. Long turns can hit stream duration limits; a page reconnect does not imply the upstream turn can resume.
+- **Backend disconnected:** check startup errors, runtime prerequisites, and port conflicts. `curl http://127.0.0.1:3000/api/health` checks local health, not cloud permissions.
+- **Session creation fails:** verify region, credentials, permissions, resource group, and instance availability.
+- **Fixed/unrelated answers:** MOCK is a deterministic replay. Configure your account and disable MOCK for real answers.
+- **Stream interrupted:** reload history before retrying. Work may still be running upstream; repeating a prompt can repeat writes.
+- **Acknowledgment but no response:** check account quota, permissions, and history. Acknowledgment is not proof that a task completed.
+- **Old session cannot continue:** its upstream execution binding may be unavailable. Save its results and create a new session.
+- **LAN page inaccessible:** use the host's reachable IP, open the frontend port, and check VPN routing or Wi-Fi client isolation. Do not use `localhost` on a colleague's machine.
 
-**Got a receipt but no answer?** Check account quota and permissions first, then load history to see whether anything landed. A bare receipt does not mean the turn ran.
+## Development and support
 
-**Cancelled, but history doesn't show it?** Real-time cancel results and history aren't perfectly consistent. Absence of a terminal record in history does not prove the cancel failed.
+SDKs are pinned to Java `9.0.10`, Node.js `9.9.1`, and Python `9.9.1`; language packages have independent version numbers. See [development and validation](docs/DEVELOPMENT.md), [Node.js](server-node/README.md), [Python](server-python/README.md), and [Java](server-java/README.md) for details.
 
-**Old session can't continue?** The session-to-executor binding can expire. Save what's there and create a new one.
+Public CI builds the frontend, runs Node/frontend tests, Python and Java tests, and all three MOCK HTTP contract checks. MOCK tests do not verify your cloud account permissions or all upstream behaviors.
 
-**Are the languages identical?** All three aim at the same web-shell feature set and are fully wired; contract asserts (34×3 at the HTTP/NDJSON layer and 14×3 at the daemon layer) pass. That doesn't prove every behavior of every cloud environment is verified — outside real-link connectivity, upstream behavior leads.
-
-## More Docs
-
-- [Node.js setup & standalone startup](server-node/README.md)
-- [Python setup & standalone startup](server-python/README.md)
-- [Java setup & standalone startup](server-java/README.md)
-- [Layout & verification commands](docs/DEVELOPMENT.md)
-
-This example is meant for local hands-on by default. Before exposing it to other people, configure authentication, access control, and credential isolation yourself.
+See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md), and [LICENSE](LICENSE). When reporting a problem, include versions and a minimal reproduction; remove credentials, business data, private endpoints, and personal information from logs.

@@ -11,7 +11,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@alicloud/dataworks-public20240518": "^9.9.0",
+    "@alicloud/dataworks-public20240518": "9.9.1",
     "@alicloud/openapi-core": "^1.0.8",
     "@darabonba/typescript": "^1.0.5",
     "@das/shared": "*",

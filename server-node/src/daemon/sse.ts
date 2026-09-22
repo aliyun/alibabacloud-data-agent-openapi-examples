@@ -9,7 +9,7 @@ import type { SessionJournal } from './journal.js';
 
 export interface SseOptions {
   journal: SessionJournal;
-  /** 客户端视角的会话 id（alias 或 real），写进事件 data.sessionId。 */
+  /** OpenAPI 的真实会话 id，写进事件 data.sessionId。 */
   sessionId: string;
   /** 进程级事件纪元，响应头回给客户端，配合游标检测"进程重启过"。 */
   epoch: string;
