@@ -10,7 +10,7 @@ import re
 
 from .constants import MARKER_PREFIX
 
-_INSTRUCTION_RE = re.compile(rf"\n*（本轮校验码 {MARKER_PREFIX}-[0-9A-F]{6}：[^\n]*）\s*$")
+_INSTRUCTION_RE = re.compile(rf"\n*（本轮校验码 {MARKER_PREFIX}-[0-9A-F]{{6}}：[^\n]*）\s*$")
 
 
 def strip_marker_instruction(text: str) -> str:

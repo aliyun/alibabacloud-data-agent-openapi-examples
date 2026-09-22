@@ -29,10 +29,10 @@ public class DasApplication {
     }
 
     /** MOCK 模式**绝不**构造 Client：那是"以为在测真实链路、其实在看录像"的唯一屏障。 */
-    @Bean
+    @Bean(destroyMethod = "close")
     public com.das.java.live.LiveClientHolder liveClientHolder(AppConfig cfg) throws Exception {
         if (!cfg.mock()) {
-            log.info("SDK Client 已构造（LIVE 模式；Java SDK 9.8.0 无 *WithSSE，流式走手写 ACS3 签名 SSE）");
+            log.info("SDK Client 已构造（LIVE 模式；官方异步 SDK，流式走 *WithResponseIterable SSE）");
         }
         return new com.das.java.live.LiveClientHolder(cfg.mock() ? null : new LiveClient(cfg));
     }

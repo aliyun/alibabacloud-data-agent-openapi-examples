@@ -33,4 +33,6 @@ npm-debug.log*
 # Dockerfile COPY 的兜底；含密钥的 app.env 只在构建工作区生成，不会回到这个目录。
 APP-META/docker-config/context/
 
-EXPORT_REPORT.md
+# Internal public-release candidates and private validation reports
+.public-candidate/
+.public-candidate.report.json

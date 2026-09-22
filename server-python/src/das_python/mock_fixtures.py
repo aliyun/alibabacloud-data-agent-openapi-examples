@@ -87,17 +87,17 @@ _BREAK, _GHOST, _CONCURRENT, _ACK, _RENDER = (
 MOCK_SCENARIOS: list[MockScenario] = [
     MockScenario(
         sessionId=_SHORT,
-        title="[MOCK] 短轮 · 22 帧 · end_turn",
+        title="[MOCK] 短轮 · end_turn",
         promptFixture="prompt-short.jsonl",
         historyFixture="load-clean.jsonl",
         frameCount=22,
-        teaches="最短闭环：一问一答、无工具调用、5.6s 拿到 end_turn",
+        teaches="最短闭环：一问一答、无工具调用、正常 end_turn",
         createdAt=1_789_026_610_000,
     ),
     MockScenario(
         # marker 注入已退役：标题不再带校验码说明。
         sessionId=_TOOLS,
-        title="[MOCK] 工具轮 · 392 帧 · 6 次调用",
+        title="[MOCK] 工具轮 · 6 次调用",
         promptFixture="prompt-tools.jsonl",
         historyFixture="load-clean.jsonl",
         frameCount=392,
@@ -106,20 +106,20 @@ MOCK_SCENARIOS: list[MockScenario] = [
     ),
     MockScenario(
         sessionId=_LONG,
-        title="[MOCK] 长轮 · 901 帧 · 191s · 10 次调用",
+        title="[MOCK] 多步分析 · 10 次调用",
         promptFixture="prompt-long.jsonl",
         historyFixture="load-polluted.jsonl",
         frameCount=901,
-        teaches="长轮 191s / 901 帧；历史用 RUNNING 期录的那份（有 rid-less 污染）",
+        teaches="多步分析；历史包含缺少 RequestId 的污染帧",
         createdAt=1_789_027_001_000,
     ),
     MockScenario(
         sessionId=_BREAK,
-        title="[MOCK] 断流 · -32603 · 1201 帧",
+        title="[MOCK] 断流 · -32603",
         promptFixture="error-stream-break.jsonl",
         historyFixture="load-polluted.jsonl",
         frameCount=1201,
-        teaches="SSE 断流：吐完 1200 帧后收尾 -32603，任务可能仍在服务端跑",
+        teaches="SSE 断流：部分回复后收尾 -32603，任务可能仍在服务端跑",
         createdAt=1_788_787_752_000,
     ),
     MockScenario(
@@ -249,7 +249,7 @@ def mock_create_session(title: str) -> dict[str, str]:
             promptFixture="prompt-short.jsonl",
             historyFixture="load-clean.jsonl",
             frameCount=22,
-            teaches="MOCK 下新建的会话，回放短轮样例（22 帧 / end_turn）。",
+            teaches="MOCK 下新建的会话，回放短轮样例（end_turn）。",
             createdAt=int(time.time() * 1000),
         ),
     )

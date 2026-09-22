@@ -1,14 +1,20 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 
-import { WebShellWithProviders, type WebShellTheme } from '@qwen-code/web-shell';
+import {
+  DaemonWorkspaceProvider, DaemonSessionProvider, useWorkspace, WebShell, type WebShellTheme,
+} from '@qwen-code/web-shell';
 
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { installOpenApiSessionCreation } from './session-client';
+import { sessionIdFromLocation, writeSessionRoute } from './session-route';
+import { resolveClientId } from './client-id';
 
 /**
  * daemon 兼容层挂在后端 `/d` 前缀（@qwen-code/sdk 的 DaemonClient 是
  * baseUrl + path 字符串拼接，所以带路径前缀的 baseUrl 天然可用）。
  *
  *  · dev：VITE_API_BASE=http://127.0.0.1:3000（仓库根 .env）→ 直连后端，CORS 已放行；
+ *  · --lan：VITE_API_BASE 为空，走网页同源 /api 与 /d 代理；
  *  · 生产：VITE_API_BASE 为空串（构建期注入，bundle 不烘入本地地址，同旧 UI 的约定）
  *    → 同源 origin + /d，与单容器部署形态一致。
  */
@@ -21,29 +27,6 @@ function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 const DAEMON_BASE = `${API_BASE}/d`;
-
-/** 深链沿用旧 UI 的 `?session=<id>` 形态：刷新、分享、前进后退都能恢复选中会话。 */
-function sessionIdFromLocation(): string | undefined {
-  return new URLSearchParams(window.location.search).get('session') ?? undefined;
-}
-
-/**
- * 稳定客户端 id：daemon 兼容层把它盖上 user 回显事件的 originatorClientId，
- * web-shell 的 suppressOwnUserEcho 靠它与自己的 clientId 精确匹配来抑制
- * "自己刚发的话"的回显——不传的话 LIVE 下用户消息会显示两遍（实测）。
- */
-function resolveClientId(): string {
-  const KEY = 'das.clientId.v1';
-  try {
-    const existing = window.localStorage.getItem(KEY);
-    if (existing) return existing;
-    const id = crypto.randomUUID();
-    window.localStorage.setItem(KEY, id);
-    return id;
-  } catch {
-    return crypto.randomUUID();
-  }
-}
 
 /**
  * 主题持久化：web-shell 自带的持久化通道是 daemon settings（POST /workspaces/:id/settings），
@@ -75,10 +58,14 @@ export default function App() {
 
   const handleSessionIdChange = useCallback((next: string | undefined) => {
     setSessionId(next);
-    const url = new URL(window.location.href);
-    if (next) url.searchParams.set('session', next);
-    else url.searchParams.delete('session');
-    window.history.replaceState(null, '', url);
+    writeSessionRoute(next);
+  }, []);
+
+  useEffect(() => {
+    writeSessionRoute(sessionIdFromLocation(), true);
+    const onPopState = () => setSessionId(sessionIdFromLocation());
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
   const handleThemeChange = useCallback((next: WebShellTheme) => {
@@ -93,21 +80,40 @@ export default function App() {
   return (
     <div style={{ height: '100%' }}>
       <ErrorBoundary label="Web Shell" variant="panel" resetKeys={[sessionId]}>
-        <WebShellWithProviders
-          baseUrl={DAEMON_BASE}
-          sessionContext={{ kind: 'standalone' }}
-          sessionId={sessionId}
-          clientId={clientId}
-          onSessionIdChange={handleSessionIdChange}
-          theme={theme}
-          onThemeChange={handleThemeChange}
-          language="zh-CN"
-          sidebar
-        />
+        <DaemonWorkspaceProvider baseUrl={DAEMON_BASE}>
+          <OpenApiSessionCreation>
+            <DaemonSessionProvider
+              sessionContext={{ kind: 'standalone' }}
+              sessionId={sessionId}
+              clientId={clientId}
+              suppressOwnUserEcho
+            >
+              <WebShell
+                onSessionIdChange={handleSessionIdChange}
+                theme={theme}
+                onThemeChange={handleThemeChange}
+                language="zh-CN"
+                sidebar
+              />
+            </DaemonSessionProvider>
+          </OpenApiSessionCreation>
+        </DaemonWorkspaceProvider>
       </ErrorBoundary>
       <MockBadge />
     </div>
   );
+}
+
+/** Install before mounting the session provider, including StrictMode remounts. */
+function OpenApiSessionCreation({ children }: { children: ReactNode }) {
+  const { client, baseUrl } = useWorkspace();
+  const [readyClient, setReadyClient] = useState<typeof client>();
+  useEffect(() => {
+    const restore = installOpenApiSessionCreation(client, baseUrl);
+    setReadyClient(client);
+    return restore;
+  }, [client, baseUrl]);
+  return readyClient === client ? children : null;
 }
 
 /**

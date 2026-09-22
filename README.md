@@ -1,14 +1,16 @@
 # DataAgent OpenAPI 多语言示例
 
-通过 web-shell 网页体验 DataWorks DataAgent：创建会话、发送问题、查看逐步回复、停止任务和查看历史。项目提供 Node.js、Python 和 Java 三种后端实现，统一使用这一份前端。
+[English](README.en.md) · [GitHub](https://github.com/aliyun/alibabacloud-data-agent-openapi-examples)
+
+通过 OpenAPI 来体验 DataWorks DataAgent：创建会话、发送问题、查看逐步回复、停止任务和查看历史。项目提供 Java、Python 和 Node.js 三种语言的示例，并配有统一的网页，方便直接体验 OpenAPI 的调用效果。
 
 每次只需要启动一个后端和一个前端。选择语言不会改变网页的使用方式，也不需要同时安装三种语言的运行环境。
 
-> 三种后端均已完整接入 web-shell（会话、流式回复、停止、历史），各自配有「会话/流式/409 在途锁/404 语义/生命周期」14 条逐项比对断言，且三个实现的 LIVE 真实链路也都单独实测连通。内部容器部署仍使用 Node.js。
+> 三种后端均已完整接入 web-shell（会话、流式回复、停止、历史），各自配有「会话/流式/409 在途锁/404 语义/生命周期」14 条逐项比对断言，且三个实现的 LIVE 真实链路也都单独实测连通。
 
-## 快速体验
+## 选择语言，一键启动
 
-所有语言都需要 Node.js 20.19+（或 22.12+）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux 和 Windows WSL；Windows 请在 WSL 终端中执行。
+所有语言都需要 Node.js 20.19+（或 22.12+）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux、Windows（原生 cmd / PowerShell）、Git Bash 和 WSL。
 
 在项目根目录安装公共依赖：
 
@@ -16,19 +18,68 @@
 npm ci
 ```
 
-选择一种后端：
+调用真实 OpenAPI 前，请按下文[使用自己的 DataAgent](#使用自己的-dataagent)配置根目录 `.env`，填写凭证并设置 `MOCK=0`。然后任选一种语言启动；每条启动命令都会同时运行该语言的后端和网页，不需要另开终端启动前端。
 
-| 后端 | 额外准备 | 启动网页与后端 | 当前网页支持 |
-| --- | --- | --- | --- |
-| Node.js | 无 | `MOCK=1 npm start -- node` | 已接入 |
-| Python | Python 3.11+；按 [Python 说明](server-python/README.md) 安装依赖 | `MOCK=1 npm start -- python` | 已接入 |
-| Java | JDK 17+、Maven 3.6.3+；见 [Java 说明](server-java/README.md) | `MOCK=1 npm start -- java` | 已接入 |
+### Java
+
+额外需要 JDK 17+ 和 Maven 3.6.3+。一键启动：
+
+```bash
+npm start -- java
+```
+
+暂时没有凭证时，可先运行 `MOCK=1 npm start -- java` 体验固定示例。首次启动自动下载依赖并构建，可能需要几分钟。更多说明见 [Java 安装与独立运行](server-java/README.md)。
+
+### Python
+
+额外需要 Python 3.11+。首次使用先安装 Python 依赖：
+
+```bash
+python3 -m venv server-python/.venv
+server-python/.venv/bin/python -m pip install -e ./server-python
+```
+
+一键启动：
+
+```bash
+npm start -- python
+```
+
+免凭证启动使用 `MOCK=1 npm start -- python`。三种后端均已接入完整网页会话交互。更多说明见 [Python 安装与独立运行](server-python/README.md)。
+
+### Node.js
+
+完成上面的 `npm ci` 后，无需额外安装其他语言环境。一键启动：
+
+```bash
+npm start -- node
+```
+
+暂时没有凭证时，可先运行 `MOCK=1 npm start -- node` 体验固定示例。更多说明见 [Node.js 安装与独立运行](server-node/README.md)。
+
+### 打开网页与停止服务
+
+免凭证体验的外壳写法：
+- macOS / Linux / Git Bash：`MOCK=1 npm start -- java`
+- Windows PowerShell：`$env:MOCK="1"; npm start -- java`
+- Windows cmd.exe：`set MOCK=1 && npm start -- java`
+- 双平台通用的快捷方式：`npm start -- java --mock`（`.env` 里已配置时也用 `--mock` 一键切换回放）
 
 打开终端提示的地址，默认是 <http://127.0.0.1:5173>。选择一个示例会话并发送问题，就能看到回复过程。MOCK 模式回放示例数据，不调用云服务；回答不会根据你输入的内容重新生成。
 
-首次启动 Java 会下载依赖并构建，可能需要几分钟。出现网页地址后再打开浏览器。按 `Ctrl+C` 同时停止后端和网页；要换语言，先停止再执行对应命令。
+出现网页地址后再打开浏览器。按 `Ctrl+C` 同时停止后端和网页；要换语言，先停止再执行对应命令。
 
 `npm start` 默认选择 Node.js，`npm run dev -- python` 与 `npm start -- python` 等价；已有的 `bash scripts/dev.sh java` 也使用同一个启动入口。只启动后端的方法见各语言说明。
+
+## 让同事通过内网访问
+
+在原启动命令后加 `--lan`：
+
+```bash
+npm start -- java --lan
+```
+
+同事打开终端输出的 `http://内网IP:5173` 即可。Node.js、Python 同样支持；免凭证演示可再加 `--mock`。所有访问者共用当前云账号权限与会话，仅适合可信内网内共享。详细步骤、Windows 命令及网络排查见[内网访问指南](docs/LAN_ACCESS.md)。
 
 ## 使用自己的 DataAgent
 
@@ -54,9 +105,11 @@ npm ci
 
 ## 网页里可以做什么
 
-在前端连接任意一种后端（Node.js / Python / Java）时，都可以新建或打开会话，发送文字问题并查看流式回复、思考过程和工具执行结果。需要中止时点击停止。人卡交互（权限确认、ask_user_question 补充信息）现已接入：agent 发起人工确认会弹卡，点选或补答后回覆将通过 ReplyAgentSession 回传并继续执行。后端进程在运行中重启的话，重启前那张卡需要该会话重新生成（pending 状态不跨进程存活），回复 stream 与历史回放不受影响。
+网页直接使用 OpenAPI 返回的真实 `sessionId`。创建会话并发送问题后，地址更新为 `/session/{sessionId}`，支持刷新恢复、分享及浏览器前进后退。
 
-历史来自云端，重要结果请及时保存。网页中会话改名、归档和删除目前只在本次后端进程内保存，重启后可能恢复原状态。Token 用量查询属于后端能力，不表示当前网页提供完整用量面板；上下文占用和部分 web-shell 功能也可能因后端缺少相应能力而不可用。
+在前端连接任意一种后端（Node.js / Python / Java）时，都可以新建或打开会话，发送文字问题并查看流式回复、思考过程和工具执行结果。需要中止时点击停止。人卡交互（权限确认、ask_user_question 补充信息）现已接入：agent 发起人工确认会弹卡，点选或补答后回覆将通过 ReplyAgentSession 回传并继续执行。后端重启后，重新打开会话会从历史恢复仍待回答的人卡。
+
+历史来自云端，重要结果请及时保存。网页中会话改名、归档和删除目前只在本次后端进程内保存，重启后可能恢复原状态。Token 用量查询属于后端能力，不表示当前网页提供完整用量面板；上下文占用和部分网页功能也可能因后端缺少相应能力而不可用。
 
 真实任务可能访问或修改你有权限操作的数据。先用小范围、容易验证的问题确认环境与权限，再执行正式任务。
 
@@ -69,6 +122,34 @@ PORT=3100 WEB_PORT=5180 npm start -- python
 ```
 
 端口已被占用时，启动命令会报错。先停止原来的服务或换端口；不会自动关闭其他进程。
+
+## 单独启动后端与网页（不走一键脚本）
+
+封装为一键的 `npm start` 只做了三件互不相干的事：构建 jar（要重构的场合）、起后端、向前传参数起网页。把它们分开手动起也有同样效果：
+
+```bash
+# 1) 构建 jar（第一次或源码有改动时）
+mvn -f server-java/pom.xml -q -DskipTests package
+
+# 2) 后端（终端一）：默认 http://127.0.0.1:3000
+java -jar server-java/target/das-server-java-0.1.0.jar
+#   MOCK 免凭证（回放合成样例）：
+#   mac/Linux/Git Bash：`MOCK=1 java -jar ...`
+#   Windows PowerShell：`$env:MOCK="1"; java -jar ...`
+#   Windows cmd.exe：`set MOCK=1 && java -jar ...`
+#   LIVE 链路：从仓库根 `.env`（或 `DAS_ENV=<name>`）读配置
+#   变端口：`java -jar ... --server.port=3999` 或 PORT=3999
+
+# 3) 前端（终端二）：指向后端的地址
+cd web && VITE_API_BASE=http://127.0.0.1:3000 npm run dev
+#   Windows PowerShell：`cd web; $env:VITE_API_BASE="http://127.0.0.1:3000"; npm run dev`
+#   Windows cmd.exe：`cd web && set VITE_API_BASE=http://127.0.0.1:3000 && npm run dev`
+```
+
+打开 <http://127.0.0.1:5173>。如果看到 **"daemon server 无法链接"**，按下面两步排查：
+
+1. `curl http://127.0.0.1:3000/api/health`——后端还活着没；命令没回 = 后端没起
+2. `VITE_API_BASE` 跟后端的 PORT 必须对应（改了就**重启 web dev server**：dev server 在启动时吃 compile env，hot-reload 不重新读 VITE_API_BASE）
 
 可以为不同账号或环境分别创建 `.env.<name>`，例如 `.env.demo`，然后：
 

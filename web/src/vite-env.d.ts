@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  /** 后端地址。不设的话回落 http://127.0.0.1:3000。 */
+  /** 后端地址。不设或为空时使用当前网页的 origin（LAN 代理 / 同源部署）。 */
   readonly VITE_API_BASE?: string;
 }
 

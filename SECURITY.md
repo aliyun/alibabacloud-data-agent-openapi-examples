@@ -6,7 +6,7 @@
 **Private vulnerability reporting**（仓库 Security 页签 → Report a vulnerability）私下报告，
 **不要**在公开 issue 里描述可被利用的细节。
 
-我们会在 7 天内确认，修复或给出缓解方案后再公开披露。
+如果仓库尚未开启私密漏洞报告，请通过阿里云安全应急响应中心联系维护方，不要在公开 issue 中粘贴密钥或业务数据。
 
 ## 范围
 
@@ -25,4 +25,6 @@
 - 日志任何级别都不打印凭证（配置里只有 present / missing 两种取值）；
 - 回覆人卡交互的端点用 POST（GET 属 CORS 简单请求，可被任意网页跨源触发）。
 
-详见 `server/src/config.ts`、`server/src/index.ts` 的注释与 `docs/CONSTRAINTS.md`。
+`--lan` 会让前端监听所有网卡，通过同源代理访问回环后端。应用没有独立用户认证；访问者共享主机账号权限与会话，仅在可信网络使用，不直接暴露公网。
+
+详见 [内网访问指南](docs/LAN_ACCESS.md)、[开发说明](docs/DEVELOPMENT.md) 及 `server-node/src/config.ts`。

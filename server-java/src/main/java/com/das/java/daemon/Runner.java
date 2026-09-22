@@ -10,7 +10,7 @@ import com.das.java.live.Normalize.DasApiException;
 import com.das.java.mock.MockFixtures;
 import com.das.java.mock.MockFixtures.MockScenario;
 import com.das.java.mock.MockReplay;
-import com.das.java.sse.SseFetcher;
+import com.das.java.live.SdkSseStream;
 import com.das.java.web.Inflight;
 import com.das.java.web.Inflight.AcquireResult;
 import com.das.java.web.Inflight.Acquired;
@@ -283,7 +283,7 @@ public class Runner {
         private final String sessionId;
         private final String outbound;
         private final List<String> acks;
-        private SseFetcher fetcher;
+        private SdkSseStream stream;
 
         LivePromptSource(LiveClient live, String sessionId, String outbound, List<String> acks) {
             this.live = live;
@@ -294,9 +294,9 @@ public class Runner {
 
         @Override
         public Map<String, Object> next() throws DasApiException {
-            if (fetcher == null) {
+            if (stream == null) {
                 try {
-                    fetcher = live.openPromptStream(sessionId, outbound, acks);
+                    stream = live.openPromptStream(sessionId, outbound, acks);
                 } catch (Exception e) {
                     if (e instanceof DasApiException de) throw de;
                     throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
@@ -305,8 +305,8 @@ public class Runner {
             while (true) {
                 String data;
                 try {
-                    data = fetcher.next();
-                } catch (SseFetcher.SseException e) {
+                    data = stream.next();
+                } catch (SdkSseStream.SseException e) {
                     throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
                 }
                 if (data == null) return null;
@@ -327,7 +327,7 @@ public class Runner {
 
         @Override
         public void close() {
-            if (fetcher != null) fetcher.close();
+            if (stream != null) stream.close();
         }
     }
 

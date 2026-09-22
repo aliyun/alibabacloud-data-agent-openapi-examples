@@ -23,7 +23,7 @@ import { historyFramesToEvents } from './translate.js';
  *
  * 实现面（对齐 qwen-code 官方契约 + sdk 校验器）：
  *  · capabilities / standalone session-options（两个 feature 标签是 standalone 模式的启动门）
- *  · standalone 会话 CRUD（创建走 alias 映射——客户端强制回显自带的 sessionId，而上游自生成 id）
+ *  · standalone 会话 CRUD（创建直接返回 OpenAPI 的真实 sessionId）
  *  · load/resume（历史帧过滤后灌 journal，回放放 compactedReplay / liveJournal）
  *  · prompt 202 + SSE events（Last-Event-ID 续传）+ cancel / heartbeat / transcript
  *  · permission：`_qwen/notify` → permission_request/resolved 事件（弹卡的唯一通道），
@@ -44,7 +44,7 @@ export async function registerDaemonRoutes(
   let sseActive = 0;
 
   /**
-   * 解析会话：alias 与 real id 都认。LIVE 下未知 id 也放行（深链/重启后直接发话，
+   * 解析会话：使用 OpenAPI 真实 sessionId。LIVE 下未知 id 也放行（深链/重启后直接发话，
    * 存在性交给上游判）；MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
    */
   function resolveSession(id: string): SessionRecord | undefined {
@@ -194,7 +194,6 @@ export async function registerDaemonRoutes(
       d.post<{ Body: { sessionId?: unknown; modelServiceId?: unknown; approvalMode?: unknown } }>(
         '/standalone/sessions',
         async (request, reply) => {
-          const requested = typeof request.body?.sessionId === 'string' ? request.body.sessionId : undefined;
           let realId: string;
           if (live) {
             const created = await liveCreateSession(live);
@@ -205,10 +204,9 @@ export async function registerDaemonRoutes(
           } else {
             realId = mockCreateSession('新建会话').sessionId;
           }
-          const record = requested ? registry.link(requested, realId) : registry.ensure(realId);
-          const clientFacingId = requested ?? realId;
-          app.log.info({ clientFacingId, realId, mock: !live }, 'daemon 兼容层新建会话（alias 已登记）');
-          return standaloneSessionBody(record, clientFacingId);
+          const record = registry.ensure(realId);
+          app.log.info({ sessionId: realId, mock: !live }, 'daemon 兼容层新建会话');
+          return standaloneSessionBody(record, realId);
         },
       );
 
@@ -390,7 +388,7 @@ export async function registerDaemonRoutes(
             if (result.ok && result.result.accepted) {
               record.pendingPermissions.delete(requestId);
               record.journal.append(
-                permissionResolvedEvent(record.aliasId ?? record.realId, requestId, {
+                permissionResolvedEvent(record.realId, requestId, {
                   outcome: outcomeKind,
                   ...(optionId !== '' ? { optionId } : {}),
                 }),
@@ -418,7 +416,7 @@ export async function registerDaemonRoutes(
         // 那是对 LIVE-only 行为的如实交代；这里的演示价值在"点卡 → 卡片消失 → 事件归档"）
         record.pendingPermissions.delete(requestId);
         record.journal.append(
-          permissionResolvedEvent(record.aliasId ?? record.realId, requestId, {
+          permissionResolvedEvent(record.realId, requestId, {
             outcome: outcomeKind,
             ...(optionId !== '' ? { optionId } : { optionId: 'proceed_once' }),
           }),

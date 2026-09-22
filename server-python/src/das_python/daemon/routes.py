@@ -43,7 +43,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
     registry = SessionRegistry()
 
     def resolve_session(session_id: str) -> SessionRecord | None:
-        """alias 与 real id 都认。LIVE 下未知 id 也放行（深链/重启后直接发话，存在性交给上游判）；
+        """使用 OpenAPI 真实 sessionId。LIVE 下未知 id 也放行（深链/重启后直接发话，存在性交给上游判）；
         MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。"""
         known = registry.resolve(session_id)
         if known is not None:
@@ -191,8 +191,6 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
 
     @app.post("/d/standalone/sessions")
     async def d_create_session(request: Request) -> Any:
-        body = await _body(request) or {}
-        requested = body.get("sessionId") if isinstance(body.get("sessionId"), str) else None
         real_id: str
         if live:
             try:
@@ -204,9 +202,8 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
                 return _error(502, api.message, "create_failed")
         else:
             real_id = mock_create_session("新建会话")["sessionId"]
-        record = registry.link(requested, real_id) if requested else registry.ensure(real_id)
-        client_facing_id = requested or real_id
-        return standalone_session_body(record, client_facing_id)
+        record = registry.ensure(real_id)
+        return standalone_session_body(record, real_id)
 
     @app.get("/d/standalone/sessions/{session_id}")
     async def d_get_session(session_id: str = Path()) -> Any:
@@ -410,7 +407,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         if entry is None:
             return _error(404, f"没有这个待处理的人卡请求（requestId={request_id}，未知/已被处理）", "permission_not_found")
         body = await _body(request) or {}
-        return await _respond_permission(entry, entry.alias_id or entry.real_id, request_id, body)
+        return await _respond_permission(entry, entry.real_id, request_id, body)
 
     # ------------------------------------------------------------------
     # 降级端点

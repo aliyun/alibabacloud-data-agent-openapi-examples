@@ -99,20 +99,20 @@ public final class MockFixtures {
 
     /** 八条演示会话：七条各对一份录制件（ack-only 那条没有，它演示的正是"零帧"）。 */
     public static final List<MockScenario> SCENARIOS = List.of(
-        new MockScenario(SHORT, "[MOCK] 短轮 · 22 帧 · end_turn",
+        new MockScenario(SHORT, "[MOCK] 短轮 · end_turn",
             "prompt-short.jsonl", "load-clean.jsonl", null, 22,
-            "最短闭环：一问一答、无工具调用、5.6s 拿到 end_turn", 1_789_026_610_000L, null),
+            "最短闭环：一问一答、无工具调用、正常 end_turn", 1_789_026_610_000L, null),
         new MockScenario(TOOLS,
             // marker 注入已退役：标题不再带校验码说明。
-            "[MOCK] 工具轮 · 392 帧 · 6 次调用",
+            "[MOCK] 工具轮 · 6 次调用",
             "prompt-tools.jsonl", "load-clean.jsonl", null, 392,
             "工具状态机：6 次调用（5 completed + 1 failed）", 1_789_029_139_000L, null),
-        new MockScenario(LONG, "[MOCK] 长轮 · 901 帧 · 191s · 10 次调用",
+        new MockScenario(LONG, "[MOCK] 多步分析 · 10 次调用",
             "prompt-long.jsonl", "load-polluted.jsonl", null, 901,
-            "长轮 191s / 901 帧；历史用 RUNNING 期录的那份（有 rid-less 污染）", 1_789_027_001_000L, null),
-        new MockScenario(BREAK, "[MOCK] 断流 · -32603 · 1201 帧",
+            "多步分析；历史包含缺少 RequestId 的污染帧", 1_789_027_001_000L, null),
+        new MockScenario(BREAK, "[MOCK] 断流 · -32603",
             "error-stream-break.jsonl", "load-polluted.jsonl", null, 1201,
-            "SSE 断流：吐完 1200 帧后收尾 -32603，任务可能仍在服务端跑", 1_788_787_752_000L, null),
+            "SSE 断流：部分回复后收尾 -32603，任务可能仍在服务端跑", 1_788_787_752_000L, null),
         new MockScenario(GHOST, "[MOCK] 会话幽灵化 · 422 · 单帧",
             "error-session-ghost.jsonl", null, null, 1,
             "会话失效：1s 内单帧 -32603 / 422，不能再发，只能新建", 1_788_790_920_000L, null),
@@ -196,7 +196,7 @@ public final class MockFixtures {
             // SessionTitle = 首条 prompt 原文（含注入的校验码说明），与 live 行为一致
             title,
             "prompt-short.jsonl", "load-clean.jsonl", null, 22,
-            "MOCK 下新建的会话，回放短轮样例（22 帧 / end_turn）。",
+            "MOCK 下新建的会话，回放短轮样例（end_turn）。",
             System.currentTimeMillis(), null));
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("sessionId", sessionId);

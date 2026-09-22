@@ -29,5 +29,5 @@ labels: bug
 **补充**
 
 - 如果是接口行为与 README 约束清单不符：请说明你观察到的行为，
-  以及与 `docs/CONSTRAINTS.md` 哪一条不一致；
-- 已读过 [FAQ](../docs/FAQ.md) 的相关条目？哪一条没覆盖你的情况？
+  以及与 `docs/DEVELOPMENT.md` 哪一条不一致；
+- 已读过 [常见问题](../../README.md#常见问题) 的相关条目？哪一条没覆盖你的情况？
