@@ -8,6 +8,12 @@
 
 > 三种后端均已完整接入 web-shell（会话、流式回复、停止、历史），各自配有「会话/流式/409 在途锁/404 语义/生命周期」14 条逐项比对断言，且三个实现的 LIVE 真实链路也都单独实测连通。
 
+## Demo 页面预览
+
+Data Agent · Powered by DataWorks。启动服务后，打开终端提示的地址（默认 <http://127.0.0.1:5173>），即可在统一的网页中创建会话、输入问题并查看流式回复。以下为浅色主题下的首页：
+
+![Data Agent Demo 首页：左侧为会话导航，右侧为欢迎页和问题输入框](docs/images/data-agent-demo.png)
+
 ## 选择语言，一键启动
 
 所有语言都需要 Node.js 22.x（至少 22.12）或 24.x（推荐 22.x）及 npm 10+ 来运行网页。下面的命令适用于 macOS、Linux、Windows（原生 cmd / PowerShell）、Git Bash 和 WSL。

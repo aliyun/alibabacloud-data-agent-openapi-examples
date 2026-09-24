@@ -3,6 +3,15 @@
 @import 'tailwindcss';
 
 html, body, #root { height: 100%; margin: 0; }
+.host-brand { width: 100%; min-width: 0; container-type: inline-size; }
+.host-brand-row { display: flex; align-items: center; gap: 10px; }
+.host-brand-logo { width: 32px; height: 32px; flex-shrink: 0; object-fit: contain; }
+.host-brand-text { min-width: 0; white-space: nowrap; }
+.host-brand-name { font-size: 22px; font-weight: 700; line-height: 1.2; }
+.host-brand-credit { margin-top: 3px; font-size: 11px; font-weight: 400; line-height: 1.4; opacity: 0.7; }
+@container (max-width: 100px) {
+  .host-brand-text { display: none; }
+}
 .host-error {
   padding: 1.5rem;
   background: #171717;
