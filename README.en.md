@@ -4,6 +4,12 @@
 
 Run a React web interface with your choice of Java, Python, or Node.js backend to create DataWorks DataAgent sessions, send prompts, stream responses and tool results, stop tasks, and reload history. Only one backend is needed. The repository includes synthetic demo data and does not require another repository or private package registry.
 
+## Demo preview
+
+Data Agent · Powered by DataWorks. After starting the services, open the address printed in the terminal (normally <http://127.0.0.1:5173>) to create sessions, enter prompts, and view streaming responses in the shared web interface. The screenshot below shows the home page in the light theme with Chinese UI labels:
+
+![Data Agent demo home page with session navigation on the left and a welcome screen and prompt input on the right](docs/images/data-agent-demo.png)
+
 ## Requirements and quick start
 
 All options require Node.js 22.x (at least 22.12) or 24.x (22.x recommended) and npm 10+ for the frontend. Java additionally requires JDK 17+ and Maven 3.6.3+. Python requires Python 3.11+.

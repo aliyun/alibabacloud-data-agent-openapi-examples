@@ -8,6 +8,28 @@ import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { installOpenApiSessionCreation, installSessionLoadNotice, type SessionLoadNotice } from './session-client';
 import { sessionIdFromLocation, writeSessionRoute } from './session-route';
 import { resolveClientId } from './client-id';
+import dataAgentLogo from './assets/data-agent-logo.png';
+
+const BRAND = {
+  name: 'Data Agent',
+  logo: <img src={dataAgentLogo} alt="" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />,
+};
+
+const SIDEBAR = {
+  branding: {
+    render: () => (
+      <div className="host-brand" aria-label="Data Agent powered by DataWorks">
+        <div className="host-brand-row">
+          <img className="host-brand-logo" src={dataAgentLogo} alt="" />
+          <div className="host-brand-text">
+            <div className="host-brand-name">Data Agent</div>
+            <div className="host-brand-credit">Powered by DataWorks</div>
+          </div>
+        </div>
+      </div>
+    ),
+  },
+};
 
 /**
  * daemon 兼容层挂在后端 `/d` 前缀（@qwen-code/sdk 的 DaemonClient 是
@@ -89,11 +111,12 @@ export default function App() {
               suppressOwnUserEcho
             >
               <WebShell
+                brand={BRAND}
                 onSessionIdChange={handleSessionIdChange}
                 theme={theme}
                 onThemeChange={handleThemeChange}
                 language="zh-CN"
-                sidebar
+                sidebar={SIDEBAR}
               />
             </DaemonSessionProvider>
           </OpenApiSessionCreation>
