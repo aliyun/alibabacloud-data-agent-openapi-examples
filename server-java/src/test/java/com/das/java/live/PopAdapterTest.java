@@ -373,6 +373,9 @@ class PopAdapterTest {
         for (String cursor : new String[]{"41", "0", null}) {
             try (var remote = adapter.events("session-A", cursor)) {
                 assertEquals(200, remote.metadata().status());
+                // Let the HTTP execution finish before the slower SSE consumer drains it.
+                // SDK response post-processing must not race the raw publisher terminal.
+                Thread.sleep(200);
                 var output = new ByteArrayOutputStream();
                 List<String> cursors = new ArrayList<>();
                 RemoteSseRelay.relay(remote, output, "session-A", cursors::add);

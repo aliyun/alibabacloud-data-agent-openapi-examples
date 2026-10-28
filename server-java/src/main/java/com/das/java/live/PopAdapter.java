@@ -103,7 +103,9 @@ final class PopAdapter implements AutoCloseable {
         headers.set("Accept", "text/event-stream");
         if (cursor != null && !cursor.isBlank()) headers.set("Last-Event-Id", cursor);
         TeaRequest request = template.copy().setStyle(RequestStyle.RPC).setAction("GetAgentSessionEvents")
-            .setMethod(HttpMethod.GET).setPathRegex("/").setBodyType("binary")
+            // Match generated SSE calls: raw bytes belong to the response handler.
+            // "binary" makes the SDK post-processor dereference the reactive response's null body.
+            .setMethod(HttpMethod.GET).setPathRegex("/").setBodyType(BodyType.JSON)
             .formModel(input).setQuery(Map.of("SessionCode", sessionId)).setHeaders(headers);
         RemoteEventStream stream = new RemoteEventStream();
         var future = handler.execute(new ClientExecutionParams<CancelAgentSessionRequest, Output>()
