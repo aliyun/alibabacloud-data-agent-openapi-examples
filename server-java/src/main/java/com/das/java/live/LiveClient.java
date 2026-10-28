@@ -7,16 +7,12 @@ import com.aliyun.sdk.gateway.pop.auth.SignatureAlgorithm;
 import com.aliyun.sdk.gateway.pop.auth.SignatureVersion;
 import com.aliyun.sdk.service.dataworks_public20240518.AsyncClient;
 import com.aliyun.sdk.service.dataworks_public20240518.DefaultAsyncClientBuilder;
-import com.aliyun.sdk.service.dataworks_public20240518.models.CancelAgentSessionRequest;
-import com.aliyun.sdk.service.dataworks_public20240518.models.CancelAgentSessionResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.CreateAgentSessionRequest;
-import com.aliyun.sdk.service.dataworks_public20240518.models.CreateAgentSessionResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentSessionTokenUsageRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentSessionTokenUsageResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionArtifactsRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionArtifactsResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionsRequest;
-import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionsResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentsRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentsResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.LoadAgentSessionRequest;
@@ -24,14 +20,16 @@ import com.aliyun.sdk.service.dataworks_public20240518.models.PromptAgentSession
 import com.aliyun.sdk.service.dataworks_public20240518.models.ReplyAgentSessionRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ReplyAgentSessionResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ReplyAgentSessionResponseBody;
+import com.aliyun.sdk.service.dataworks_public20240518.models.UpdateAgentSessionTitleRequest;
 import com.das.java.config.AppConfig;
+import com.das.java.config.SessionOptions;
 import com.das.java.core.ApiError;
 import com.das.java.core.Constants;
 import com.das.java.core.Frames;
 import com.das.java.live.Normalize.DasApiException;
-import com.das.java.live.SdkSseStream.SseException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import darabonba.core.ResponseIterable;
+import darabonba.core.TeaModel;
 import darabonba.core.client.ClientOverrideConfiguration;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -48,15 +46,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * 路由只负责"mock 还是 live"的分派与 HTTP 语义。
  * 与 Node 实现的 server-node/live.ts、Python 实现的 live.py 同源同语义。
  *
- * 全部 9 个接口都走官方异步 SDK（alibabacloud-dataworks_public20240518，
- * CompletableFuture 风格）：非流式 7 接口 join() 成阻塞语义；两个流式接口
- * 用官方的 *WithResponseIterable SSE 变体——同步线 SDK 至今没有给 Prompt/
- * Load 做流式建模，这正是当初自实现 ACS3 签名 HTTP（已删）的原因。
+ * Official SDK transport and signing. PopAdapter supplies explicit wire fields for
+ * lifecycle actions and response fields still missing from SDK 9.0.17. GetAgentSessionEvents
+ * uses a signed GET and raw reactive byte transport; prompt/load keep generated SSE methods.
  *
  * 重试语义：SDK 默认不装配 RetryPolicy ⇒ 只发一次，与旧 runtimeFor 的
  * autoretry=false、prompt 绝不重试一致。
  *
- * 两个 client 实例：非流式带整个响应的 600s 超时（对齐旧 readTimeout）；
+ * Generated REST/SSE clients plus a generic POP adapter. Non-stream calls have a 600s timeout;
  * SSE 流上不能有这种超时（RUNNING 期 load 实测阻塞过 178s，中途静默期更长），
  * 停滞保护由消费端 next(timeoutMs) 逐次执行。
  */
@@ -71,12 +68,20 @@ public final class LiveClient implements AutoCloseable {
     private final AsyncClient rest;
     private final AsyncClient sse;
     private final AppConfig cfg;
+    private final PopAdapter pop;
     private final AtomicLong rpcIdCounter = new AtomicLong();
 
     /** 构造失败让进程直接起不来——带病启动比启动失败难查得多。 */
-    public LiveClient(AppConfig cfg) {
+    public LiveClient(AppConfig cfg) { this(cfg, PopAdapter.create(cfg)); }
+
+    LiveClient(AppConfig cfg, PopAdapter pop) {
+        this(cfg, pop, buildClient(cfg, Duration.ofMillis(Constants.DEFAULT_READ_TIMEOUT_MS)));
+    }
+
+    LiveClient(AppConfig cfg, PopAdapter pop, AsyncClient rest) {
         this.cfg = cfg;
-        this.rest = buildClient(cfg, Duration.ofMillis(Constants.DEFAULT_READ_TIMEOUT_MS));
+        this.pop = pop;
+        this.rest = rest;
         this.sse = buildClient(cfg, null);
     }
 
@@ -103,6 +108,7 @@ public final class LiveClient implements AutoCloseable {
                 Credential.builder()
                     .accessKeyId(cfg.accessKeyId())
                     .accessKeySecret(cfg.accessKeySecret())
+                    .securityToken(cfg.securityToken())
                     .build()))
             .region(cfg.regionId())
             .overrideConfiguration(override)
@@ -115,6 +121,7 @@ public final class LiveClient implements AutoCloseable {
     /** 进程退出时关掉两个 client（netty 线程池）；MOCK 模式根本不会构造到这一步。 */
     @Override
     public void close() {
+        pop.close();
         rest.close();
         sse.close();
     }
@@ -191,147 +198,152 @@ public final class LiveClient implements AutoCloseable {
 
     /** 建会话。成功判据只有 SessionId 非空（HTTP 200 + 有 Result 但 SessionId 为空仍是失败）。 */
     public Map<String, Object> createSession(String mode) throws Exception {
-        String api = "CreateAgentSession";
-        try {
-            CreateAgentSessionResponse resp = join(rest.createAgentSession(buildCreateSessionRequest(mode)));
-            var body = resp.getBody();
-            var rpc = body.getJsonRpcResponse();
-            var result = rpc == null ? null : rpc.getResult();
-            if (result == null) {
-                // 空响应体是这条接口最常见的失败形态，单独归一类：处置方式与其它 rpc_error 完全不同。
-                throw new DasApiException(ApiError.createEmptyBody(
-                    api + " 返回 HTTP " + resp.getStatusCode() + " 但没有 JsonRpcResponse.Result，拿不到 SessionId"
-                        + (body.getRequestId() != null ? "（RequestId " + body.getRequestId() + "）" : "")
-                        + "。实测最常见的原因是账号下没有运行中的 DataWorks 实例，或者该账号需要 RESOURCE_GROUP_ID 而没配。"));
-            }
-            String sessionId = result.getSessionId();
-            if (sessionId == null || sessionId.isEmpty()) {
-                throw new DasApiException(ApiError.createEmptyBody(api + " 返回了 Result 但 SessionId 为空"));
-            }
-            Map<String, Object> out = new LinkedHashMap<>();
-            out.put("sessionId", sessionId);
-            if (body.getRequestId() != null) out.put("requestId", body.getRequestId());
-            return out;
-        } catch (DasApiException e) {
-            throw e;
-        } catch (Exception e) {
-            throw toDas(e, api);
-        }
+        return createSessionWithOptions(SessionOptions.resolve(cfg, mode == null ? null : Map.of("approvalMode", mode)));
     }
 
-    /**
-     * CreateAgentSession 的请求构造。嵌套关系是血泪教训：initialConfigOptions 只存在于
-     * meta 之下，agentName 只存在于 meta.agent 之下——塞错层级，序列化会按模型声明静默丢弃。
-     */
-    CreateAgentSessionRequest buildCreateSessionRequest(String mode) {
-        return CreateAgentSessionRequest.builder()
-            .id(nextRpcId())
-            .jsonrpc(JSONRPC_VERSION)
-            .params(CreateAgentSessionRequest.Params.builder()
-                .meta(CreateAgentSessionRequest.Meta.builder()
-                    .agent(CreateAgentSessionRequest.Agent.builder()
-                        .agentName(cfg.agentName())
-                        .build())
-                    .config(CreateAgentSessionRequest.Config.builder()
-                        .sessionSource(cfg.sessionSource())
-                        // 类型是 Array<{SessionTagCode}> 而不是 string[]：传字符串数组会被静默忽略。
-                        .sessionTags(List.of(
-                            CreateAgentSessionRequest.SessionTags.builder()
-                                .sessionTagCode(cfg.sessionSource())
-                                .build()))
-                        .build())
-                    // ResourceGroupId 走 InitialConfigOptions，且上游**不校验有效性**。
-                    // mode：yolo 放行全部工具授权；default 停下等人（人卡，配 /reply 回覆）。
-                    .initialConfigOptions(CreateAgentSessionRequest.InitialConfigOptions.builder()
-                        .resourceGroupId(cfg.resourceGroupId())
-                        .mode(mode)
-                        .build())
-                    .build())
-                .build())
-            .build();
-    }
-
-    public Map<String, Object> listSessions() throws Exception {
-        String api = "ListAgentSessions";
-        try {
-            List<Map<String, Object>> collected = new ArrayList<>();
-            String nextToken = null;
-            Integer totalCount = null;
-            boolean truncated = false;
-
-            for (int page = 0; page < MAX_PAGES; page++) {
-                ListAgentSessionsResponse resp = join(rest.listAgentSessions(
-                    ListAgentSessionsRequest.builder()
-                        .id(nextRpcId())
-                        .jsonrpc(JSONRPC_VERSION)
-                        .params(ListAgentSessionsRequest.Params.builder()
-                            // AgentName 实测**必填**；SessionSourceList 是生效的过滤器；
-                            // SessionTitle 过滤器被**静默忽略**——标题搜索一律前端做。
-                            .agentName(cfg.agentName())
-                            .sessionSourceList(List.of(cfg.sessionSource()))
-                            .maxResults(PAGE_SIZE)
-                            .nextToken(nextToken)
-                            .build())
-                        .build()));
-                var body = resp.getBody();
-                var rpc = body.getJsonRpcResponse();
-                var result = rpc == null ? null : rpc.getResult();
-                if (result == null) {
-                    throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), body.getRequestId()));
-                }
-                if (totalCount == null) totalCount = result.getTotalCount();
-                if (result.getAgentSessions() != null) {
-                    for (var row : result.getAgentSessions()) {
-                        Map<String, Object> summary = toSessionSummary(row);
-                        if (summary != null) collected.add(summary);
-                    }
-                }
-                nextToken = result.getNextToken();
-                if (nextToken == null || nextToken.isEmpty()) break;
-                if (page == MAX_PAGES - 1) truncated = true;
-            }
-
-            Map<String, Object> out = new LinkedHashMap<>();
-            out.put("sessions", collected);
-            // TotalCount 与已收集条数之差，归因不唯一（分页上限时也含"没取的页"），
-            // 所以必须一并返回 truncated，不把差额说成"被过滤掉 N 条"。
-            out.put("filteredOut", Math.max(0, (totalCount != null ? totalCount : collected.size()) - collected.size()));
-            out.put("total", totalCount != null ? totalCount : collected.size());
-            out.put("truncated", truncated);
-            return out;
-        } catch (DasApiException e) {
-            throw e;
-        } catch (Exception e) {
-            throw toDas(e, api);
-        }
-    }
-
-    private Map<String, Object> toSessionSummary(
-        com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionsResponseBody.AgentSessions row) {
-        if (row.getSessionId() == null || row.getSessionId().isEmpty()) return null;
-        var meta = row.getMeta();
-        List<String> tags = new ArrayList<>();
-        if (meta != null && meta.getSessionTagList() != null) {
-            for (var tag : meta.getSessionTagList()) {
-                if (tag.getSessionTagCode() != null) tags.add(tag.getSessionTagCode());
-            }
-        }
-        long createdAt = row.getSessionCreatedAt() != null ? row.getSessionCreatedAt() : 0L;
+    public Map<String, Object> createSessionWithOptions(SessionOptions options) throws Exception {
+        Map<String, Object> result = callResponse("CreateAgentSession", rest.createAgentSession(buildCreateSessionRequest(options))
+            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody())));
+        Object sessionId = result.get("SessionId");
+        if (!(sessionId instanceof String id) || id.isBlank())
+            throw new DasApiException(ApiError.createEmptyBody("CreateAgentSession returned no SessionId"));
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("sessionId", row.getSessionId());
-        // SessionTitle = 首条 prompt 原文（可能带注入的校验码说明），剥离由前端做。
-        String title = row.getSessionTitle();
-        out.put("title", title != null && !title.isEmpty() ? title
-            : (row.getSessionDescription() != null ? row.getSessionDescription() : ""));
-        out.put("createdAt", createdAt);
-        // 恒等于 createdAt（实测 29/29）。照原样透传，运行态一律以前端流为准。
-        out.put("updatedAt", row.getSessionUpdatedAt() != null ? row.getSessionUpdatedAt() : createdAt);
-        // 恒为 RELEASED，同样不能当运行态用。
-        out.put("status", meta != null && meta.getSessionStatus() != null && !meta.getSessionStatus().isEmpty()
-            ? meta.getSessionStatus() : "UNKNOWN");
-        out.put("source", meta != null ? meta.getSessionSource() : null);
-        out.put("tags", tags);
+        out.put("sessionId", sessionId);
+        if (result.get("requestId") != null) out.put("requestId", result.get("requestId"));
         return out;
+    }
+
+    public Map<String, Object> renameSession(String id, String title) throws Exception {
+        return callResponse("UpdateAgentSessionTitle", rest.updateAgentSessionTitle(UpdateAgentSessionTitleRequest.builder()
+            .id(nextRpcId()).jsonrpc(JSONRPC_VERSION)
+            .params(UpdateAgentSessionTitleRequest.Params.builder().sessionId(id).title(title).build()).build())
+            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody())));
+    }
+
+    public Map<String, Object> archiveSession(String id, boolean archived) throws Exception {
+        return callPop("ArchiveAgentSession", Map.of("SessionId", id, "Archived", archived));
+    }
+
+    public Map<String, Object> deleteSession(String id) throws Exception {
+        return callPop("DeleteAgentSession", Map.of("SessionId", id));
+    }
+
+    public RemoteEventStream events(String id, String cursor) { return pop.events(id, cursor); }
+
+    private static PopAdapter.Output sdkOutput(Integer status, TeaModel body) {
+        PopAdapter.Output output = new PopAdapter.Output();
+        output.statusCode = status;
+        output.body = body == null ? null : body.toMap();
+        return output;
+    }
+
+    private Map<String, Object> callPop(String api, Map<String, Object> params) throws Exception {
+        return callResponse(api, pop.call(api, nextRpcId(), params));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> callResponse(String api, CompletableFuture<PopAdapter.Output> response) throws Exception {
+        try {
+            PopAdapter.Output output = join(response);
+            Map<String, Object> body = output.body;
+            Object rpcValue = body == null ? null : body.get("JsonRpcResponse");
+            Map<?, ?> rpc = rpcValue instanceof Map<?, ?> map ? map : Map.of();
+            if (rpc.get("Error") instanceof Map<?, ?> error) {
+                Integer code = error.get("Code") instanceof Number number ? number.intValue() : null;
+                String errorCode = error.get("ErrorCode") instanceof String text ? text : null;
+                String requestId = body.get("RequestId") instanceof String text ? text : null;
+                throw new DasApiException(ApiError.redact(ApiError.classify(api + ": " + error.get("Message")
+                    + (requestId == null ? "" : " | requestId=" + requestId), code, errorCode, output.statusCode)));
+            }
+            if (!(rpc.get("Result") instanceof Map<?, ?> result)) {
+                throw new DasApiException(ApiError.apiError("rpc_error", api + " returned no JsonRpcResponse.Result"
+                    + (body == null || body.get("RequestId") == null ? "" : " | requestId=" + body.get("RequestId"))));
+            }
+            Map<String, Object> out = new LinkedHashMap<>((Map<String, Object>) result);
+            if (body.get("RequestId") != null) out.put("requestId", body.get("RequestId"));
+            return out;
+        } catch (DasApiException e) { throw e; }
+        catch (Exception e) { throw toDas(e, api); }
+    }
+
+    /** 9.0.17 models all initial options used by the workbench. */
+    CreateAgentSessionRequest buildCreateSessionRequest(SessionOptions options) {
+        var initial = CreateAgentSessionRequest.InitialConfigOptions.builder()
+            .mode(options.approvalMode()).model(options.model()).reasoningEffort(options.reasoningEffort())
+            .resourceGroupId(cfg.resourceGroupId()).projectId(cfg.projectId()).build();
+        var meta = CreateAgentSessionRequest.Meta.builder()
+            .agent(CreateAgentSessionRequest.Agent.builder().agentName(options.agentName() != null ? options.agentName() : cfg.agentName()).build())
+            .config(CreateAgentSessionRequest.Config.builder().sessionSource(cfg.sessionSource())
+                .sessionTags(List.of(CreateAgentSessionRequest.SessionTags.builder().sessionTagCode(cfg.sessionSource()).build())).build())
+            .initialConfigOptions(initial).build();
+        return CreateAgentSessionRequest.builder().id(nextRpcId()).jsonrpc(JSONRPC_VERSION)
+            .params(CreateAgentSessionRequest.Params.builder().meta(meta).build()).build();
+    }
+
+    public Map<String, Object> listSessions() throws Exception { return listSessions(false); }
+
+    public Map<String, Object> listSessions(boolean archived) throws Exception { return listSessions(archived, null); }
+
+    public Map<String, Object> listSessions(boolean archived, String agentName) throws Exception {
+        return listSessions(archived, null, SessionOptions.validateAgentName(agentName));
+    }
+
+    public Map<String, Object> sessionSummary(String sessionId) throws Exception { return sessionSummary(sessionId, null); }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> sessionSummary(String sessionId, String agentName) throws Exception {
+        agentName = SessionOptions.validateAgentName(agentName);
+        for (boolean archived : new boolean[]{false, true}) {
+            var result = listSessions(archived, sessionId, agentName);
+            for (var row : (List<Map<String, Object>>)result.get("sessions"))
+                if (sessionId.equals(row.get("sessionId"))) return row;
+        }
+        return null;
+    }
+
+    private Map<String, Object> listSessions(boolean archived, String sessionId, String agentName) throws Exception {
+        List<Map<String, Object>> collected = new ArrayList<>();
+        String next = null;
+        int total = 0;
+        boolean truncated = false;
+        for (int page = 0; page < MAX_PAGES; page++) {
+            var params = ListAgentSessionsRequest.Params.builder().maxResults(PAGE_SIZE).archived(archived).nextToken(next);
+            if (sessionId == null) params.agentName(agentName != null ? agentName : cfg.agentName()).sessionSourceList(List.of(cfg.sessionSource()));
+            else {
+                params.sessionId(sessionId);
+                if (agentName != null) params.agentName(agentName);
+            }
+
+            Map<String, Object> result = callResponse("ListAgentSessions", rest.listAgentSessions(ListAgentSessionsRequest.builder()
+                .id(nextRpcId()).jsonrpc(JSONRPC_VERSION).params(params.build()).build())
+                .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody())));
+            if (result.get("TotalCount") instanceof Number number) total = number.intValue();
+            if (result.get("AgentSessions") instanceof List<?> rows) for (Object raw : rows) {
+                if (!(raw instanceof Map<?, ?> row) || !(row.get("SessionId") instanceof String id) || id.isBlank()) continue;
+                Map<?, ?> meta = row.get("Meta") instanceof Map<?, ?> map ? map : Map.of();
+                List<String> tags = new ArrayList<>();
+                if (meta.get("SessionTagList") instanceof List<?> values) for (Object value : values) {
+                    if (value instanceof Map<?, ?> tag && tag.get("SessionTagCode") instanceof String code) tags.add(code);
+                }
+                Map<String, Object> summary = new LinkedHashMap<>();
+                summary.put("sessionId", id);
+                Object title = row.get("SessionTitle");
+                summary.put("title", title instanceof String text && !text.isEmpty() ? text : row.get("SessionDescription"));
+                Object created = row.get("SessionCreatedAt") == null ? 0L : row.get("SessionCreatedAt");
+                summary.put("createdAt", created);
+                summary.put("updatedAt", row.get("SessionUpdatedAt") == null ? created : row.get("SessionUpdatedAt"));
+                summary.put("status", meta.get("SessionStatus") == null ? "UNKNOWN" : meta.get("SessionStatus"));
+                summary.put("source", meta.get("SessionSource"));
+                summary.put("tags", tags);
+                summary.put("archived", Boolean.TRUE.equals(meta.get("Archived")));
+                collected.add(summary);
+            }
+            next = result.get("NextToken") instanceof String text && !text.isEmpty() ? text : null;
+            if (next == null) break;
+            if (page == MAX_PAGES - 1) truncated = true;
+        }
+        return Map.of("sessions", collected, "filteredOut", Math.max(0, total - collected.size()),
+            "total", total, "truncated", truncated);
     }
 
     // ------------------------------------------------------------------
@@ -411,41 +423,35 @@ public final class LiveClient implements AutoCloseable {
 
     /**
      * cancel。【LIVE 09-18】上游已会真正取消：HTTP 200 + 流以 stopReason=cancelled 收场。
-     * delivered = 上游接受了取消请求（HTTP 200）。取消失败的处置是让调用方知道
+     * delivered = 上游返回成功 JSON-RPC Result；仅 HTTP 200 不足以确认。取消失败时让调用方知道
      * "没取消成"，而不是收到一个 5xx——异常记进 detail 透给前端。
      */
     public Map<String, Object> cancel(String sessionId) throws Exception {
-        String api = "CancelAgentSession";
-        String upstream = "调用未返回";
-        Integer status = null;
         try {
-            CancelAgentSessionResponse resp = join(rest.cancelAgentSession(
-                CancelAgentSessionRequest.builder()
-                    .id(nextRpcId())
-                    .jsonrpc(JSONRPC_VERSION)
-                    .params(CancelAgentSessionRequest.Params.builder()
-                        .sessionId(sessionId)
-                        .build())
-                    .build()));
-            status = resp.getStatusCode();
-            upstream = "HTTP " + status;
-        } catch (Exception e) {
-            upstream = Normalize.toApiError(unwrap(e), api).message();
+            Map<String, Object> accepted = callPop("CancelAgentSession", Map.of("SessionId", sessionId));
+            Map<String, Object> result = new LinkedHashMap<>();
+            boolean noop = Boolean.TRUE.equals(accepted.get("Noop"));
+            boolean delivered = Boolean.TRUE.equals(accepted.get("Delivered"));
+            // Older deployments acknowledge only the target SID. Never infer delivery
+            // or idle state, and never downgrade explicit delivery/no-op fields.
+            boolean legacy = !accepted.containsKey("Delivered") && !accepted.containsKey("Noop")
+                && sessionId.equals(accepted.get("SessionId"));
+            result.put("accepted", delivered || noop || legacy);
+            result.put("delivered", delivered);
+            if (!legacy) result.put("noop", noop);
+            result.put("warning", legacy ? "cancel-accepted-legacy"
+                : delivered ? "cancel-accepted" : noop ? "cancel-noop" : "cancel-upstream-error");
+            result.put("detail", delivered
+                ? "CancelAgentSession accepted the request; execution cancellation is confirmed only by its remote terminal."
+                : legacy ? "CancelAgentSession acknowledged the matching session; delivery and execution cancellation are unconfirmed."
+                : noop ? "The remote session is idle; cancellation is a no-op."
+                : "CancelAgentSession did not confirm Delivered or Noop.");
+            if (accepted.get("requestId") != null) result.put("requestId", accepted.get("requestId"));
+            return result;
+        } catch (Exception error) {
+            ApiError failure = Normalize.toApiError(error, "CancelAgentSession");
+            return Map.of("accepted", false, "delivered", false, "warning", "cancel-upstream-error", "detail", failure.message());
         }
-
-        boolean delivered = status != null && status == 200;
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("delivered", delivered);
-        result.put("warning", delivered ? "cancel-accepted" : "cancel-upstream-error");
-        result.put("detail", delivered
-            ? "已向上游发出 " + api + "（" + upstream + "），取消请求已被接受。"
-                + "若当时有执行中的轮次，流会以 `stopReason=cancelled` 终态收场"
-                + "（实测 3/3：1200 字长文在 432 字处被截断；空闲会话上取消是 no-op）。"
-                + "注意：cancelled 终态目前不落库——稍后 LoadAgentSession 里那一轮 "
-                + "`terminated=false`、无 stopReason，属上游已知缺口，不代表取消失败。"
-            : "已向上游发出 " + api + " 但未获 200（本次结果：" + upstream + "）。"
-                + "取消未确认生效：那一轮可能仍在执行，结果稍后拉历史确认。");
-        return result;
     }
 
     // ------------------------------------------------------------------
@@ -517,45 +523,10 @@ public final class LiveClient implements AutoCloseable {
     // 历史（LoadAgentSession · 官方 SSE）
     // ------------------------------------------------------------------
 
-    /**
-     * 拉一整份历史帧。
-     *
-     * 用**独立的 30s 停滞上限**：实测在会话 RUNNING 期间调 load，4 次里有 2 次会阻塞
-     * 到那一轮跑完才返回（178s、81.6s）。阻塞不可预测，快速失败让用户重试，
-     * 好过把界面挂死三分钟。停滞上限在每次 next() 上执行（帧在流就继续等）。
-     *
-     * `Meta.BeginLogOffset` 是**死参数**：传任何值都返回全量，所以不传。
-     */
-    @SuppressWarnings("unchecked")
+    /** 历史快照总预算30秒，最多3次只读拉取；完整Load回执前不返回半份历史。 */
     public List<Map<String, Object>> loadFrames(String sessionId) throws Exception {
-        String api = "LoadAgentSession";
-        ResponseIterable<com.aliyun.sdk.service.dataworks_public20240518.models.LoadAgentSessionResponseBody> iterable =
-            sse.loadAgentSessionWithResponseIterable(
-                LoadAgentSessionRequest.builder()
-                    .id(nextRpcId())
-                    .jsonrpc(JSONRPC_VERSION)
-                    .params(LoadAgentSessionRequest.Params.builder()
-                        .sessionId(sessionId)
-                        .meta(LoadAgentSessionRequest.Meta.builder().isReload(true).build())
-                        .build())
-                    .build());
-
-        List<Map<String, Object>> frames = new ArrayList<>();
-        SdkSseStream stream = new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode);
-        try (stream) {
-            while (true) {
-                String data;
-                try {
-                    data = stream.next(Constants.HISTORY_READ_TIMEOUT_MS);
-                } catch (SseException e) {
-                    throw new DasApiException(Normalize.toApiError(e, api));
-                }
-                if (data == null) break;
-                Map<String, Object> frame = frameFromData(data);
-                if (frame != null) frames.add(frame);
-            }
-        }
-        return frames;
+        return LoadSnapshotReader.read(remainingMs -> openLoadStream(sessionId, null),
+            Constants.HISTORY_READ_TIMEOUT_MS, 3, 250);
     }
 
     /** SSE data 载荷 → 线格式帧（live 路径拒收 POP-only 载荷；帧的其它处理与 Node/Python 同源）。 */
@@ -574,13 +545,14 @@ public final class LiveClient implements AutoCloseable {
      * 帧到达顺序即上游顺序；POP 回执的 RequestId 填进 acks（零帧场景唯一可查的线索）。
      * 抛出的异常不在这里吞，交给流管道归一化。
      */
-    public SdkSseStream openPromptStream(String sessionId, String outboundText, List<String> acks) throws Exception {
+    public RecoveringPromptStream openPromptStream(String sessionId, String outboundText, List<String> acks) throws Exception {
         String api = "PromptAgentSession";
+        String promptId = java.util.UUID.randomUUID().toString();
         try {
             ResponseIterable<com.aliyun.sdk.service.dataworks_public20240518.models.PromptAgentSessionResponseBody> iterable =
                 sse.promptAgentSessionWithResponseIterable(
                     PromptAgentSessionRequest.builder()
-                        .id(nextRpcId())
+                        .id(promptId)
                         .jsonrpc(JSONRPC_VERSION)
                         .params(PromptAgentSessionRequest.Params.builder()
                             .sessionId(sessionId)
@@ -590,9 +562,22 @@ public final class LiveClient implements AutoCloseable {
                                 .build()))
                             .build())
                         .build());
-            return new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode);
+            return new RecoveringPromptStream(promptId,
+                RecoveringPromptStream.wrap(new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode)),
+                (offset, remainingMs) -> openLoadStream(sessionId, offset));
         } catch (Exception e) {
             throw toDas(e, api);
         }
     }
+    /** 在途 Load 必须流式消费；调用方用剩余恢复预算限制每次 next。 */
+    private RecoveringPromptStream.Source openLoadStream(String sessionId, Long offset) throws Exception {
+        String loadId = nextRpcId();
+        var iterable = sse.loadAgentSessionWithResponseIterable(LoadAgentSessionRequest.builder()
+            .id(loadId).jsonrpc(JSONRPC_VERSION)
+            .params(LoadAgentSessionRequest.Params.builder().sessionId(sessionId)
+                .meta(LoadAgentSessionRequest.Meta.builder().isReload(true).beginLogOffset(offset).build())
+                .build()).build());
+        return RecoveringPromptStream.wrap(new SdkSseStream("LoadAgentSession", iterable.iterator(), iterable::getStatusCode), loadId);
+    }
+
 }

@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, useContext, useRef, type ComponentProps, type ReactNode } from 'react';
 
 import {
-  DaemonWorkspaceProvider, DaemonSessionProvider, useWorkspace, WebShell, type WebShellTheme,
+  DaemonWorkspaceProvider, DaemonSessionProvider, useActions, useConnection, useWorkspace, WebShell, type WebShellTheme, type ComposerToolbarAction,
 } from '@qwen-code/web-shell';
 
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { installOpenApiSessionCreation, installSessionLoadNotice, type SessionLoadNotice } from './session-client';
+import { OpenApiPromptRendering } from './components/OpenApiPromptRendering';
+import { installOpenApiSessionCreation, type OpenApiCreateOptions, type SessionDefaults } from './session-client';
+import { clearPreferences, effectiveDefaults, readPreferences, readPreferenceState, resolveCreationOptions, savePreferences, readSelectedAgent, saveSelectedAgent } from './session-preferences';
 import { sessionIdFromLocation, writeSessionRoute } from './session-route';
+import { saveSessionConfiguration, saveSessionAgent, readSessionAgent } from './session-configuration';
+import { SessionSettingsContext, SessionSettingsButton, SessionSettingsDialog, SessionCreateError } from './session-settings';
 import { resolveClientId } from './client-id';
 import dataAgentLogo from './assets/data-agent-logo.png';
 
@@ -30,6 +34,8 @@ const SIDEBAR = {
     ),
   },
 };
+
+
 
 /**
  * daemon 兼容层挂在后端 `/d` 前缀（@qwen-code/sdk 的 DaemonClient 是
@@ -71,7 +77,7 @@ function resolveTheme(): WebShellTheme {
  *
  * sessionContext 用 standalone：data agent 的会话是云上资源（无 cwd/工作区概念），
  * standalone 正是 web-shell 为"产品集成、无 daemon 工作区"准备的形态。
- * 服务端由 server-node/src/daemon 把 webshell 协议翻译到 data agent OpenAPI 的 8 个接口。
+ * 服务端由 server-node/src/daemon 把 web-shell 协议适配为 DataAgent OpenAPI 调用。
  */
 export default function App() {
   const [sessionId, setSessionId] = useState<string | undefined>(sessionIdFromLocation);
@@ -103,21 +109,28 @@ export default function App() {
     <div style={{ height: '100%' }}>
       <ErrorBoundary label="Web Shell" variant="panel" resetKeys={[sessionId]}>
         <DaemonWorkspaceProvider baseUrl={DAEMON_BASE}>
-          <OpenApiSessionCreation sessionId={sessionId}>
+          <OpenApiSessionCreation theme={theme}>
             <DaemonSessionProvider
               sessionContext={{ kind: 'standalone' }}
               sessionId={sessionId}
               clientId={clientId}
-              suppressOwnUserEcho
+              suppressOwnUserEcho={false}
             >
-              <WebShell
-                brand={BRAND}
-                onSessionIdChange={handleSessionIdChange}
-                theme={theme}
-                onThemeChange={handleThemeChange}
-                language="zh-CN"
-                sidebar={SIDEBAR}
-              />
+              <OpenApiPromptRendering>
+                <OpenApiToolbarDefaults>
+                  <SessionWebShell
+                    onSessionIdChange={handleSessionIdChange}
+                    theme={theme}
+                    onThemeChange={handleThemeChange}
+                    language="zh-CN"
+                    brand={BRAND}
+                    sidebar={{ ...SIDEBAR, footer: { items: ['theme', 'version', 'sessionsOverview', 'workspacesOverview', 'splitView', 'daemonStatus', 'localFiles', 'collapse'],
+                      render: () => <SessionSettingsButton /> } }}
+                    renderComposerHeader={SessionCreateError}
+                    cycleModeOnTab={false}
+                  />
+                </OpenApiToolbarDefaults>
+              </OpenApiPromptRendering>
             </DaemonSessionProvider>
           </OpenApiSessionCreation>
         </DaemonWorkspaceProvider>
@@ -127,21 +140,150 @@ export default function App() {
   );
 }
 
+// Existing sessions cannot change model or mode through POP yet.
+const SESSION_TOOLBAR_ACTIONS: readonly ComposerToolbarAction[] = [
+  'commands', 'contextUsage', 'gitBranch', 'widthMode', 'voice', 'workspace',
+];
+
+function SessionWebShell(props: ComponentProps<typeof WebShell>) {
+  const settings = useContext(SessionSettingsContext);
+  const { sessionId } = useConnection();
+  const [sidebarEnabled, setSidebarEnabled] = useState(true);
+  const sidebarAgent = useRef(settings?.configured?.agentName);
+  useEffect(() => {
+    const agent = settings?.configured?.agentName;
+    if (settings?.open || !agent || sidebarAgent.current === agent) return;
+    const previous = sidebarAgent.current;
+    sidebarAgent.current = agent;
+    // The public sidebar prop remounts only its directory, clearing old Agent
+    // pages/cursors. Session provider and composer (including draft) stay mounted.
+    if (previous) setSidebarEnabled(false);
+  }, [settings?.configured?.agentName, settings?.open]);
+  useEffect(() => {
+    if (sidebarEnabled) return;
+    const timer = setTimeout(() => setSidebarEnabled(true), 0);
+    return () => clearTimeout(timer);
+  }, [sidebarEnabled]);
+  const actions: readonly ComposerToolbarAction[] = sessionId ? SESSION_TOOLBAR_ACTIONS
+    : ['model', ...(settings?.configured?.approvalMode === 'plan' ? [] : ['approvalMode'] as const), ...SESSION_TOOLBAR_ACTIONS];
+  return <WebShell {...props} sidebar={{ ...(typeof props.sidebar === 'object' ? props.sidebar : {}), enabled: props.sidebar !== false && sidebarEnabled }} composerToolbarActions={actions} onSlashCommand={command => {
+    if (['settings', 'model', 'approval-mode', 'plan'].includes(command.command)) {
+      settings?.setOpen(true);
+      return true;
+    }
+  }} />;
+}
+
+/** Keep native standalone create overrides; Plan remains an atomic POP option. */
+export function OpenApiToolbarDefaults({ children }: { children: ReactNode }) {
+  const actions = useActions();
+  const { sessionId } = useConnection();
+  const settings = useContext(SessionSettingsContext);
+  const signature = JSON.stringify(settings?.configured);
+  const applied = useRef(signature);
+  const creating = useRef(0);
+  const [pendingCreates, setPendingCreates] = useState(0);
+  useEffect(() => {
+    if (settings?.open || applied.current === signature || creating.current > 0) return;
+    const previous = applied.current;
+    applied.current = signature;
+    // Public clearSession refreshes the standalone options without remounting
+    // WebShell (and losing the draft). Never reload an attached session.
+    if (previous && previous !== 'undefined' && !sessionId) {
+      void actions.clearSession().catch(error => console.warn('无法刷新新会话选项', error));
+    }
+  }, [actions, settings?.open, signature, sessionId, pendingCreates]);
+  useEffect(() => {
+    const original = actions.createSession;
+    const create: typeof original = async options => {
+      const context = { ...options };
+      // Native Plan is post-create setApprovalMode; our settings send Plan in
+      // CreateAgentSession itself. The neutral advertised mode is not a choice.
+      if (settings?.configured?.approvalMode === 'plan') delete context.approvalMode;
+      creating.current += 1;
+      setPendingCreates(creating.current);
+      try {
+        return await original.call(actions, context);
+      } finally { creating.current -= 1; setPendingCreates(creating.current); }
+    };
+    actions.createSession = create;
+    return () => { if (actions.createSession === create) actions.createSession = original; };
+  }, [actions, settings]);
+  return children;
+}
+
 /** Install before mounting the session provider, including StrictMode remounts. */
-function OpenApiSessionCreation({ children, sessionId }: { children: ReactNode; sessionId?: string }) {
-  const [notice, setNotice] = useState<SessionLoadNotice>();
+export function OpenApiSessionCreation({ children, theme = 'dark' }: { children: ReactNode; theme?: WebShellTheme }) {
   const { client, baseUrl } = useWorkspace();
   const [readyClient, setReadyClient] = useState<typeof client>();
+  const [defaults, setDefaults] = useState<SessionDefaults>();
+  const [configError, setConfigError] = useState<string>();
+  const [createError, setCreateError] = useState<string>();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [revision, setRevision] = useState(0);
   useEffect(() => {
-    const restore = installOpenApiSessionCreation(client, baseUrl);
-    const restoreLoad = installSessionLoadNotice(client, setNotice);
+    let mounted = true;
+    const readDefaults = async () => {
+      const response = await fetch(`${baseUrl}/openapi/session-options`, { signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) throw new Error('无法读取会话配置，请确认后端版本');
+      const remote = await response.json() as SessionDefaults;
+      const options = { ...remote, agentName: readSelectedAgent(baseUrl) };
+      if (!options || typeof options.agentName !== 'string' || !Array.isArray(options.models)) throw new Error('无效的会话默认配置');
+      if (mounted) { setDefaults(options); setConfigError(undefined); }
+      return options;
+    };
+    void readDefaults().catch((error: Error) => { if (mounted) setConfigError(error.message); });
+    const restore = installOpenApiSessionCreation(client, baseUrl, async initial => {
+      const agentName = readSelectedAgent(baseUrl);
+      const preferences = readPreferences(baseUrl, agentName);
+      const options = await readDefaults();
+      return { ...resolveCreationOptions(options, preferences, initial), agentName };
+    }, {
+      onDiscovered: (sid, agent) => saveSessionAgent(baseUrl, sid, agent),
+      agentName: sid => sid ? readSessionAgent(baseUrl, sid) ?? readSelectedAgent(baseUrl) : readSelectedAgent(baseUrl),
+      defaults: async () => {
+        const defaults = await readDefaults();
+        const saved = effectiveDefaults(defaults, readPreferences(baseUrl, defaults.agentName));
+        // Native Plan uses a post-create mutation. Advertise a neutral mode
+        // only for Plan; the action adapter retains the atomic POP setting.
+        return saved.approvalMode === 'plan' ? { ...saved, approvalMode: 'default' } : saved;
+      },
+      onCreateError: error => { if (mounted) setCreateError(error.message); },
+      onCreated: (options, session) => {
+        if (mounted) setCreateError(undefined);
+        if (options.agentName) {
+          saveSessionConfiguration(baseUrl, options.agentName, session.sessionId, options);
+          saveSessionAgent(baseUrl, session.sessionId, options.agentName);
+        }
+        if (mounted) setRevision(value => value + 1);
+      },
+      // A successful create is not a user preference change. In particular it
+      // must not turn inherited environment values into persistent overrides.
+    });
     setReadyClient(client);
-    return () => { restoreLoad(); restore(); };
+    return () => { mounted = false; restore(); };
   }, [client, baseUrl]);
-  return readyClient === client ? <>
-    {notice?.sessionId === sessionId && notice?.message && <div role="alert" style={{ position: 'fixed', top: 12, right: 12, maxWidth: 520, zIndex: 100, padding: 12, borderRadius: 8, background: '#4a2020', color: '#fff' }}>{notice.message}</div>}
-    {children}
-  </> : null;
+  const preferences = defaults ? readPreferenceState(baseUrl, defaults.agentName) : undefined;
+  const configured = defaults ? effectiveDefaults(defaults, preferences!.options) : undefined;
+  const update = (options: OpenApiCreateOptions) => {
+    if (!defaults) return;
+    savePreferences(baseUrl, defaults.agentName, { ...readPreferences(baseUrl, defaults.agentName), ...options });
+    setDefaults({ ...defaults });
+  };
+  return <SessionSettingsContext.Provider value={{ baseUrl, defaults, configured, preferences, configError, createError, clearCreateError: () => setCreateError(undefined),
+    open: settingsOpen, setOpen: setSettingsOpen, update, revision, theme,
+    selectAgent: name => {
+      saveSelectedAgent(baseUrl, name);
+      if (defaults) setDefaults({ ...defaults, agentName: name.trim() });
+    },
+    reset: () => { if (defaults) { clearPreferences(baseUrl, defaults.agentName); saveSelectedAgent(baseUrl, 'dataworks_data_agent'); setDefaults({ ...defaults, agentName: 'dataworks_data_agent' }); } } }}>
+    <div className="openapi-shell" onKeyDownCapture={event => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ',') {
+        event.preventDefault(); event.stopPropagation(); setSettingsOpen(true);
+      }
+    }}>{readyClient === client ? children : null}</div>
+    <SessionSettingsDialog />
+  </SessionSettingsContext.Provider>;
 }
 
 /**

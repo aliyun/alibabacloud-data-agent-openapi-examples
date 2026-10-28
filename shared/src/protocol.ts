@@ -5,10 +5,9 @@ import type { StopReason } from './constants.js';
 /**
  * 前后端之间的流式 wire 协议：NDJSON，一行一个 JSON 对象。
  *
- * 为什么不用 SSE：前端无论如何都要手解（EventSource 不支持 POST body，而 prompt
- * 必须 POST），SSE 的 `data:` 转义是纯负担；更关键的是 SSE 的 `id:` /
- * `Last-Event-ID` 语义**暗示可以断点续传**，而 BeginLogOffset 实测是死参数、
- * 服务端根本没有增量续传——用 SSE 等于在协议层撒谎。
+ * 使用 NDJSON 承载 POST 的增量响应；旧 LSP 的上游续传由后端管理：
+ * 保存原轮 offset，并通过 LoadAgentSession.Meta.BeginLogOffset 续接。
+ * 前端 wire 不要求浏览器使用 EventSource / Last-Event-ID。
  *
  * 帧一律**原样透传**（`body` 就是上游那一帧，不重塑、不改名），
  * 这样 wire 形状与录制 fixture 同形，live 与 mock 才能共用同一个 reducer。

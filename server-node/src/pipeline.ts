@@ -81,6 +81,7 @@ export async function* toWireEvents(input: PipelineInput): AsyncGenerator<WireEv
 
       // 终态只看顶层 Result.stopReason；服务端的状态字段问不出运行态（恒 RELEASED）。
       terminal ??= terminalOf(frame);
+      if (terminal) break; // An owned RPC terminal is final even if the HTTP connection later resets.
     }
   } catch (err) {
     /**

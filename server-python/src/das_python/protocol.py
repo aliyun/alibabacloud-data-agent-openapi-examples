@@ -1,8 +1,7 @@
 """前后端之间的流式 wire 协议：NDJSON，一行一个 JSON 对象。
 
-为什么不用 SSE：前端无论如何都要手解（EventSource 不支持 POST body），SSE 的
-`data:` 转义是纯负担；更关键的是 SSE 的 `id:`/`Last-Event-ID` 语义**暗示可以断点续传**，
-而 BeginLogOffset 实测是死参数、服务端根本没有增量续传——用 SSE 等于在协议层撒谎。
+POST 响应使用 NDJSON。上游断流由后端按原轮 offset 调 LoadAgentSession 续接，
+不依赖浏览器 EventSource / Last-Event-ID，也不重发 Prompt。
 
 帧一律**原样透传**（body 就是上游那一帧，不重塑、不改名），这样 wire 形状与录制
 fixture 同形，live 与 mock 才能共用同一个 reducer。后端唯一加工的地方是错误归一化。

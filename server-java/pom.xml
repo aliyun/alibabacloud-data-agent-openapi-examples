@@ -29,13 +29,12 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
-    <!-- DataAgent OpenAPI 的 Java SDK（官方异步线）：全部 9 个接口都走它，
-         prompt/load 的 SSE 用官方的 *WithResponseIterable 变体（9.0.9 起），
-         不再自实现 ACS3 签名 HTTP。同步线（无前缀 artifact）至今没有流式建模。 -->
+    <!-- Official asynchronous SDK. Generated REST and prompt/load SSE APIs are used where modeled;
+         raw SDK-core responses preserve fields omitted by generated models (see the language README). -->
     <dependency>
       <groupId>com.aliyun</groupId>
       <artifactId>alibabacloud-dataworks_public20240518</artifactId>
-      <version>9.0.10</version>
+      <version>9.0.17</version>
     </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>

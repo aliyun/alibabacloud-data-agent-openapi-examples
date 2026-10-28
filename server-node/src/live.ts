@@ -1,6 +1,4 @@
 import {
-  CancelAgentSessionRequest,
-  CancelAgentSessionRequestParams,
   CreateAgentSessionRequest,
   CreateAgentSessionRequestParams,
   CreateAgentSessionRequestParamsMeta,
@@ -12,8 +10,6 @@ import {
   GetAgentSessionTokenUsageRequestParams,
   ListAgentSessionArtifactsRequest,
   ListAgentSessionArtifactsRequestParams,
-  ListAgentSessionsRequest,
-  ListAgentSessionsRequestParams,
   ListAgentsRequest,
   ListAgentsRequestParams,
   LoadAgentSessionRequest,
@@ -51,6 +47,10 @@ import {
 } from '@das/shared';
 
 import type { AppConfig } from './config.js';
+import { recoverPromptFrames } from './prompt-recovery.js';
+import { readLoadSnapshot } from './load-recovery.js';
+import { sessionOptions, type SessionCreationOptions } from './session-options.js';
+import { callOpenApi } from './openapi.js';
 import { missingResultError, readNonStreamBody, toApiError } from './normalize.js';
 import { SdkError, runtimeFor, runtimeForSse, type SdkClient } from './sdk.js';
 
@@ -67,6 +67,18 @@ export interface LiveContext {
   client: SdkClient;
   cfg: AppConfig;
   log?: FastifyBaseLogger;
+}
+
+export async function liveSessionMutation(ctx: LiveContext, action: 'UpdateAgentSessionTitle' | 'ArchiveAgentSession' | 'DeleteAgentSession',
+  sessionId: string, values: Record<string, unknown> = {}): Promise<ApiResult<Record<string, unknown>>> {
+  try {
+    const response = await callOpenApi(ctx.client, action, { SessionId: sessionId, ...values });
+    const body = readNonStreamBody(response);
+    if (!body.result) return { ok: false, error: missingResultError(action, body) };
+    return { ok: true, result: body.result };
+  } catch (err) {
+    return { ok: false, error: toApiError(err, action) };
+  }
 }
 
 const JSONRPC_VERSION = '2.0';
@@ -149,44 +161,39 @@ export async function liveListAgents(ctx: LiveContext): Promise<ApiResult<Agents
  *    注意 ask_user_question（提问类）在两种模式下都会出现——它不是授权，yolo 不会
  *    自动答掉它（实测 tool_call 停在 pending），没人回覆它轮次照样会等。
  */
-export function buildCreateSessionRequest(cfg: AppConfig, mode: SessionMode = 'yolo'): CreateAgentSessionRequest {
-  return new CreateAgentSessionRequest({
+export function buildCreateSessionRequest(cfg: AppConfig, mode: SessionMode | SessionCreationOptions = {}): CreateAgentSessionRequest {
+  const options = sessionOptions(cfg, typeof mode === 'string' ? { approvalMode: mode } : mode);
+  const request = new CreateAgentSessionRequest({
     id: nextRpcId(),
     jsonrpc: JSONRPC_VERSION,
     params: new CreateAgentSessionRequestParams({
       meta: new CreateAgentSessionRequestParamsMeta({
         // AgentName 只认这一个位置；不要靠 ListAgents 去发现它（恒查不到 data agent）
-        agent: new CreateAgentSessionRequestParamsMetaAgent({ agentName: cfg.agentName }),
+        agent: new CreateAgentSessionRequestParamsMetaAgent({ agentName: options.agentName ?? cfg.agentName }),
         config: new CreateAgentSessionRequestParamsMetaConfig({
           sessionSource: cfg.sessionSource,
           // 类型是 Array<{SessionTagCode}> 而不是 string[]：传字符串数组不会被拒，
           // 只会被静默忽略，然后左栏的过滤就少了一列可用的判据。
           sessionTags: [new CreateAgentSessionRequestParamsMetaConfigSessionTags({ sessionTagCode: cfg.sessionSource })],
         }),
-        /**
-         * ResourceGroupId 走 `InitialConfigOptions`。
-         * 注意上游**不校验有效性**：填一个不存在的 ID 照样建会话成功，
-         * 所以它不能当排错信号用；反过来，账号下零运行实例又不填它，
-         * 得到的就是下面那个空响应体。
-         *
-         * mode：`yolo` 放行全部工具授权；`default` 停下等人（人卡，配 /reply 回覆）。
-         */
+        // Optional legacy resource group; ACS does not require it.
         initialConfigOptions: new CreateAgentSessionRequestParamsMetaInitialConfigOptions({
           resourceGroupId: cfg.resourceGroupId,
-          mode,
+          mode: options.approvalMode,
+          model: options.modelServiceId,
+          reasoningEffort: options.reasoningEffort,
         }),
       }),
     }),
   });
+  return request;
 }
 
-export async function liveCreateSession(ctx: LiveContext, mode: SessionMode = 'yolo'): Promise<ApiResult<CreateSessionResult>> {
+export async function liveCreateSession(ctx: LiveContext, mode: SessionMode | SessionCreationOptions = {}): Promise<ApiResult<CreateSessionResult>> {
   const api = 'CreateAgentSession';
   try {
-    const resp = await ctx.client.createAgentSessionWithOptions(
-      buildCreateSessionRequest(ctx.cfg, mode),
-      runtimeFor(),
-    );
+    const request = buildCreateSessionRequest(ctx.cfg, mode).toMap();
+    const resp = await callOpenApi(ctx.client, api, request.Params as Record<string, unknown>);
 
     const body = readNonStreamBody(resp);
     if (!body.result) {
@@ -197,7 +204,7 @@ export async function liveCreateSession(ctx: LiveContext, mode: SessionMode = 'y
         error: createEmptyBodyError(
           `${api} 返回 HTTP ${body.statusCode ?? '?'} 但没有 JsonRpcResponse.Result，拿不到 SessionId` +
             (body.requestId ? `（RequestId ${body.requestId}）` : '') +
-            '。实测最常见的原因是账号下没有运行中的 DataWorks 实例，或者该账号需要 RESOURCE_GROUP_ID 而没配。',
+            '。请根据 RequestId 排查实例准备或上游响应；ACS 模式无需配置资源组。',
         ),
       };
     }
@@ -214,7 +221,7 @@ export async function liveCreateSession(ctx: LiveContext, mode: SessionMode = 'y
   }
 }
 
-export async function liveListSessions(ctx: LiveContext): Promise<ApiResult<SessionsResult>> {
+export async function liveListSessions(ctx: LiveContext, archived = false): Promise<ApiResult<SessionsResult>> {
   const api = 'ListAgentSessions';
   try {
     const collected: SessionSummary[] = [];
@@ -223,25 +230,19 @@ export async function liveListSessions(ctx: LiveContext): Promise<ApiResult<Sess
     let truncated = false;
 
     for (let page = 0; page < MAX_PAGES; page += 1) {
-      const resp = await ctx.client.listAgentSessionsWithOptions(
-        new ListAgentSessionsRequest({
-          id: nextRpcId(),
-          jsonrpc: JSONRPC_VERSION,
-          params: new ListAgentSessionsRequestParams({
+      const resp = await callOpenApi(ctx.client, api, {
             /**
              * AgentName 实测**必填**：不传会拿到一个与预期无关的结果集。
              * SessionSourceList 是生效的过滤器——这正是"只列本工程建的会话"能成立的原因。
              * 反过来 SessionTitle 过滤器被**静默忽略**（传了也返回全量），
              * 所以本端点不提供 q 参数，标题搜索一律前端做。
              */
-            agentName: ctx.cfg.agentName,
-            sessionSourceList: [ctx.cfg.sessionSource],
-            maxResults: PAGE_SIZE,
-            nextToken,
-          }),
-        }),
-        runtimeFor(),
-      );
+            AgentName: ctx.cfg.agentName,
+            SessionSourceList: [ctx.cfg.sessionSource],
+            Archived: archived,
+            MaxResults: PAGE_SIZE,
+            ...(nextToken ? { NextToken: nextToken } : {}),
+      });
 
       const body = readNonStreamBody(resp);
       if (!body.result) return { ok: false, error: missingResultError(api, body) };
@@ -332,36 +333,29 @@ function toSessionSummary(row: unknown): SessionSummary | undefined {
 // 历史（LoadAgentSession）
 // ---------------------------------------------------------------------------
 
-/**
- * 拉一整份历史帧。
- *
- * 用**独立的 30s readTimeout**：实测在会话 RUNNING 期间调 load，4 次里有 2 次会阻塞到
- * 那一轮跑完才返回（178s、81.6s），另外 2 次 0.1s 返回但内容是假的 end_turn。
- * 阻塞不可预测，快速失败让用户重试，好过把界面挂死三分钟。
- *
- * `Meta.BeginLogOffset` 是**死参数**：传任何值都返回全量，服务端没有增量续传。
- * 所以这里不传它，也不在任何地方暴露它——这也是本工程选 NDJSON 而不是 SSE 的原因
- * （SSE 的 `Last-Event-ID` 语义会暗示"可以续传"，那是撒谎）。
- */
-export async function liveLoadFrames(ctx: LiveContext, sessionId: string): Promise<AcpFrame[]> {
-  const frames: AcpFrame[] = [];
+/** 历史快照与在途续传使用不同预算；恢复时必须消费原轮终态。 */
+async function* liveLoadStream(ctx: LiveContext, sessionId: string, id: string,
+  offset: number | undefined, timeoutMs: number): AsyncGenerator<AcpFrame> {
   const stream = ctx.client.loadAgentSessionWithSSE(
-    new LoadAgentSessionRequest({
-      id: nextRpcId(),
-      jsonrpc: JSONRPC_VERSION,
-      params: new LoadAgentSessionRequestParams({
-        sessionId,
-        meta: new LoadAgentSessionRequestParamsMeta({ isReload: true }),
+    new LoadAgentSessionRequest({ id, jsonrpc: JSONRPC_VERSION,
+      params: new LoadAgentSessionRequestParams({ sessionId,
+        meta: new LoadAgentSessionRequestParamsMeta({ isReload: true,
+          ...(offset === undefined ? {} : { beginLogOffset: offset }) }),
       }),
-    }),
-    runtimeForSse(HISTORY_READ_TIMEOUT_MS),
+    }), runtimeForSse(timeoutMs),
   );
-
   for await (const resp of guardAsyncIterable(stream, 'LoadAgentSession')) {
     const frame = frameFromSdkBody((resp as { body?: unknown }).body);
-    if (frame) frames.push(frame);
+    if (frame) yield frame;
   }
-  return frames;
+}
+
+export async function liveLoadFrames(ctx: LiveContext, sessionId: string): Promise<AcpFrame[]> {
+  return readLoadSnapshot(timeoutMs => {
+    const id = nextRpcId();
+    return { id, frames: liveLoadStream(ctx, sessionId, id, undefined, timeoutMs) };
+  }, error => toApiError(error, 'LoadAgentSession').kind === 'transport',
+  { budgetMs: HISTORY_READ_TIMEOUT_MS });
 }
 
 export async function liveHistory(ctx: LiveContext, sessionId: string): Promise<ApiResult<HistoryResult>> {
@@ -458,49 +452,28 @@ export async function liveArtifacts(ctx: LiveContext, sessionId: string): Promis
  */
 export async function liveCancel(ctx: LiveContext, sessionId: string): Promise<ApiResult<CancelResult>> {
   const api = 'CancelAgentSession';
-  let upstream = '调用未返回';
-  let status: number | undefined;
   try {
-    const resp = await ctx.client.cancelAgentSessionWithOptions(
-      new CancelAgentSessionRequest({
-        id: nextRpcId(),
-        jsonrpc: JSONRPC_VERSION,
-        params: new CancelAgentSessionRequestParams({ sessionId }),
-      }),
-      runtimeFor(),
-    );
-    const body = readNonStreamBody(resp);
-    status = body.statusCode;
-    upstream = `HTTP ${status ?? '?'}`;
+    const resp = await callOpenApi(ctx.client, api, { SessionId: sessionId });
+    const { result } = readNonStreamBody(resp);
+    if (result && result.delivered === undefined && result.noop === undefined && result.sessionId === sessionId) {
+      return { ok: true, result: { delivered: false, accepted: true, warning: 'cancel-accepted-legacy',
+        detail: '旧版接口已回执此会话的取消请求；未提供 Delivered/Noop，实际终止以远端事件为准。' } };
+    }
+    if (typeof result?.delivered !== 'boolean' || (result.noop !== undefined && typeof result.noop !== 'boolean')) {
+      return { ok: false, error: toApiError(new Error('CancelAgentSession 未返回有效的 Delivered/Noop 结果'), api) };
+    }
+    const delivered = result.delivered;
+    const noop = result.noop === true;
+    return { ok: true, result: {
+      delivered, noop,
+      warning: delivered ? 'cancel-accepted' : noop ? 'cancel-noop' : 'cancel-upstream-error',
+      detail: delivered ? '上游确认取消请求已送达；执行终态以真实事件为准。'
+        : noop ? '上游确认会话空闲，取消为空操作。' : '上游未确认取消请求送达，执行可能仍在继续。',
+    } };
   } catch (err) {
-    // 非 2xx / 网络层失败都记进 detail 透给前端，不当异常抛——取消失败
-    // 的正确处置是让调用方知道"没取消成"，而不是收到一个 5xx。
-    upstream = toApiError(err, api).message;
+    return { ok: false, error: toApiError(err, api) };
   }
-
-  const delivered = status === 200;
-  return {
-    ok: true,
-    result: {
-      delivered,
-      warning: delivered ? 'cancel-accepted' : 'cancel-upstream-error',
-      detail: delivered
-        ? `已向上游发出 ${api}（${upstream}），取消请求已被接受。` +
-          '若当时有执行中的轮次，流会以 `stopReason=cancelled` 终态收场' +
-          '（实测 3/3：1200 字长文在 432 字处被截断；空闲会话上取消是 no-op）。' +
-          '注意：cancelled 终态目前不落库——稍后 LoadAgentSession 里那一轮 ' +
-          '`terminated=false`、无 stopReason，属上游已知缺口，不代表取消失败。'
-        : `已向上游发出 ${api} 但未获 200（本次结果：${upstream}）。` +
-          '取消未确认生效：那一轮可能仍在执行，结果稍后拉历史确认。',
-    },
-  };
 }
-
-// ---------------------------------------------------------------------------
-// 人卡回覆（ReplyAgentSession）
-// ---------------------------------------------------------------------------
-
-/** `POST /api/sessions/:id/reply` 的入参（路由层已做过形状校验）。 */
 export interface ReplyInput {
   permissionRequestId: string;
   /** ask_user_question 的答案（索引键 → 选项 label / 自定义文本）。 */
@@ -683,9 +656,23 @@ export async function* livePromptFrames(
   outboundText: string,
   acks?: string[],
 ): AsyncGenerator<AcpFrame, void, unknown> {
+  const id = nextRpcId();
+  yield* recoverPromptFrames(
+    { id, frames: initialPromptFrames(ctx, sessionId, outboundText, id, acks) },
+    (offset, timeoutMs) => {
+      const loadId = nextRpcId();
+      return { id: loadId, frames: liveLoadStream(ctx, sessionId, loadId, offset, timeoutMs) };
+    },
+    error => toApiError(error, 'LoadAgentSession').kind === 'transport',
+    { onResume: (offset, attempt) => ctx.log?.info({ sessionId, offset, attempt }, 'prompt_stream_resume') },
+  );
+}
+
+async function* initialPromptFrames(ctx: LiveContext, sessionId: string, outboundText: string,
+  id: string, acks?: string[]): AsyncGenerator<AcpFrame> {
   const stream = ctx.client.promptAgentSessionWithSSE(
     new PromptAgentSessionRequest({
-      id: nextRpcId(),
+      id,
       jsonrpc: JSONRPC_VERSION,
       params: new PromptAgentSessionRequestParams({
         sessionId,

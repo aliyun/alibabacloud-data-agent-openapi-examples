@@ -27,4 +27,4 @@
 
 `--lan` 会让前端监听所有网卡，通过同源代理访问回环后端。应用没有独立用户认证；访问者共享主机账号权限与会话，仅在可信网络使用，不直接暴露公网。
 
-详见 [内网访问指南](docs/LAN_ACCESS.md)、[开发说明](docs/DEVELOPMENT.md) 及 `server-node/src/config.ts`。
+详见 [内网访问说明](README.md#内网访问端口与配置切换)、[开发说明](docs/DEVELOPMENT.md) 及 `server-node/src/config.ts`。

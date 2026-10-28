@@ -49,12 +49,19 @@ export function createSdkClient(cfg: AppConfig): SdkClient {
     new $OpenApiUtil.Config({
       accessKeyId: cfg.accessKeyId,
       accessKeySecret: cfg.accessKeySecret,
+      securityToken: cfg.securityToken,
       regionId: cfg.regionId,
       // 留空时 SDK 按 regionId 走内置映射；非空时直接当 host，覆盖映射（预发/日常网关靠它）。
       endpoint: cfg.endpoint,
       // 不在这里设 readTimeout：Config 上的超时是全局的，而 load 需要一个远小于
       // 默认值的独立超时（见 HISTORY_READ_TIMEOUT_MS）。超时一律走 RuntimeOptions。
       connectTimeout: CONNECT_TIMEOUT_MS,
+      // openapi-core currently drops RuntimeOptions.keepAlive before dara.doAction.
+      // Use its supported header configuration so completed responses do not leave
+      // this client's sockets in httpx's shared idle pool. This avoids reusing our
+      // own stale idle connections without retrying a possibly accepted Prompt.
+      // SSE remains open until its response ends; ordinary RPCs pay a new handshake.
+      globalParameters: new $OpenApiUtil.GlobalParameters({ headers: { connection: 'close' } }),
       /**
        * **关掉重试的唯一有效开关在这里，不在 RuntimeOptions 上。**
        *
@@ -70,6 +77,20 @@ export function createSdkClient(cfg: AppConfig): SdkClient {
       retryOptions: new $dara.RetryOptions({ retryable: false }),
     }),
   );
+
+  // liveCreateSession uses the generic POP callApi path, which supplies
+  // runtimeFor(). Apply the creation budget at SDK dispatch so its existing
+  // JSON-RPC error handling and other actions remain unchanged.
+  const callApi = client.callApi.bind(client);
+  client.callApi = (params, request, runtime) => {
+    if (params.action !== 'CreateAgentSession') return callApi(params, request, runtime);
+    const budget = runtimeForCreate(runtime.readTimeout ?? DEFAULT_READ_TIMEOUT_MS);
+    return callApi(params, request, new $dara.RuntimeOptions({
+      ...runtime,
+      connectTimeout: budget.connectTimeout,
+      readTimeout: budget.readTimeout,
+    }));
+  };
 
   assertSseCapable(client);
   return client;
@@ -105,6 +126,19 @@ export function runtimeFor(readTimeoutMs: number = DEFAULT_READ_TIMEOUT_MS): $da
  * stay disabled and a real stream failure remains an error.
  */
 export function runtimeForSse(readTimeoutMs: number = DEFAULT_READ_TIMEOUT_MS): $dara.RuntimeOptions {
+  const runtime = runtimeFor(readTimeoutMs);
+  runtime.connectTimeout = readTimeoutMs;
+  return runtime;
+}
+
+/**
+ * CreateAgentSession may spend tens of seconds preparing a session before its
+ * first response byte. httpx retains connectTimeout as the socket idle timeout,
+ * so use the read budget for both timers, just as for SSE. Tradeoff: connection
+ * establishment can also take this long. This is not a total wall-clock deadline;
+ * retries remain disabled by the client policy.
+ */
+export function runtimeForCreate(readTimeoutMs: number = DEFAULT_READ_TIMEOUT_MS): $dara.RuntimeOptions {
   const runtime = runtimeFor(readTimeoutMs);
   runtime.connectTimeout = readTimeoutMs;
   return runtime;

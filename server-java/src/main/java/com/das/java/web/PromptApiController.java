@@ -7,7 +7,7 @@ import com.das.java.core.Frames;
 import com.das.java.live.LiveClient;
 import com.das.java.live.Normalize;
 import com.das.java.live.Normalize.DasApiException;
-import com.das.java.live.SdkSseStream;
+import com.das.java.live.RecoveringPromptStream;
 import com.das.java.mock.MockFixtures;
 import com.das.java.mock.MockFixtures.MockScenario;
 import com.das.java.mock.MockReplay;
@@ -33,10 +33,9 @@ import org.springframework.web.bind.annotation.RestController;
  * `POST /api/sessions/:id/prompt` → `application/x-ndjson`。与 Node 实现的
  * server-node/routes/prompt.ts、Python 实现的 main.py 中的 prompt 路由同源同语义。
  *
- * 这是全工程唯一一条流式路由，也是唯一一处"写操作"：prompt 一旦送出去，服务端那一轮
+ * 这是每请求独立的 NDJSON prompt 路由：prompt 一旦送出去，服务端那一轮
  * 就开始跑了，断开连接不会停掉它。所以顺序是硬的：
- * **校验参数 → 拿在途锁 → 进流 → 调上游**。把锁放在流开始之前，被拒的那一方还能
- * 拿到一个普通 JSON 响应。
+ * **校验参数 → flush headers → 调上游**。LIVE 准入由 POP 决定；MOCK 保留演示在途锁。
  */
 @RestController
 public class PromptApiController {
@@ -76,7 +75,7 @@ public class PromptApiController {
         FrameSource source;
         if (live != null) {
             // 注意这里只是**登记**了参数，HTTP 请求要到 producer 线程第一次 next() 才发出——
-            // 所以在途锁之前构造它并不会碰到上游（与 Node 异步生成器、Python async gen 的惰性和本一致）。
+            // 所以在响应 headers flush 前构造它不会碰到上游（与 Node 异步生成器、Python async gen 的惰性和本一致）。
             source = new LivePromptSource(live, sessionId, outbound, popRequestIds);
         } else {
             MockScenario scenario = MockFixtures.findScenario(sessionId);
@@ -92,18 +91,25 @@ public class PromptApiController {
             if (scenario.popAck() != null) popRequestIds.add(scenario.popAck());
         }
 
-        AcquireResult acquire = inflight.tryAcquire(sessionId);
-        if (acquire instanceof Inflight.Rejected rejected) {
-            source.close();
-            return json(rejected.error());
+        Acquired acquired = null;
+        if (live == null) {
+            AcquireResult acquire = inflight.tryAcquire(sessionId);
+            if (acquire instanceof Inflight.Rejected rejected) { source.close(); return json(rejected.error()); }
+            acquired = (Acquired) acquire;
         }
-        Acquired acquired = (Acquired) acquire;
 
         response.setStatus(HttpServletResponse.SC_OK);
         response.setContentType(Wire.CONTENT_TYPE + "; charset=utf-8");
         response.setHeader("Cache-Control", "no-store, no-transform");
         response.setHeader("X-Accel-Buffering", "no");
-        pump(response.getOutputStream(), source, sessionId, popRequestIds, acquired);
+        // Admission is observable before waiting for the model's first frame.
+        OutputStream output;
+        try { response.flushBuffer(); output = response.getOutputStream(); }
+        catch (IOException failure) {
+            try { source.close(); } finally { if (acquired != null) acquired.release().run(); }
+            return null;
+        }
+        pump(output, source, sessionId, popRequestIds, acquired);
         return null; // 响应已由本方法写完，Spring 不再做视图/转换处理
     }
 
@@ -144,14 +150,15 @@ public class PromptApiController {
 
     /**
      * live 提示词的帧源：每帧过 frameFromSdkBody；POP 回执（不是帧）收集进 acks。
-     * 构造是惰性的——第一次 next() 才真正发起流式调用（拿到在途锁之后才碰上游）。
+     * 构造是惰性的——第一次 next() 才真正发起本请求的流式调用。
      */
     private static final class LivePromptSource implements FrameSource {
         private final LiveClient live;
         private final String sessionId;
         private final String outbound;
         private final List<String> acks;
-        private SdkSseStream stream;
+        private volatile RecoveringPromptStream stream;
+        private volatile boolean closed;
 
         LivePromptSource(LiveClient live, String sessionId, String outbound, List<String> acks) {
             this.live = live;
@@ -162,9 +169,11 @@ public class PromptApiController {
 
         @Override
         public Map<String, Object> next() throws DasApiException {
+            if (closed) return null;
             if (stream == null) {
                 try {
                     stream = live.openPromptStream(sessionId, outbound, acks);
+                    if (closed) { stream.close(); return null; }
                 } catch (Exception e) {
                     if (e instanceof DasApiException de) throw de;
                     throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
@@ -174,7 +183,7 @@ public class PromptApiController {
                 String data;
                 try {
                     data = stream.next();
-                } catch (SdkSseStream.SseException e) {
+                } catch (DasApiException e) {
                     throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"));
                 }
                 if (data == null) return null;
@@ -197,13 +206,14 @@ public class PromptApiController {
 
         @Override
         public void close() {
+            closed = true;
             if (stream != null) stream.close();
         }
     }
 
     // ------------------------------------------------------------------
     // 泵：约束与 Node 的 streamWire、Python 的 stream() 同源
-    // （心跳 15s；硬上限 330s；客户端断开 → 释放锁并停源，不 cancel 不重发）
+    // （心跳 15s；不设整轮硬上限；客户端断开 → 释放锁并停源，不 cancel 不重发）
     // ------------------------------------------------------------------
 
     private void pump(
@@ -214,7 +224,8 @@ public class PromptApiController {
         Acquired acquired
     ) throws IOException {
         Pipeline pipeline = new Pipeline(sessionId, live == null, System.currentTimeMillis());
-        java.util.concurrent.LinkedBlockingQueue<Object> events = new java.util.concurrent.LinkedBlockingQueue<>();
+        java.util.concurrent.ArrayBlockingQueue<Object> events = new java.util.concurrent.ArrayBlockingQueue<>(128);
+        java.util.concurrent.atomic.AtomicBoolean disconnected = new java.util.concurrent.atomic.AtomicBoolean();
 
         Thread producer = new Thread(() -> {
             try {
@@ -222,24 +233,21 @@ public class PromptApiController {
                     Map<String, Object> frame = source.next();
                     if (frame == null) break;
                     for (Map<String, Object> event : pipeline.onFrame(frame)) {
-                        events.put(event);
-                        if ("meta".equals(event.get("type")) && pipeline.rid() != null) {
+                        if (!enqueue(events, event, disconnected)) return;
+                        if (acquired != null && "meta".equals(event.get("type")) && pipeline.rid() != null) {
                             // 回填 rid 必须在流进行中，不能等流结束：锁拒绝日志靠它指认在途轮次。
                             acquired.entry().rid = pipeline.rid();
                         }
                     }
                 }
                 Map<String, Object> finish = pipeline.finish(popRequestIds);
-                if (finish != null) events.put(finish);
+                if (finish != null) enqueue(events, finish, disconnected);
             } catch (DasApiException e) {
-                events.offer(pipeline.onError(e, "PromptAgentSession"));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (Throwable t) {
-                events.offer(pipeline.onError(
-                    new DasApiException(Normalize.toApiError(t, "PromptAgentSession")), "PromptAgentSession"));
+                enqueue(events, pipeline.onError(e, "PromptAgentSession"), disconnected);
+            } catch (Exception error) {
+                enqueue(events, pipeline.onError(new DasApiException(Normalize.toApiError(error, "PromptAgentSession")), "PromptAgentSession"), disconnected);
             } finally {
-                events.offer(END);
+                enqueue(events, END, disconnected);
             }
         }, "prompt-producer-" + sessionId);
         producer.setDaemon(true);
@@ -268,9 +276,22 @@ public class PromptApiController {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
-            source.close();
-            acquired.release().run();
+            disconnected.set(true);
+            try { source.close(); }
+            finally {
+                producer.interrupt();
+                events.clear();
+                if (acquired != null) acquired.release().run();
+            }
         }
+    }
+
+    private static boolean enqueue(java.util.concurrent.BlockingQueue<Object> queue, Object item,
+        java.util.concurrent.atomic.AtomicBoolean closed) {
+        try {
+            while (!closed.get()) if (queue.offer(item, 100, java.util.concurrent.TimeUnit.MILLISECONDS)) return true;
+        } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        return false;
     }
 
     private static void writeLine(OutputStream output, Map<String, Object> event) throws IOException {

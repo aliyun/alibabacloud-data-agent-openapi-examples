@@ -153,15 +153,10 @@ def test_load_seeds_history_into_compacted_replay(mock_client: TestClient) -> No
     assert body["liveJournal"] == []
     assert body["lastEventId"] == compacted[-1]["id"]
     assert isinstance(body["eventEpoch"], str)
-    assert body["state"]["models"] == [
-        {
-            "modelId": "data-agent",
-            "baseModelId": "data-agent",
-            "name": "DataWorks Data Agent",
-            "isCurrent": True,
-            "isRuntime": False,
-        }
-    ]
+    assert body["state"]["models"] == {
+        "currentModelId": "data-agent",
+        "availableModels": [{"modelId": "data-agent", "name": "DataWorks Data Agent"}],
+    }
     assert body["state"]["modes"] == {}
     assert body["state"]["configOptions"] is None
     assert body["historyHasMore"] is False
@@ -475,15 +470,15 @@ def test_question_options_do_not_invent_tool_approval() -> None:
 def test_restored_question_sends_only_answers_upstream(monkeypatch) -> None:
     from unittest.mock import AsyncMock
     from fastapi import FastAPI
-    from das_python.daemon import routes
+    from das_python.daemon import routes, live_routes
 
     frames = [
         {"RequestId": "turn-1", "Params": {"update": {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "Ask a question"}}}},
         {"RequestId": "turn-1", "Params": {"kind": "permission_request", "data": {"requestId": "question-1", "toolCall": {"_meta": {"toolName": "ask_user_question"}}}}},
     ]
-    monkeypatch.setattr(routes, "_load_frames", AsyncMock(return_value=frames))
+    monkeypatch.setattr(live_routes, "_load_frames", AsyncMock(return_value=frames))
     reply = AsyncMock(return_value={"accepted": True})
-    monkeypatch.setattr(routes, "_reply_result", reply)
+    monkeypatch.setattr(live_routes, "_reply_result", reply)
     app = FastAPI()
     live = object()
     cfg = _mock_cfg()
@@ -499,20 +494,3 @@ def test_restored_question_sends_only_answers_upstream(monkeypatch) -> None:
     reply.assert_awaited_once_with(live, session_id, {
         "permissionRequestId": "question-1", "outcome": "selected", "answers": {"0": "A"}, "optionId": None,
     })
-
-
-@pytest.mark.parametrize('option_id,answers', [('proceed_once', None), ('submit', {'0': 'synthetic freeform'}), (None, {'0': 'A'})])
-def test_reply_uses_real_python_sdk_parameter_names(option_id, answers):
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
-    from das_python.live import _reply_result
-    body = SimpleNamespace(to_map=lambda: {'JsonRpcResponse': {'Result': {'Accepted': True}}})
-    client = SimpleNamespace(reply_agent_session_with_options_async=AsyncMock(return_value=SimpleNamespace(body=body)))
-    result = asyncio.run(_reply_result(SimpleNamespace(client=client), 'synthetic-session', {
-        'permissionRequestId': 'synthetic-question', 'optionId': option_id, 'answers': answers, 'outcome': 'selected',
-    }))
-    assert result['accepted'] is True
-    request = client.reply_agent_session_with_options_async.call_args.args[0]
-    assert request.params.outcome.option_id == option_id
-    assert request.params.answers == answers
-    assert request.params.permission_request_id == 'synthetic-question'

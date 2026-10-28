@@ -28,14 +28,32 @@ public record AppConfig(
     String agentName,
     String sessionSource,
     String resourceGroupId,
+    /** 可选的创建会话项目上下文（SDK InitialConfigOptions.ProjectId）。 */
+    String projectId,
     String accessKeyId,
     String accessKeySecret,
     /** 默认 127.0.0.1：进程持有 AK/SK，暴露到局域网等于把凭证使用权一起暴露。 */
     String serverHost,
     /** 前端构建产物目录；存在则由本进程同源托管（单容器交付 UI+API）。 */
     String webDist,
-    Path repoRoot
+    Path repoRoot,
+    String model,
+    String approvalMode,
+    String reasoningEffort,
+    List<String> models,
+    /** Optional STS token paired with this config's access key. */
+    String securityToken
 ) {
+    /** Preserve callers that explicitly supply long-lived credentials. */
+    public AppConfig(boolean mock, boolean mockRealtime, double mockSpeed, int port,
+        List<String> corsOrigin, String regionId, String endpoint, String agentName,
+        String sessionSource, String resourceGroupId, String projectId, String accessKeyId,
+        String accessKeySecret, String serverHost, String webDist, Path repoRoot,
+        String model, String approvalMode, String reasoningEffort, List<String> models) {
+        this(mock, mockRealtime, mockSpeed, port, corsOrigin, regionId, endpoint, agentName,
+            sessionSource, resourceGroupId, projectId, accessKeyId, accessKeySecret, serverHost,
+            webDist, repoRoot, model, approvalMode, reasoningEffort, models, null);
+    }
     private static final Set<String> TRUTHY = Set.of("1", "true", "yes", "on");
 
     /** JVM 内无法改写真实环境变量；用进程级覆盖表实现 dotenv override:false 语义。 */
@@ -45,6 +63,16 @@ public record AppConfig(
     private static String env(String key) {
         String v = System.getenv(key);
         return v != null ? v : ENV_OVERRIDES.get(key);
+    }
+
+    static List<String> parseModels(String raw, String model) {
+        var values = new java.util.LinkedHashSet<String>();
+        if (raw != null) for (String item : raw.split(",")) {
+            String value = nonEmpty(item);
+            if (value != null) values.add(value);
+        }
+        if (model != null) values.add(model);
+        return List.copyOf(values);
     }
 
     private static boolean bool(String raw) {
@@ -120,11 +148,17 @@ public record AppConfig(
             agent != null ? agent : Constants.DEFAULT_AGENT_NAME,
             source != null ? source : Constants.DEFAULT_SESSION_SOURCE,
             nonEmpty(env("RESOURCE_GROUP_ID")),
+            nonEmpty(env("DATAAGENT_PROJECT_ID")),
             accessKeyId,
             accessKeySecret,
             host != null ? host : "127.0.0.1",
             webDist,
-            repoRoot
+            repoRoot,
+            nonEmpty(env("DATAAGENT_MODEL")),
+            nonEmpty(env("DATAAGENT_MODE")) != null ? nonEmpty(env("DATAAGENT_MODE")) : "yolo",
+            nonEmpty(env("DATAAGENT_REASONING_EFFORT")),
+            parseModels(env("DATAAGENT_MODELS"), nonEmpty(env("DATAAGENT_MODEL"))),
+            nonEmpty(env("ALIBABA_CLOUD_SECURITY_TOKEN"))
         );
 
         if (!cfg.mock && (cfg.accessKeyId == null || cfg.accessKeySecret == null)) {

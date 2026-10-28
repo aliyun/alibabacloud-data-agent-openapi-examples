@@ -1,6 +1,7 @@
 package com.das.java.web;
 
 import com.das.java.config.AppConfig;
+import com.das.java.config.SessionOptions;
 import com.das.java.core.ApiError;
 import com.das.java.core.Constants;
 import com.das.java.core.Marker;
@@ -90,6 +91,7 @@ public class RestApiController {
         result.put("agent", cfg.agentName());
         result.put("sessionSource", cfg.sessionSource());
         result.put("resourceGroupIdConfigured", cfg.resourceGroupId() != null);
+        result.put("projectIdConfigured", cfg.projectId() != null);
         // 只说"有没有"，不说"是什么"：health 是前端启动时第一个请求，
         // 内容会进浏览器 network 面板、日志和截图。
         result.put("credentials", cfg.accessKeyId() != null && cfg.accessKeySecret() != null ? "present" : "missing");
@@ -104,10 +106,13 @@ public class RestApiController {
     // ------------------------------------------------------------------
 
     @GetMapping("/api/sessions")
-    public ResponseEntity<Map<String, Object>> sessions() throws Exception {
+    public ResponseEntity<Map<String, Object>> sessions(
+        @RequestParam(name = "agentName", required = false) String agentName) throws Exception {
+        try { agentName = SessionOptions.validateAgentName(agentName); }
+        catch (IllegalArgumentException error) { return send(err(ApiError.apiError("rpc_error", error.getMessage()))); }
         if (live != null) {
             try {
-                return send(ok(live.listSessions()));
+                return send(ok(agentName == null ? live.listSessions() : live.listSessions(false, agentName)));
             } catch (Exception exc) {
                 return send(liveError(exc, "ListAgentSessions"));
             }
@@ -117,18 +122,14 @@ public class RestApiController {
 
     @PostMapping("/api/sessions")
     public ResponseEntity<Map<String, Object>> createSession(@RequestBody(required = false) Map<String, Object> body) throws Exception {
-        Object rawMode = body == null ? null : body.get("mode");
-        String mode = null;
-        if (rawMode instanceof String s && !s.isEmpty()) {
-            if (s.equals("default") || s.equals("yolo")) {
-                mode = s;
-            } else {
-                return send(err(ApiError.apiError("rpc_error", "mode 只接受 'yolo' | 'default'，收到：" + s)));
-            }
+        SessionOptions options;
+        try { options = SessionOptions.resolve(cfg, body); }
+        catch (IllegalArgumentException error) {
+            return send(err(ApiError.apiError("rpc_error", error.getMessage())));
         }
         if (live != null) {
             try {
-                return send(ok(live.createSession(mode != null ? mode : "yolo")));
+                return send(ok(live.createSessionWithOptions(options)));
             } catch (Exception exc) {
                 return send(liveError(exc, "CreateAgentSession"));
             }

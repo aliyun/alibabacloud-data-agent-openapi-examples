@@ -33,6 +33,11 @@ class AppConfig:
     accessKeySecret: str | None  # noqa: N815
     serverHost: str  # noqa: N815
     webDist: str | None  # noqa: N815
+    model: str | None = None
+    mode: str = "yolo"
+    reasoningEffort: str | None = None  # noqa: N815
+    models: tuple[str, ...] = ()
+    securityToken: str | None = None  # noqa: N815 — externally supplied temporary credentials
 
 
 def _bool(raw: str | None) -> bool:
@@ -94,6 +99,10 @@ def load_config() -> AppConfig:
     access_key_secret = _non_empty(os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET"))
 
     cfg = AppConfig(
+        model=_non_empty(os.environ.get("DATAAGENT_MODEL")),
+        mode=_non_empty(os.environ.get("DATAAGENT_MODE")) or "yolo",
+        reasoningEffort=_non_empty(os.environ.get("DATAAGENT_REASONING_EFFORT")),
+        models=tuple(dict.fromkeys(s.strip() for s in os.environ.get("DATAAGENT_MODELS", "").split(",") if s.strip())),
         mock=_bool(os.environ.get("MOCK")),
         mockRealtime=_bool(os.environ.get("MOCK_REALTIME")),  # noqa: N815
         mockSpeed=_num(os.environ.get("MOCK_SPEED"), MOCK_DEFAULT_SPEED),  # noqa: N815
@@ -110,6 +119,7 @@ def load_config() -> AppConfig:
         resourceGroupId=_non_empty(os.environ.get("RESOURCE_GROUP_ID")),  # noqa: N815
         accessKeyId=access_key_id,  # noqa: N815
         accessKeySecret=access_key_secret,  # noqa: N815
+        securityToken=_non_empty(os.environ.get("ALIBABA_CLOUD_SECURITY_TOKEN")),  # noqa: N815
         serverHost=_non_empty(os.environ.get("SERVER_HOST")) or "127.0.0.1",  # noqa: N815
         webDist=_non_empty(os.environ.get("WEB_DIST")) or str(REPO_ROOT / "web" / "dist"),  # noqa: N815
     )

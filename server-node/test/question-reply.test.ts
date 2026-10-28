@@ -6,6 +6,7 @@ import type { AppConfig } from '../src/config.js';
 import * as live from '../src/live.js';
 import { permissionRequestEvent, OPENAPI_ANSWERS_OPTION } from '../src/daemon/events.js';
 import { registerDaemonRoutes } from '../src/daemon/routes.js';
+import { registerPromptRoutes } from '../src/routes/prompt.js';
 
 const frames: AcpFrame[] = readFileSync(new URL('./fixtures/prompt-permission.jsonl', import.meta.url), 'utf8')
   .trim().split('\n').map(line => JSON.parse(line).data);
@@ -41,7 +42,9 @@ describe('OpenAPI answers-only question compatibility', () => {
       expect(reply).toHaveBeenCalledWith(expect.anything(), id, {
         permissionRequestId: 'req-keep-1', outcome: 'selected', answers: { '0': '先列大纲' }, optionId: undefined,
       });
+      reply.mockResolvedValueOnce({ ok: true, result: { accepted: false } } as Awaited<ReturnType<typeof live.liveReply>>);
       expect((await app.inject({ method: 'POST', url, payload: { outcome, answers: { '0': '先列大纲' } } })).statusCode).toBe(404);
+      expect(reply).toHaveBeenCalledTimes(2); // Upstream, rather than a resolved-request cache, rejects the second reply.
     } finally { await app.close(); }
   });
 
@@ -55,18 +58,19 @@ describe('OpenAPI answers-only question compatibility', () => {
     const app = Fastify();
     const cfg = { mock: false, corsOrigin: [], regionId: 'test', agentName: 'test' } as unknown as AppConfig;
     await registerDaemonRoutes(app, cfg, {} as live.LiveContext['client']);
+    await registerPromptRoutes(app, cfg, {} as live.LiveContext['client']);
     const id = '00000000-0000-4000-8000-000000000002';
     try {
-      expect((await app.inject({ method: 'POST', url: `/d/session/${id}/prompt`,
-        payload: { prompt: [{ type: 'text', text: 'Ask a question' }] } })).statusCode).toBe(202);
-      await vi.waitFor(async () => {
-        const transcript = (await app.inject({ method: 'GET', url: `/d/session/${id}/transcript` })).json();
-        expect(transcript.events.some((e: { type: string }) => e.type === 'turn_error')).toBe(true);
-      });
+      const response = await app.inject({ method: 'POST', url: `/api/sessions/${id}/prompt`, payload: { text: 'Ask a question' } });
+      expect(response.statusCode).toBe(200);
+      const events = response.body.trim().split('\n').map(line => JSON.parse(line));
+      expect(events.some(event => event.type === 'error')).toBe(true);
+      expect(events.some(event => event.type === 'done')).toBe(false);
       expect((await app.inject({ method: 'POST', url: `/d/session/${id}/permission/req-keep-1`, payload: {
         outcome: { outcome: 'selected', optionId: OPENAPI_ANSWERS_OPTION }, answers: { '0': '先列大纲' },
       } })).statusCode).toBe(200);
-      expect(reply).toHaveBeenCalledWith(expect.anything(), id, expect.objectContaining({ optionId: undefined, answers: { '0': '先列大纲' } }));
+      expect(reply).toHaveBeenCalledWith(expect.anything(), id, expect.objectContaining({ answers: { '0': '先列大纲' } }));
+      expect(reply.mock.calls[0]?.[2].optionId).toBeUndefined();
     } finally { await app.close(); }
   });
 });

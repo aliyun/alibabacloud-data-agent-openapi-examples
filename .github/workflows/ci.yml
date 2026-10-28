@@ -29,6 +29,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
+      - run: node --test scripts/test/assume-role.test.mjs scripts/e2e/*.test.mjs
       - run: python -m venv server-python/.venv && server-python/.venv/bin/python -m pip install -e './server-python[test]'
       - run: server-python/.venv/bin/python -m pytest server-python/tests
         env:

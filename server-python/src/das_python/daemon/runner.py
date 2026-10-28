@@ -1,4 +1,4 @@
-"""daemon prompt 准入与后台轮次。与 Node 实现的 server/daemon/runner.ts、
+"""MOCK-only daemon prompt 准入与后台轮次。与 Node 实现的 server/daemon/runner.ts、
 Java 实现的 Runner.java 同源同语义。
 
 所有校验都在**还没碰到上游**之前完成（写操作纪律），通过后立刻返回 202 所需的
@@ -22,7 +22,6 @@ from ..config import AppConfig
 from ..errors import classify_error, prompt_not_dispatched, redact_api_error, stream_break_without_terminal
 from ..frames import error_of, request_id_of, session_update_of, terminal_of, text_of
 from ..inflight import Acquired, Rejected as InflightRejected, try_acquire
-from ..live import LiveContext, _prompt_frames
 from ..mock_fixtures import find_scenario, read_fixture_frames
 from ..mock_replay import replay_frames
 from ..normalize import to_api_error
@@ -42,7 +41,6 @@ class PendingTurn:
     """
 
     cfg: Any
-    live: Any
     record: Any
     client_facing_id: str
     prompt_id: str
@@ -102,7 +100,6 @@ async def _turn_worker_loop() -> None:
         try:
             await run_turn(
                 pending.cfg,
-                pending.live,
                 pending.record,
                 pending.client_facing_id,
                 pending.prompt_id,
@@ -118,7 +115,6 @@ async def _turn_worker_loop() -> None:
 
 def admit_prompt(
     cfg: AppConfig,
-    live: LiveContext | None,
     record: SessionRecord,
     client_facing_id: str,
     prompt_blocks: Any,
@@ -132,7 +128,7 @@ def admit_prompt(
             texts.append(block["text"])
             continue
         block_type = block.get("type") if isinstance(block, dict) else None
-        # 上游 PromptAgentSession 只收文本块；图片块如实拒绝而不是静默丢弃（缺口见 OPENAPI-GAPS）
+        # 上游 PromptAgentSession 只收文本块；图片块如实拒绝而不是静默丢弃
         return Rejected(400, f"不支持的 prompt content block（type={block_type}）：上游 data agent OpenAPI 仅接受文本", "unsupported_prompt_content")
     text = "".join(texts).strip()
     if not text:
@@ -161,7 +157,6 @@ def admit_prompt(
         last_event_id=last_event_id,
         pending=PendingTurn(
             cfg=cfg,
-            live=live,
             record=record,
             client_facing_id=client_facing_id,
             prompt_id=prompt_id,
@@ -175,7 +170,6 @@ def admit_prompt(
 
 async def run_turn(
     cfg: AppConfig,
-    live: LiveContext | None,
     record: SessionRecord,
     client_facing_id: str,
     prompt_id: str,
@@ -184,7 +178,7 @@ async def run_turn(
     acquired: Acquired,
     started_at: int,
 ) -> None:
-    """后台轮次：帧源（live=SDK SSE / mock=录制件回放）→ 翻译 → journal。
+    """MOCK 后台轮次：录制件回放→ 翻译 → journal。
 
     收尾分类与 pipeline 同源：
       · 帧内 Error → 首个错误归一成 turn_error（后续帧继续收）；
@@ -193,22 +187,22 @@ async def run_turn(
     不设整轮硬上限；等待真实终态或明确传输错误。
     """
     journal = record.journal
+
+    def emit_terminal(event: dict[str, Any]) -> None:
+        journal.append(event)
+
     print(json.dumps({"event": "prompt_stream_start", "backend": "python", "pid": os.getpid(),
                       "sessionId": record.real_id, "promptId": prompt_id, "startedAt": started_at}), flush=True)
     acks: list[str] = []
 
     frames: AsyncGenerator[dict[str, Any], None]
-    if live:
-        frames = _prompt_frames(live, record.real_id, outbound, acks)
-    else:
-        scenario = find_scenario(record.real_id)
-        frames = replay_frames(
-            read_fixture_frames(scenario.promptFixture) if scenario and scenario.promptFixture else [],
-            realtime=cfg.mockRealtime,
-            speed=cfg.mockSpeed,
-        )
-        if scenario and scenario.popAck:
-            acks.append(scenario.popAck)
+    scenario = find_scenario(record.real_id)
+    frames = replay_frames(
+        read_fixture_frames(scenario.promptFixture) if scenario and scenario.promptFixture else [],
+        realtime=cfg.mockRealtime, speed=cfg.mockSpeed,
+    )
+    if scenario and scenario.popAck:
+        acks.append(scenario.popAck)
 
     frame_count = 0
     last_frame_at = None
@@ -238,9 +232,9 @@ async def run_turn(
                     request_id = permission_event.get("data", {}).get("requestId")
                     if isinstance(request_id, str):
                         if permission_event["type"] == "permission_request":
-                            record.pending_permissions[request_id] = permission_event
+                            record.set_pending_permission(request_id, permission_event)
                         else:
-                            record.pending_permissions.pop(request_id, None)
+                            record.set_pending_permission(request_id, None)
             if not error_sent:
                 event = frame_to_session_update(frame, client_facing_id, strip_marker=True, originator_client_id=client_id)
                 duplicate_user_chunk = False
@@ -271,7 +265,7 @@ async def run_turn(
                         errorCode=frame_error.get("errorCode") if isinstance(frame_error.get("errorCode"), str) else None,
                     )
                 )
-                journal.append(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
+                emit_terminal(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
             if terminal is None:
                 terminal = terminal_of(frame)
             if terminal is not None:
@@ -279,7 +273,7 @@ async def run_turn(
 
         if not error_sent:
             if terminal is not None:
-                journal.append(turn_complete_event(client_facing_id, terminal.get("rawStopReason") or "end_turn", prompt_id))
+                emit_terminal(turn_complete_event(client_facing_id, terminal.get("rawStopReason") or "end_turn", prompt_id))
             else:
                 error_sent = True
                 if frame_count == 0 and acks:
@@ -289,19 +283,19 @@ async def run_turn(
                     if frame_count == 0 and acks
                     else stream_break_without_terminal(frame_count)
                 )
-                journal.append(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
+                emit_terminal(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
     except Exception as err:  # noqa: BLE001
         cause = err
         while cause is not None and len(exception_types) < 4:
             exception_types.append(type(cause).__name__)
             cause = cause.__cause__ or cause.__context__
         if not error_sent and terminal is not None:
-            journal.append(turn_complete_event(client_facing_id, terminal.get("rawStopReason") or "end_turn", prompt_id))
+            emit_terminal(turn_complete_event(client_facing_id, terminal.get("rawStopReason") or "end_turn", prompt_id))
         elif not error_sent:
             outcome = "transport_exception"
             error_sent = True
             api = to_api_error(err if isinstance(err, Exception) else RuntimeError(str(err)), "PromptAgentSession")
-            journal.append(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
+            emit_terminal(turn_error_event(client_facing_id, api.message, prompt_id=prompt_id, code=api.kind, error_kind=api.kind))
     except asyncio.CancelledError:
         outcome = "task_cancelled"
         raise

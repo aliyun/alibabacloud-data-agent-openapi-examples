@@ -53,7 +53,7 @@ public class DasApplication {
         Map<String, Object> props = new HashMap<>();
         props.put("server.port", cfg.port());
         props.put("server.address", cfg.serverHost());
-        // 长轮响应不被容器异步超时掐断（330s 硬上限由本工程的流管道执行，容器只负责放行）。
+        // 不以容器异步超时限制整轮响应时长，流管道等待真实终态或传输错误。
         props.put("spring.mvc.async.request-timeout", "-1");
         new SpringApplicationBuilder(DasApplication.class)
             .properties(props)

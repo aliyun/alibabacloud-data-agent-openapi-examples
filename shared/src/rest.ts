@@ -120,9 +120,12 @@ export interface ArtifactsResult {
  *    `terminated=false`、无 stopReason，历史侧无法区分"已取消"与"断流"。
  */
 export interface CancelResult {
-  /** 上游是否接受了取消请求（HTTP 200）。执行中轮次的实际终止以流上 `stopReason=cancelled` 为准。 */
+  /** 上游确认已送达；实际终止以真实流的 stopReason 为准。 */
   delivered: boolean;
-  warning?: 'cancel-accepted' | 'cancel-upstream-error' | 'mock-replay-uncancellable';
+  /** Legacy Result.SessionId acknowledges receipt only, not actual delivery. */
+  accepted?: boolean;
+  noop?: boolean;
+  warning?: 'cancel-accepted' | 'cancel-accepted-legacy' | 'cancel-noop' | 'cancel-upstream-error' | 'mock-replay-uncancellable';
   detail: string;
 }
 

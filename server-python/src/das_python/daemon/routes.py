@@ -12,14 +12,15 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Path, Request, Response
+from fastapi import FastAPI, Path, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..config import AppConfig
 from ..constants import HEARTBEAT_MS, STREAM_HARD_LIMIT_MS
-from ..live import LiveContext, _cancel_result, _create_session_result, _load_frames, _reply_result
+from ..live import LiveContext
 from ..mock_fixtures import find_scenario, mock_create_session, read_fixture_frames
 from ..normalize import to_api_error
+from ..session_options import creation_options, public_options
 from .events import OPENAPI_ANSWERS_OPTION, permission_resolved_event, prompt_cancelled_event, session_snapshot_event
 from .journal import MAX_EVENTS, JournalEntry, SessionJournal
 from .registry import WORKSPACE_CWD, SessionRecord, SessionRegistry, rebuild_pending_permissions
@@ -40,33 +41,6 @@ def _not_found(session_id: str) -> JSONResponse:
 
 
 def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | None) -> None:
-    registry = SessionRegistry()
-
-    def resolve_session(session_id: str) -> SessionRecord | None:
-        """使用 OpenAPI 真实 sessionId。LIVE 下未知 id 也放行（深链/重启后直接发话，存在性交给上游判）；
-        MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。"""
-        known = registry.resolve(session_id)
-        if known is not None:
-            return known
-        if live:
-            return registry.ensure(session_id)
-        return registry.ensure(session_id) if find_scenario(session_id) is not None else None
-
-    def standalone_session_body(record: SessionRecord, client_facing_id: str) -> dict[str, Any]:
-        return {
-            "sessionId": client_facing_id,
-            # daemon 分配的客户端身份：客户端随 prompt 以 X-Qwen-Client-Id 带回，
-            # 我们据此盖 originatorClientId（suppressOwnUserEcho 的匹配键）
-            "clientId": record.client_id,
-            "workspaceCwd": WORKSPACE_CWD,
-            "attached": False,
-            "createdAt": _iso(record.created_at),
-            "sourceType": "standalone",
-            "context": {"kind": "standalone"},
-            "projectlessOutputDirectory": f"{WORKSPACE_CWD}/out/{client_facing_id}",
-            "workingDirectory": {"state": "ready"},
-        }
-
     # ------------------------------------------------------------------
     # 发现
     # ------------------------------------------------------------------
@@ -92,6 +66,8 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
     @app.get("/d/daemon/status")
     async def d_daemon_status(detail: str | None = None) -> dict[str, Any]:
         """daemon 状态报告（web-shell 的「Daemon 状态」面板）。全部字段是**本地真实状态**（不依赖上游）。"""
+        if live:
+            return _error(404, "No authoritative remote daemon status API", "status_unavailable")
         stats = registry.stats()
         return {
             "v": 1,
@@ -155,28 +131,71 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             },
         }
 
+    @app.get("/d/openapi/session-options")
+    async def d_openapi_session_options() -> dict[str, Any]:
+        return {**public_options(cfg), "promptTransport": "http-stream" if live else "daemon"}
+
+    @app.post("/d/session/{session_id}/model")
+    @app.post("/d/session/{session_id}/approval-mode")
+    @app.post("/d/session/{session_id}/config-option")
+    async def d_configuration_requires_new_session(session_id: str) -> Any:
+        return _error(409, "POP configuration is applied at creation; create a new session", "requires_new_session")
+
     @app.get("/d/standalone/session-options")
     async def d_session_options() -> dict[str, Any]:
         model = {
             "modelId": "data-agent",
             "baseModelId": "data-agent",
-            "name": "DataWorks Data Agent",
+            "name": "默认模型",
             "isCurrent": True,
             "isRuntime": False,
         }
+        configured = public_options(cfg)
+        models = [{**model, "modelId": value, "baseModelId": value, "name": value,
+                   "isCurrent": value == cfg.model} for value in configured["models"]]
         return {
             "v": 1,
             "initialized": True,
+            "approvalMode": configured["approvalMode"],
             "providers": [
                 {
                     "kind": "model_provider",
                     "status": "ok",
                     "authType": "none",
                     "current": True,
-                    "models": [model],
+                    "models": models or [model],
                 }
             ],
             "errors": [],
+        }
+
+    if live:
+        from .live_routes import register_live_routes
+        register_live_routes(app, cfg, live)
+        return
+
+    registry = SessionRegistry()
+
+    def resolve_session(session_id: str) -> SessionRecord | None:
+        """MOCK 仅解析已知场景；LIVE 路由不创建或访问此注册表。"""
+        known = registry.resolve(session_id)
+        if known is not None:
+            return None if known.deleted else known
+        return registry.ensure(session_id) if find_scenario(session_id) is not None else None
+
+    def standalone_session_body(record: SessionRecord, client_facing_id: str) -> dict[str, Any]:
+        return {
+            "sessionId": client_facing_id,
+            # daemon 分配的客户端身份：客户端随 prompt 以 X-Qwen-Client-Id 带回，
+            # 我们据此盖 originatorClientId（suppressOwnUserEcho 的匹配键）
+            "clientId": record.client_id,
+            "workspaceCwd": WORKSPACE_CWD,
+            "attached": False,
+            "createdAt": _iso(record.created_at),
+            "sourceType": "standalone",
+            "context": {"kind": "standalone"},
+            "projectlessOutputDirectory": f"{WORKSPACE_CWD}/out/{client_facing_id}",
+            "workingDirectory": {"state": "ready"},
         }
 
     # ------------------------------------------------------------------
@@ -187,21 +206,21 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
     async def d_list_sessions(archiveState: str | None = None) -> dict[str, Any]:
         if archiveState == "archived":
             return {"sessions": registry.archived_summaries()}
-        return {"sessions": await registry.list_summaries(cfg, live)}
+        try:
+            return {"sessions": await registry.list_summaries(cfg, archived=archiveState == "archived")}
+        except Exception as exc:
+            api = to_api_error(exc, "ListAgentSessions")
+            return _error(502, api.message, "list_failed")
 
     @app.post("/d/standalone/sessions")
     async def d_create_session(request: Request) -> Any:
         real_id: str
-        if live:
-            try:
-                # _create_session_result 回的是结果字典 {sessionId, requestId}（信封由本层自己包）
-                created = await _create_session_result(live, None)
-                real_id = created["sessionId"]
-            except Exception as exc:  # noqa: BLE001
-                api = to_api_error(exc if isinstance(exc, Exception) else RuntimeError(str(exc)), "CreateAgentSession")
-                return _error(502, api.message, "create_failed")
-        else:
-            real_id = mock_create_session("新建会话")["sessionId"]
+        body = await _body(request) or {}
+        try:
+            creation_options(cfg, body)
+        except ValueError as exc:
+            return _error(400, str(exc), "invalid_session_options")
+        real_id = mock_create_session("新建会话")["sessionId"]
         record = registry.ensure(real_id)
         return standalone_session_body(record, real_id)
 
@@ -223,19 +242,19 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
     @app.patch("/d/standalone/sessions/{session_id}/metadata")
     async def d_rename_standalone(request: Request, session_id: str = Path()) -> Any:
         body = await _body(request) or {}
-        return _rename(session_id, body.get("displayName"))
+        return await _rename(session_id, body.get("displayName"))
 
     @app.post("/d/standalone/sessions/archive")
     async def d_archive(request: Request) -> dict[str, Any]:
-        return _batch_mutate("archive", (await _body(request) or {}).get("sessionIds"))
+        return await _batch_mutate("archive", (await _body(request) or {}).get("sessionIds"))
 
     @app.post("/d/standalone/sessions/unarchive")
     async def d_unarchive(request: Request) -> dict[str, Any]:
-        return _batch_mutate("unarchive", (await _body(request) or {}).get("sessionIds"))
+        return await _batch_mutate("unarchive", (await _body(request) or {}).get("sessionIds"))
 
     @app.post("/d/standalone/sessions/delete")
     async def d_delete(request: Request) -> dict[str, Any]:
-        return _batch_mutate("delete", (await _body(request) or {}).get("sessionIds"))
+        return await _batch_mutate("delete", (await _body(request) or {}).get("sessionIds"))
 
     # ------------------------------------------------------------------
     # 会话内：prompt / 事件流 / 生命周期
@@ -248,7 +267,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             return _not_found(session_id)
         body = await _body(request) or {}
         client_id = request.headers.get("x-qwen-client-id")
-        admission = admit_prompt(cfg, live, record, session_id, body.get("prompt"), client_id)
+        admission = admit_prompt(cfg, record, session_id, body.get("prompt"), client_id)
         if hasattr(admission, "status"):
             return _error(admission.status, admission.error, admission.code)
         # 后台轮次不进 handler 的 anyio 任务组（Starlette 会在响应完成后 cancel）：
@@ -260,16 +279,15 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             status_code=202,
         )
 
+    @app.post("/d/session/{session_id}/openapi-prompt/{prompt_id}/receipt")
+    async def d_prompt_receipt(session_id: str, prompt_id: str) -> Any:
+        return Response(status_code=204)
+
     @app.post("/d/session/{session_id}/cancel")
     async def d_cancel(session_id: str = Path()) -> Any:
         record = resolve_session(session_id)
         if record is None:
             return _not_found(session_id)
-        if live:
-            try:
-                await _cancel_result(live, record.real_id)
-            except Exception:  # noqa: BLE001
-                pass  # 照发本地 prompt_cancelled（与 Node/Java 对齐）
         active_prompt_id = record.journal.active_prompt_id
         if active_prompt_id is not None:
             # 上游流随后会以 stopReason=cancelled 终态收场 → turn_complete(cancelled) 也会到
@@ -312,7 +330,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         record = resolve_session(session_id)
         if record is None:
             return _not_found(session_id)
-        # 上游 load 无增量游标（BeginLogOffset 是死参数），整份 journal 即全部历史
+        # 此历史端点返回完整快照；在途 Prompt 的增量恢复由帧源单独处理
         return {
             "v": 1,
             "sessionId": session_id,
@@ -335,14 +353,13 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
     @app.patch("/d/session/{session_id}/metadata")
     async def d_rename_session(request: Request, session_id: str = Path()) -> Any:
         body = await _body(request) or {}
-        return _rename(session_id, body.get("displayName"))
+        return await _rename(session_id, body.get("displayName"))
 
     @app.delete("/d/session/{session_id}")
     async def d_delete_session(session_id: str = Path()) -> Any:
         record = resolve_session(session_id)
         if record is None:
             return _not_found(session_id)
-        # 上游没有删除接口：本地标记隐藏（journal 保留，深链重开还能看到），重启后恢复
         record.deleted = True
         return Response(status_code=204)
 
@@ -367,29 +384,8 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         if outcome_kind == "selected" and not option_id and not answers:
             return _error(400, "outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）", "invalid_permission_response")
 
-        if live:
-            try:
-                result = await _reply_result(live, record.real_id, {
-                    "permissionRequestId": request_id,
-                    "answers": answers,
-                    "optionId": option_id or None,
-                    "outcome": outcome_kind,
-                })
-                if result.get("accepted"):
-                    record.pending_permissions.pop(request_id, None)
-                    record.journal.append(permission_resolved_event(session_id, request_id, {
-                        "outcome": outcome_kind,
-                        **({"optionId": option_id} if option_id else {}),
-                    }))
-                    return {}
-                # 上游明确不接：按赛跑失败对待——本地移除并走 404 语义
-                record.pending_permissions.pop(request_id, None)
-                return _error(404, "上游明确 accepted=false（requestId 可能已过期或已被他人回覆）", "permission_not_accepted")
-            except Exception as exc:  # noqa: BLE001
-                return JSONResponse({"error": f"回覆上游失败：{exc}", "code": "permission_upstream_error"}, status_code=502)
-
         # MOCK：回覆是本地教学闭环——上游无真通道，直接当已受理
-        record.pending_permissions.pop(request_id, None)
+        record.set_pending_permission(request_id, None)
         record.journal.append(permission_resolved_event(session_id, request_id, {
             "outcome": outcome_kind,
             **({"optionId": option_id} if option_id else {}),
@@ -424,7 +420,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
     @app.api_route("/d/{path:path}", methods=["GET", "POST", "PATCH", "DELETE", "PUT"])
     async def d_not_implemented_fallback(request: Request) -> JSONResponse:
         """兜底 404。web-shell 打到这里的就是 daemon 有、而我们（因为上游 OpenAPI 缺接口
-        或尚未实现）给不了的端点——记录进日志，是 OPENAPI-GAPS.md 的证据链。"""
+        或尚未实现）给不了的端点——记录进日志，便于定位未提供的能力。"""
         print(f"[daemon] 未实现端点（缺口候选）: {request.method} {request.url.path}")
         return _error(404, f"daemon 兼容层未实现该端点：{request.method} {request.url.path}", "not_implemented")
 
@@ -437,20 +433,10 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         if record is None or record.deleted:
             return _not_found(session_id)
 
-        # Restore the live journal immediately while upstream is awaiting a reply.
-        if mode == "load" and not record.journal.active_prompt:
-            frames: list[dict[str, Any]]
-            if live:
-                try:
-                    frames = await _load_frames(live, record.real_id)
-                except Exception as exc:  # noqa: BLE001
-                    api = to_api_error(exc if isinstance(exc, Exception) else RuntimeError(str(exc)), "LoadAgentSession")
-                    return _error(502 if api.kind == "transport" else 404, api.message, "standalone_session_not_found")
-            else:
-                scenario = find_scenario(record.real_id)
-                frames = read_fixture_frames(scenario.historyFixture) if scenario and scenario.historyFixture else []
-            # 过滤 + 去重判据与 reduce_history 同源（rid-less 污染 / load 伪轮次 /
-            # bridge-echo 重复回显都不进 journal）
+        events: list[dict[str, Any]] = []
+        if mode == "load":
+            scenario = find_scenario(record.real_id)
+            frames = read_fixture_frames(scenario.historyFixture) if scenario and scenario.historyFixture else []
             events = history_frames_to_events(frames, session_id)
             record.journal.seed(events)
             rebuild_pending_permissions(record)
@@ -458,15 +444,10 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         return {
             **standalone_session_body(record, session_id),
             "state": {
-                "models": [
-                    {
-                        "modelId": "data-agent",
-                        "baseModelId": "data-agent",
-                        "name": "DataWorks Data Agent",
-                        "isCurrent": True,
-                        "isRuntime": False,
-                    }
-                ],
+                "models": {"currentModelId": "data-agent",
+                           "availableModels": [
+                               {"modelId": "data-agent", "name": "DataWorks Data Agent"}
+                           ]},
                 "modes": {},
                 "configOptions": None,
             },
@@ -477,18 +458,17 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             "historyHasMore": False,
         }
 
-    def _rename(session_id: str, display_name: Any) -> Any:
+    async def _rename(session_id: str, display_name: Any) -> Any:
         record = resolve_session(session_id)
         if record is None:
             return _not_found(session_id)
         name = display_name.strip() if isinstance(display_name, str) else ""
-        if not name:
-            return _error(400, "displayName 不能为空", "invalid_metadata")
-        # 进程级：上游没有改名接口（SessionTitle 恒为首条 prompt 原文），重启即失
+        if not name or len(name) > 512:
+            return _error(400, "displayName length must be 1–512", "invalid_metadata")
         record.display_name = name
         return {"sessionId": session_id, "displayName": name}
 
-    def _batch_mutate(action: str, raw_ids: Any) -> dict[str, Any]:
+    async def _batch_mutate(action: str, raw_ids: Any) -> dict[str, Any]:
         ids = [v for v in raw_ids if isinstance(v, str)] if isinstance(raw_ids, list) else []
         done: list[str] = []
         skipped: list[str] = []
@@ -496,7 +476,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
         errors: list[Any] = []
         for raw in ids:
             session_id = raw.lower()
-            record = registry.resolve(session_id)
+            record = resolve_session(raw)
             if record is None:
                 not_found.append(session_id)
                 continue
@@ -513,7 +493,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
                 else:
                     skipped.append(session_id)
             else:
-                # 上游没有删除接口：本地隐藏标记（journal 保留），重启后恢复可见
+                # MOCK hides locally; LIVE reaches here only after POP succeeds.
                 record.deleted = True
                 done.append(session_id)
         if action == "archive":

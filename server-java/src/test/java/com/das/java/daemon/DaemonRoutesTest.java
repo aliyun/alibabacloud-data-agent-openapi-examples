@@ -303,9 +303,9 @@ class DaemonRoutesTest {
         assertEquals(((Number) compactedReplay.get(compactedReplay.size() - 1).get("id")).longValue(),
             ((Number) lastEventId).longValue());
         assertTrue(body.get("eventEpoch") instanceof String);
-        assertEquals(List.of(Map.of(
+        assertEquals(Map.of("currentModelId", "data-agent", "availableModels", List.of(Map.of(
             "modelId", "data-agent", "baseModelId", "data-agent",
-            "name", "DataWorks Data Agent", "isCurrent", true, "isRuntime", false)),
+            "name", "DataWorks Data Agent", "isCurrent", true, "isRuntime", false))),
             ((Map<String, Object>) body.get("state")).get("models"));
         assertEquals(Map.of(), ((Map<String, Object>) body.get("state")).get("modes"));
         assertNull(((Map<String, Object>) body.get("state")).get("configOptions"));

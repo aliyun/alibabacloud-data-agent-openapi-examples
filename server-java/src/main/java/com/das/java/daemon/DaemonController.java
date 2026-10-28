@@ -1,6 +1,8 @@
 package com.das.java.daemon;
 
 import com.das.java.config.AppConfig;
+import com.das.java.config.SessionOptions;
+import com.das.java.live.RemoteSseRelay;
 import com.das.java.core.Constants;
 import com.das.java.live.LiveClient;
 import com.das.java.live.LiveClientHolder;
@@ -42,7 +44,8 @@ public class DaemonController {
 
     private final AppConfig cfg;
     private final LiveClient live;
-    private final Registry registry = new Registry();
+    private final Registry registry;
+    private final LiveDaemon remote;
     private final Runner runner;
     /** 进程级事件纪元：重启即变；客户端凭它判断游标属于"上一个进程"并触发 resync。 */
     private final String epoch = UUID.randomUUID().toString();
@@ -50,17 +53,17 @@ public class DaemonController {
     public DaemonController(AppConfig cfg, LiveClientHolder holder, Inflight inflight) {
         this.cfg = cfg;
         this.live = holder.client();
-        this.runner = new Runner(cfg, this.live, inflight);
+        this.registry = live == null ? new Registry() : null;
+        this.runner = live == null ? new Runner(cfg, inflight) : null;
+        this.remote = live == null ? null : new LiveDaemon(cfg, live);
     }
 
     /**
-     * 解析会话：使用 OpenAPI 真实 sessionId。LIVE 下未知 id 也放行（深链/重启后直接发话，
-     * 存在性交给上游判）；MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
+     * 解析 MOCK 演示会话，必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
      */
     private Registry.Record resolveSession(String id) {
         Registry.Record known = registry.resolve(id);
         if (known != null) return known;
-        if (live != null) return registry.ensure(id);
         return MockFixtures.findScenario(id) != null ? registry.ensure(id) : null;
     }
 
@@ -106,7 +109,8 @@ public class DaemonController {
 
     /** daemon 状态报告（web-shell 的「Daemon 状态」面板）。全部字段是**本地真实状态**（不依赖上游）。 */
     @GetMapping("/daemon/status")
-    public Map<String, Object> daemonStatus(@RequestParam(name = "detail", required = false) String detailParam) {
+    public ResponseEntity<?> daemonStatus(@RequestParam(name = "detail", required = false) String detailParam) {
+        if (live != null) return ResponseEntity.status(404).body(errorBody("Remote daemon status is unavailable", "status_unavailable"));
         String detail = "full".equals(detailParam) ? "full" : "summary";
         Map<String, Object> stats = registry.stats();
 
@@ -172,26 +176,55 @@ public class DaemonController {
         runtime.put("rateLimit", Map.of("enabled", false, "rejectedSinceStart", Map.of()));
         out.put("runtime", runtime);
 
+        return ResponseEntity.ok(out);
+    }
+
+    @GetMapping("/openapi/session-options")
+    public Map<String, Object> openapiSessionOptions() {
+        Map<String, Object> out = new LinkedHashMap<>(SessionOptions.describe(cfg));
+        out.put("promptTransport", live == null ? "daemon" : "http-stream");
         return out;
+    }
+
+    @PostMapping({"/session/{id}/model", "/session/{id}/mode", "/session/{id}/config", "/session/{id}/config-option",
+        "/session/{id}/reasoning", "/session/{id}/reasoning-effort", "/session/{id}/approval-mode"})
+    public ResponseEntity<?> configureExisting(@PathVariable("id") String id) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(errorBody(
+            "POP supports configuration only at creation; create a new session to change model, mode or reasoning effort.",
+            "requires-new-session"));
+    }
+
+    private String eventEpoch(String id) {
+        return live == null ? epoch : "openapi:" + cfg.regionId() + ":" + id;
     }
 
     @GetMapping("/standalone/session-options")
     public Map<String, Object> sessionOptions() {
-        Map<String, Object> model = new LinkedHashMap<>();
-        model.put("modelId", "data-agent");
-        model.put("baseModelId", "data-agent");
-        model.put("name", "DataWorks Data Agent");
-        model.put("isCurrent", true);
-        model.put("isRuntime", false);
+        SessionOptions defaults = SessionOptions.resolve(cfg, null);
+        String selected = defaults.model() == null ? "data-agent" : defaults.model();
+        var ids = new java.util.LinkedHashSet<String>();
+        ids.add(selected);
+        if (cfg.models() != null) ids.addAll(cfg.models());
+        List<Map<String, Object>> models = new ArrayList<>();
+        for (String id : ids) {
+            Map<String, Object> model = new LinkedHashMap<>();
+            model.put("modelId", id);
+            model.put("baseModelId", id);
+            model.put("name", "data-agent".equals(id) ? "默认模型" : id);
+            model.put("isCurrent", selected.equals(id));
+            model.put("isRuntime", false);
+            models.add(model);
+        }
 
         Map<String, Object> provider = new LinkedHashMap<>();
         provider.put("kind", "model_provider");
         provider.put("status", "ok");
         provider.put("authType", "none");
         provider.put("current", true);
-        provider.put("models", List.of(model));
+        provider.put("models", models);
 
         Map<String, Object> out = new LinkedHashMap<>();
+        out.put("approvalMode", defaults.approvalMode());
         out.put("v", 1);
         out.put("initialized", true);
         out.put("providers", List.of(provider));
@@ -203,39 +236,40 @@ public class DaemonController {
     // standalone 会话目录
     // ------------------------------------------------------------------
 
-    @GetMapping("/standalone/sessions")
-    public Map<String, Object> listSessions(@RequestParam(name = "archiveState", required = false) String archiveState) {
-        if ("archived".equals(archiveState)) {
-            return Map.of("sessions", registry.archivedSummaries());
+    private static String queryAgentName(String agentName) {
+        try { return SessionOptions.validateAgentName(agentName); }
+        catch (IllegalArgumentException error) {
+            throw new org.springframework.web.server.ResponseStatusException(HttpStatus.BAD_REQUEST, error.getMessage());
         }
-        return Map.of("sessions", registry.listSummaries(cfg, live));
+    }
+
+    @GetMapping("/standalone/sessions")
+    public Map<String, Object> listSessions(@RequestParam(name = "archiveState", required = false) String archiveState,
+        @RequestParam(name = "agentName", required = false) String agentName) {
+        agentName = queryAgentName(agentName);
+        boolean archived = "archived".equals(archiveState);
+        if (remote != null) {
+            try { return remote.list(archived, agentName); }
+            catch (Exception error) { throw new org.springframework.web.server.ResponseStatusException(HttpStatus.BAD_GATEWAY, "ListAgentSessions failed"); }
+        }
+        return Map.of("sessions", archived ? registry.archivedSummaries() : registry.listSummaries(cfg));
     }
 
     @PostMapping("/standalone/sessions")
     public ResponseEntity<?> createSession(@RequestBody(required = false) Map<String, Object> body) {
-        String realId;
-        if (live != null) {
-            Map<String, Object> created;
-            try {
-                created = live.createSession(null);
-            } catch (Exception e) {
-                String message = e instanceof com.das.java.live.Normalize.DasApiException de
-                    ? de.apiError().message()
-                    : String.valueOf(e.getMessage());
-                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                    .body(errorBody(message, "create_failed"));
-            }
-            realId = (String) created.get("sessionId");
-        } else {
-            realId = (String) MockFixtures.mockCreateSession("新建会话").get("sessionId");
-        }
-        Registry.Record record = registry.ensure(realId);
-        log.info("daemon 兼容层新建会话 sessionId={} mock={}", realId, live == null);
-        return ResponseEntity.ok(standaloneSessionBody(record, realId));
+        SessionOptions options;
+        try { options = SessionOptions.resolve(cfg, body); }
+        catch (IllegalArgumentException error) { return ResponseEntity.badRequest().body(errorBody(error.getMessage(), "invalid_session_options")); }
+        if (remote != null) return remote.create(options);
+        String id = (String) MockFixtures.mockCreateSession("新建会话").get("sessionId");
+        return ResponseEntity.ok(standaloneSessionBody(registry.ensure(id), id));
     }
 
     @GetMapping("/standalone/sessions/{id}")
-    public ResponseEntity<?> getSession(@PathVariable("id") String id) {
+    public ResponseEntity<?> getSession(@PathVariable("id") String id,
+        @RequestParam(name = "agentName", required = false) String agentName) {
+        agentName = queryAgentName(agentName);
+        if (remote != null) return remote.get(id, agentName);
         Registry.Record record = resolveSession(id);
         if (record == null || record.deleted) return notFound(id);
         return ResponseEntity.ok(registry.summaryFor(record, id));
@@ -280,6 +314,8 @@ public class DaemonController {
         @PathVariable("id") String id,
         @RequestBody(required = false) Map<String, Object> body,
         @RequestHeader(name = "x-qwen-client-id", required = false) String clientId) {
+        if (live != null) return ResponseEntity.status(HttpStatus.GONE).body(errorBody("Use POST /api/sessions/:id/prompt", "prompt_transport_retired"));
+
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
         Runner.Admission admission = runner.admit(record, id, body == null ? null : body.get("prompt"), clientId);
@@ -292,21 +328,22 @@ public class DaemonController {
         Map<String, Object> accepted = new LinkedHashMap<>();
         accepted.put("promptId", admitted.promptId());
         accepted.put("lastEventId", admitted.lastEventId());
-        accepted.put("eventEpoch", epoch);
+        accepted.put("eventEpoch", eventEpoch(record.realId));
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(accepted);
+    }
+
+    @PostMapping("/session/{id}/openapi-prompt/{promptId}/receipt")
+    public ResponseEntity<?> promptReceipt(@PathVariable("id") String id, @PathVariable("promptId") String promptId) {
+        return live == null ? ResponseEntity.noContent().build()
+            : ResponseEntity.status(HttpStatus.GONE).body(errorBody("Local prompt receipts are retired", "prompt_transport_retired"));
     }
 
     @PostMapping("/session/{id}/cancel")
     public ResponseEntity<?> cancel(@PathVariable("id") String id) {
+        if (remote != null) return remote.cancel(id);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
-        if (live != null) {
-            try {
-                live.cancel(record.realId);
-            } catch (Exception e) {
-                log.warn("daemon cancel 上游调用失败（照发本地 prompt_cancelled）sessionId={}：{}", record.realId, e.getMessage());
-            }
-        }
+
         String activePromptId = record.journal.activePromptId;
         if (activePromptId != null) {
             // 上游流随后会以 stopReason=cancelled 终态收场 → turn_complete(cancelled) 也会到
@@ -321,14 +358,80 @@ public class DaemonController {
         @RequestParam(name = "snapshot", required = false) String snapshotParam,
         @RequestHeader(name = "last-event-id", required = false) String lastRaw,
         HttpServletResponse response) throws IOException {
-        Registry.Record record = resolveSession(id);
-        if (record == null) {
-            response.setStatus(HttpStatus.NOT_FOUND.value());
-            response.setContentType("application/json; charset=utf-8");
-            response.getWriter().write(new com.fasterxml.jackson.databind.ObjectMapper()
-                .writeValueAsString(errorBody("没有这个会话：" + id, "standalone_session_not_found")));
+        if (live != null) {
+            if (lastRaw != null && !RemoteSseRelay.safeCursor(lastRaw)) {
+                response.setStatus(400);
+                response.setContentType("application/json");
+                response.getWriter().write("{\"error\":\"Invalid remote cursor\",\"code\":\"invalid_cursor\"}");
+                return;
+            }
+            String remoteCursor = lastRaw;
+            Integer upstreamStatus = null;
+            String upstreamRequestId = null;
+            try (var stream = live.events(id, remoteCursor)) {
+                var metadata = stream.metadata();
+                upstreamStatus = metadata.status();
+                upstreamRequestId = metadata.headers().entrySet().stream()
+                    .filter(header -> header.getKey().equalsIgnoreCase("x-acs-request-id"))
+                    .map(Map.Entry::getValue).findFirst().orElse(null);
+                String contentType = metadata.headers().entrySet().stream()
+                    .filter(header -> header.getKey().equalsIgnoreCase("Content-Type"))
+                    .map(Map.Entry::getValue).findFirst().orElse("");
+                if (metadata.status() / 100 == 2 && !contentType.split(";", 2)[0].trim().equalsIgnoreCase("text/event-stream"))
+                    throw new IOException("GetAgentSessionEvents returned a non-SSE response");
+                response.setStatus(metadata.status());
+                response.setContentType(metadata.status() / 100 == 2 ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8");
+                response.setHeader("Cache-Control", "no-store, no-transform");
+                response.setHeader("X-Accel-Buffering", "no");
+                response.setHeader("X-Qwen-Event-Epoch", eventEpoch(id));
+                for (var header : metadata.headers().entrySet()) {
+                    if (header.getKey().equalsIgnoreCase("X-Qwen-Sse-Stream-Id")) response.setHeader(header.getKey(), header.getValue());
+                }
+                if (metadata.status() / 100 == 2) {
+                    RemoteSseRelay.relay(stream, response.getOutputStream(), id, ignored -> {});
+                } else {
+                    byte[] chunk;
+                    while ((chunk = stream.next()) != null) response.getOutputStream().write(chunk);
+                }
+            } catch (Exception error) {
+                Throwable cause = error;
+                for (int depth = 0; depth < 8; depth++) {
+                    if (cause instanceof com.aliyun.sdk.gateway.pop.exception.PopClientException pop) {
+                        if (upstreamStatus == null) upstreamStatus = pop.getStatusCode();
+                        if (upstreamRequestId == null) upstreamRequestId = pop.getRequestId();
+                    } else if (cause instanceof com.aliyun.sdk.gateway.pop.exception.PopServerException pop) {
+                        if (upstreamStatus == null) upstreamStatus = pop.getStatusCode();
+                        if (upstreamRequestId == null) upstreamRequestId = pop.getRequestId();
+                    }
+                    if (cause.getCause() == null || cause.getCause() == cause) break;
+                    cause = cause.getCause();
+                }
+                // Structured diagnostics only: never log messages, request headers, body, config or credentials.
+                if (upstreamRequestId != null) upstreamRequestId = upstreamRequestId.replaceAll("[^A-Za-z0-9._:-]", "");
+                if (upstreamRequestId != null && upstreamRequestId.length() > 128) upstreamRequestId = upstreamRequestId.substring(0, 128);
+                log.warn("openapi_events_failure code=events_failed status={} requestId={} exceptionType={}",
+                    upstreamStatus, upstreamRequestId, cause.getClass().getSimpleName());
+                if (!response.isCommitted()) {
+                    response.reset();
+                    response.setStatus(502);
+                    response.setContentType("application/json; charset=utf-8");
+                    var failure = errorBody("GetAgentSessionEvents failed", "events_failed");
+                    if (upstreamStatus != null) failure.put("upstreamStatus", upstreamStatus);
+                    if (upstreamRequestId != null) failure.put("requestId", upstreamRequestId);
+                    response.getWriter().write(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(failure));
+                } else if (error instanceof IOException io) throw io;
+                else throw new IOException("GetAgentSessionEvents failed", error);
+            }
             return;
         }
+        Registry.Record record = resolveSession(id);
+        if (record == null) {
+            response.setStatus(404);
+            response.setContentType("application/json; charset=utf-8");
+            response.getWriter().write(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(errorBody("Session not found", "standalone_session_not_found")));
+            return;
+        }
+
         Long lastEventId = null;
         if (lastRaw != null) {
             try {
@@ -351,6 +454,7 @@ public class DaemonController {
 
     @PostMapping("/session/{id}/heartbeat")
     public ResponseEntity<?> heartbeat(@PathVariable("id") String id) {
+        if (live != null) return ResponseEntity.noContent().build();
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
         // 上游没有心跳接口；会话亲和是临时的，这里只回 204 维持客户端记账，不做任何上游调用。
@@ -359,9 +463,10 @@ public class DaemonController {
 
     @GetMapping("/session/{id}/transcript")
     public ResponseEntity<?> transcript(@PathVariable("id") String id) {
+        if (remote != null) return remote.transcript(id);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
-        // 上游 load 无增量游标（BeginLogOffset 是死参数），整份 journal 即全部历史
+        // 此历史端点返回完整快照；在途 Prompt 的增量恢复由帧源单独处理
         List<Object> events = new ArrayList<>();
         for (Journal.Entry entry : record.journal.all()) events.add(entry.event());
         Map<String, Object> out = new LinkedHashMap<>();
@@ -374,6 +479,7 @@ public class DaemonController {
 
     @GetMapping("/session/{id}/status")
     public ResponseEntity<?> status(@PathVariable("id") String id) {
+        if (live != null) return ResponseEntity.status(404).body(errorBody("Remote prompt status is unavailable", "status_unavailable"));
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
         Map<String, Object> out = new LinkedHashMap<>();
@@ -391,9 +497,10 @@ public class DaemonController {
 
     @DeleteMapping("/session/{id}")
     public ResponseEntity<?> deleteSession(@PathVariable("id") String id) {
+        if (remote != null) return remote.delete(id);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
-        // 上游没有删除接口：本地标记隐藏（journal 保留，深链重开还能看到），重启后恢复
+
         record.deleted = true;
         return ResponseEntity.noContent().build();
     }
@@ -408,6 +515,7 @@ public class DaemonController {
         @PathVariable("id") String id,
         @PathVariable("requestId") String requestId,
         @RequestBody(required = false) Map<String, Object> body) {
+        if (remote != null) return remote.permission(id, requestId, body);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
         Map<String, Object> pending = record.pendingPermissions.get(requestId);
@@ -426,9 +534,9 @@ public class DaemonController {
         Map<String, String> answers = body != null && body.get("answers") instanceof Map<?, ?> a && !a.isEmpty()
             ? (Map<String, String>) a : null;
         if (Events.OPENAPI_ANSWERS_OPTION.equals(optionId)) {
-            Object pendingData = pending.get("data");
-            if (!(pendingData instanceof Map<?, ?> data) || !Boolean.TRUE.equals(data.get("openApiAnswersOnly"))
-                    || !"selected".equals(outcomeKind) || answers == null) {
+            Object pendingData = pending == null ? null : pending.get("data");
+            boolean knownQuestion = pendingData instanceof Map<?, ?> data && Boolean.TRUE.equals(data.get("openApiAnswersOnly"));
+            if (!knownQuestion || !"selected".equals(outcomeKind) || answers == null) {
                 return ResponseEntity.badRequest().body(errorBody("问答提交必须包含 answers", "invalid_permission_response"));
             }
             optionId = null; // UI-only option must never reach OpenAPI.
@@ -440,37 +548,9 @@ public class DaemonController {
         }
 
         String clientFacingId = record.realId;
-        if (live != null) {
-            try {
-                Map<String, Object> input = new LinkedHashMap<>();
-                input.put("permissionRequestId", requestId);
-                if (answers != null && !answers.isEmpty()) input.put("answers", answers);
-                if (optionId != null) input.put("optionId", optionId);
-                input.put("outcome", outcomeKind);
-                Map<String, Object> result = live.reply(record.realId, input);
-                boolean accepted = Boolean.TRUE.equals(result.get("accepted"));
-                if (accepted) {
-                    record.pendingPermissions.remove(requestId);
-                    Map<String, Object> outcomeEvent = new LinkedHashMap<>();
-                    outcomeEvent.put("outcome", outcomeKind);
-                    if (optionId != null) outcomeEvent.put("optionId", optionId);
-                    record.journal.append(Events.permissionResolved(clientFacingId, requestId, outcomeEvent));
-                    return ResponseEntity.ok(Map.of());
-                }
-                // 上游明确不接：按赛跑失败对待——本地移除并走 404 语义
-                record.pendingPermissions.remove(requestId);
-                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody(
-                    "上游明确 accepted=false（requestId 可能已过期或已被他人回覆）", "permission_not_accepted"));
-            } catch (Exception e) {
-                log.warn("daemon permission 回覆上游失败 sessionId={} requestId={}：{}", record.realId, requestId, e.getMessage());
-                Map<String, Object> out = new LinkedHashMap<>();
-                out.put("error", "回覆上游失败：" + e.getMessage());
-                out.put("code", "permission_upstream_error");
-                return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(out);
-            }
-        }
 
-        // MOCK：回覆是本地教学闭环——上游无真通道，直接当已受理。
+
+        // MOCK：回覆是本地教学闭环——录制件可能在后续轮次复用相同 requestId。
         record.pendingPermissions.remove(requestId);
         Map<String, Object> outcomeEvent = new LinkedHashMap<>();
         outcomeEvent.put("outcome", outcomeKind);
@@ -483,6 +563,7 @@ public class DaemonController {
     public ResponseEntity<Map<String, Object>> permissionDirect(
         @PathVariable("requestId") String requestId,
         @RequestBody(required = false) Map<String, Object> body) {
+        if (live != null) return ResponseEntity.status(404).body(errorBody("Session ID is required", "permission_not_found"));
         // 历史兼容路由：requestId 在全注册表里反查会话
         for (Registry.Record record : registry.allRecords()) {
             if (record.pendingPermissions.containsKey(requestId)) {
@@ -504,7 +585,7 @@ public class DaemonController {
 
     /**
      * 兜底 404：**记日志**。web-shell 打到这里的就是 daemon 有、而我们（因为上游
-     * OpenAPI 缺接口或尚未实现）给不了的端点——这份日志是 OPENAPI-GAPS.md 的证据链。
+     * OpenAPI 缺接口或尚未实现）给不了的端点——日志用于定位未提供的能力。
      */
     @RequestMapping("/{*path}")
     public ResponseEntity<Map<String, Object>> notImplementedFallback(jakarta.servlet.http.HttpServletRequest request) {
@@ -519,52 +600,25 @@ public class DaemonController {
     // ------------------------------------------------------------------
 
     private ResponseEntity<?> loadSessionImpl(String id, String mode) {
+        if (remote != null) return remote.load(id); // Resume also reads fresh remote history.
         Registry.Record record = resolveSession(id);
         if (record == null || record.deleted) return notFound(id);
-
-        // Do not block restoring an active conversation on upstream history.
-        if ("load".equals(mode) && !record.journal.activePrompt) {
-            List<Map<String, Object>> frames;
-            if (live != null) {
-                try {
-                    frames = live.loadFrames(record.realId);
-                } catch (Exception e) {
-                    var api = com.das.java.live.Normalize.toApiError(e, "LoadAgentSession");
-                    return ResponseEntity.status(api.kind().equals("transport") ? HttpStatus.BAD_GATEWAY : HttpStatus.NOT_FOUND)
-                        .body(errorBody(api.message(), "standalone_session_not_found"));
-                }
-            } else {
-                MockFixtures.MockScenario scenario = MockFixtures.findScenario(record.realId);
-                frames = scenario != null && scenario.historyFixture() != null
-                    ? MockFixtures.readFixtureFrames(cfg.repoRoot(), scenario.historyFixture())
-                    : List.of();
-            }
-            // 过滤 + 去重判据与 reduceHistory 同源（rid-less 污染 / load 伪轮次 /
-            // bridge-echo 重复回显都不进 journal）
-            List<Map<String, Object>> events = Translate.historyFramesToEvents(frames, id);
-            record.journal.seed(events);
-            // 用种子事件重建 pending：重启后那张卡能真正回得上去
+        if ("load".equals(mode)) {
+            MockFixtures.MockScenario scenario = MockFixtures.findScenario(record.realId);
+            var frames = scenario != null && scenario.historyFixture() != null
+                ? MockFixtures.readFixtureFrames(cfg.repoRoot(), scenario.historyFixture()) : List.<Map<String, Object>>of();
+            record.journal.seed(Translate.historyFramesToEvents(frames, id));
             Registry.rebuildPendingPermissions(record);
         }
-
         Map<String, Object> out = new LinkedHashMap<>(standaloneSessionBody(record, id));
         Map<String, Object> state = new LinkedHashMap<>();
-        Map<String, Object> model = new LinkedHashMap<>();
-        model.put("modelId", "data-agent");
-        model.put("baseModelId", "data-agent");
-        model.put("name", "DataWorks Data Agent");
-        model.put("isCurrent", true);
-        model.put("isRuntime", false);
-        state.put("models", List.of(model));
+        state.put("models", Map.of("currentModelId", "data-agent", "availableModels", List.of(Map.of("modelId", "data-agent",
+            "baseModelId", "data-agent", "name", "DataWorks Data Agent", "isCurrent", true, "isRuntime", false))));
         state.put("modes", Map.of());
         state.put("configOptions", null);
         out.put("state", state);
-        List<Object> compacted = new ArrayList<>();
-        for (Journal.Entry entry : record.journal.compacted()) compacted.add(entry.event());
-        List<Object> liveJournal = new ArrayList<>();
-        for (Journal.Entry entry : record.journal.live()) liveJournal.add(entry.event());
-        out.put("compactedReplay", compacted);
-        out.put("liveJournal", liveJournal);
+        out.put("compactedReplay", record.journal.compacted().stream().map(Journal.Entry::event).toList());
+        out.put("liveJournal", record.journal.live().stream().map(Journal.Entry::event).toList());
         out.put("lastEventId", record.journal.lastId());
         out.put("eventEpoch", epoch);
         out.put("historyHasMore", false);
@@ -572,13 +626,15 @@ public class DaemonController {
     }
 
     private ResponseEntity<?> renameSession(String id, Object displayName) {
-        Registry.Record record = resolveSession(id);
-        if (record == null) return notFound(id);
         String name = displayName instanceof String s ? s.trim() : "";
         if (name.isEmpty()) {
             return ResponseEntity.badRequest().body(errorBody("displayName 不能为空", "invalid_metadata"));
         }
-        // 进程级：上游没有改名接口（SessionTitle 恒为首条 prompt 原文），重启即失
+        if (name.length() > 512) return ResponseEntity.badRequest().body(errorBody("Title exceeds 512 characters", "invalid_metadata"));
+        if (remote != null) return remote.rename(id, name);
+        Registry.Record record = resolveSession(id);
+        if (record == null) return notFound(id);
+
         record.displayName = name;
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("sessionId", id);
@@ -587,6 +643,7 @@ public class DaemonController {
     }
 
     private Map<String, Object> batchMutate(String action, Object rawIds) {
+        if (remote != null) return remote.batch(action, rawIds);
         List<String> ids = new ArrayList<>();
         if (rawIds instanceof List<?> list) {
             for (Object v : list) {
@@ -598,12 +655,13 @@ public class DaemonController {
         List<String> notFoundIds = new ArrayList<>();
         List<Object> errors = new ArrayList<>();
         for (String raw : ids) {
-            String id = raw.toLowerCase();
-            Registry.Record record = registry.resolve(id);
+            String id = raw;
+            Registry.Record record = resolveSession(id);
             if (record == null) {
                 notFoundIds.add(id);
                 continue;
             }
+
             switch (action) {
                 case "archive" -> {
                     if (record.archived) skipped.add(id);
@@ -619,7 +677,6 @@ public class DaemonController {
                     } else skipped.add(id);
                 }
                 default -> {
-                    // 上游没有删除接口：本地隐藏标记（journal 保留），重启后恢复可见
                     record.deleted = true;
                     done.add(id);
                 }

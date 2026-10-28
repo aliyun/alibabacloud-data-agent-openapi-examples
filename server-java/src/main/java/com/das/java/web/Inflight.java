@@ -37,7 +37,7 @@ public class Inflight {
 
     private final Map<String, Entry> inflight = new ConcurrentHashMap<>();
 
-    public AcquireResult tryAcquire(String sessionId) {
+    public synchronized AcquireResult tryAcquire(String sessionId) {
         Entry existing = inflight.get(sessionId);
         if (existing != null) {
             long heldForMs = System.currentTimeMillis() - existing.startedAt;

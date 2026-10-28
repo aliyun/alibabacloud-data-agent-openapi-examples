@@ -192,15 +192,7 @@ describe('daemon 兼容层 /d（MOCK）', () => {
     expect(typeof body.lastEventId).toBe('number');
     expect(body.lastEventId).toBe(body.compactedReplay.at(-1)?.id);
     expect(typeof body.eventEpoch).toBe('string');
-    expect(body.state.models).toEqual([
-      {
-        modelId: 'data-agent',
-        baseModelId: 'data-agent',
-        name: 'DataWorks Data Agent',
-        isCurrent: true,
-        isRuntime: false,
-      },
-    ]);
+    expect(body.state.models).toEqual({ currentModelId: 'data-agent', availableModels: [{ modelId: 'data-agent', name: '当前会话模型' }] });
     expect(body.state.modes).toEqual({});
     expect(body.state.configOptions).toBeNull();
     expect(body.historyHasMore).toBe(false);

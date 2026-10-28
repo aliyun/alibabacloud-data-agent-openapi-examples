@@ -2,10 +2,11 @@ import { randomUUID } from 'node:crypto';
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
-import { STREAM_HARD_LIMIT_MS, type AcpFrame } from '@das/shared';
+import { STREAM_HARD_LIMIT_MS } from '@das/shared';
 
 import type { AppConfig } from '../config.js';
-import { liveCancel, liveCreateSession, liveLoadFrames, liveReply, type LiveContext } from '../live.js';
+import { registerLiveDaemonRoutes } from './live-routes.js';
+import { publicSessionOptions, sessionOptions } from '../session-options.js';
 import { findScenario, mockCreateSession, readFixtureFrames } from '../mock/fixtures.js';
 import { toApiError } from '../normalize.js';
 import type { SdkClient } from '../sdk.js';
@@ -16,7 +17,7 @@ import { streamSse } from './sse.js';
 import { historyFramesToEvents } from './translate.js';
 
 /**
- * daemon 兼容层：把 @qwen-code/web-shell 说的话翻译成 data agent OpenAPI 的 8 个上游调用。
+ * daemon 兼容入口：LIVE 交给无状态 POP 路由；以下 Registry 和后台准入仅供 MOCK。
  *
  * 挂载在 `/d` 前缀下——DaemonClient 是 `baseUrl + path` 字符串拼接，所以前端把
  * baseUrl 指到 `<origin>/d` 即可，与现有 `/api/*`、SPA 回退互不干扰。
@@ -28,29 +29,27 @@ import { historyFramesToEvents } from './translate.js';
  *  · prompt 202 + SSE events（Last-Event-ID 续传）+ cancel / heartbeat / transcript
  *  · permission：`_qwen/notify` → permission_request/resolved 事件（弹卡的唯一通道），
  *    回覆走 ReplyAgentSession（200 受理 / 404 未知·已被处理，与 web-shell SDK 契约对齐）
- *  · 未知端点 404 并**记日志**——那是 OPENAPI-GAPS.md 的证据来源
+ *  · 未知端点 404 并**记日志**——便于定位尚未提供的能力
  */
 export async function registerDaemonRoutes(
   app: FastifyInstance,
   cfg: AppConfig,
   client: SdkClient | undefined,
 ): Promise<void> {
-  const live: LiveContext | undefined = client ? { client, cfg, log: app.log } : undefined;
+  if (client) return registerLiveDaemonRoutes(app, cfg, client);
   const registry = new SessionRegistry();
   /** 进程级事件纪元：重启即变；客户端凭它判断游标属于"上一个进程"并触发 resync。 */
   const epoch = randomUUID();
-  const promptDeps: PromptDeps = { cfg, live, log: app.log };
+  const promptDeps: PromptDeps = { cfg, log: app.log };
   /** 当前活跃 SSE 连接数（daemon/status 的 transport.restSseActive）。 */
   let sseActive = 0;
 
   /**
-   * 解析会话：使用 OpenAPI 真实 sessionId。LIVE 下未知 id 也放行（深链/重启后直接发话，
-   * 存在性交给上游判）；MOCK 下必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
+   * MOCK 只解析本地录制场景；LIVE 在独立无状态路由中处理。
    */
   function resolveSession(id: string): SessionRecord | undefined {
     const known = registry.resolve(id);
     if (known) return known;
-    if (live) return registry.ensure(id);
     return findScenario(id) ? registry.ensure(id) : undefined;
   }
 
@@ -66,6 +65,7 @@ export async function registerDaemonRoutes(
       // ---- 发现 ----
 
       d.get('/health', async () => ({ status: 'ok' }));
+      d.get('/openapi/session-options', async () => ({ ...publicSessionOptions(cfg), promptTransport: 'daemon' }));
 
       d.get('/capabilities', async () => ({
         v: 1,
@@ -74,8 +74,7 @@ export async function registerDaemonRoutes(
         modelServices: ['data-agent'],
         workspaces: [],
         policy: {},
-        // webshell 按这个间隔轮询会话目录 live-state；每次轮询在 LIVE 下都是一次
-        // 真实 ListAgentSessions（约 0.4s、上游无增量游标）——30s 是负载与新鲜度的折中
+        // MOCK 会话目录轮询间隔。LIVE 能力在独立路由中声明。
         sessionLiveStatePollIntervalMs: 30_000,
       }));
 
@@ -159,21 +158,17 @@ export async function registerDaemonRoutes(
       d.get('/standalone/session-options', async () => ({
         v: 1,
         initialized: true,
+        approvalMode: cfg.mode ?? 'yolo',
         providers: [
           {
             kind: 'model_provider',
             status: 'ok',
             authType: 'none',
             current: true,
-            models: [
-              {
-                modelId: 'data-agent',
-                baseModelId: 'data-agent',
-                name: 'DataWorks Data Agent',
-                isCurrent: true,
-                isRuntime: false,
-              },
-            ],
+            models: (publicSessionOptions(cfg).models.length ? publicSessionOptions(cfg).models : ['data-agent']).map(modelId => ({
+              modelId, baseModelId: modelId, name: modelId === 'data-agent' ? '默认模型' : modelId,
+              isCurrent: modelId === (cfg.model ?? 'data-agent'), isRuntime: false,
+            })),
           },
         ],
         errors: [],
@@ -187,25 +182,21 @@ export async function registerDaemonRoutes(
           if (request.query?.archiveState === 'archived') {
             return { sessions: registry.archivedSummaries() };
           }
-          return { sessions: await registry.listSummaries(cfg, live, app.log) };
+          return { sessions: await registry.listSummaries(cfg) };
         },
       );
 
-      d.post<{ Body: { sessionId?: unknown; modelServiceId?: unknown; approvalMode?: unknown } }>(
+      d.post<{ Body: { sessionId?: unknown; agentName?: unknown; modelServiceId?: unknown; approvalMode?: unknown; reasoningEffort?: unknown } }>(
         '/standalone/sessions',
         async (request, reply) => {
           let realId: string;
-          if (live) {
-            const created = await liveCreateSession(live);
-            if (!created.ok) {
-              return reply.code(502).send({ error: created.error.message, code: 'create_failed' });
-            }
-            realId = created.result.sessionId;
-          } else {
-            realId = mockCreateSession('新建会话').sessionId;
-          }
+          let options;
+          try { options = sessionOptions(cfg, request.body ?? {}); }
+          catch (err) { return reply.code(400).send({ error: String((err as Error).message), code: 'invalid_session_options' }); }
+          realId = mockCreateSession('新建会话').sessionId;
           const record = registry.ensure(realId);
-          app.log.info({ sessionId: realId, mock: !live }, 'daemon 兼容层新建会话');
+          record.creationOptions = options;
+          app.log.info({ sessionId: realId, mock: true }, 'daemon 兼容层新建会话');
           return standaloneSessionBody(record, realId);
         },
       );
@@ -264,7 +255,6 @@ export async function registerDaemonRoutes(
         const id = request.params.id;
         const record = resolveSession(id);
         if (!record) return notFound(reply, id);
-        if (live) await liveCancel(live, record.realId);
         const activePromptId = record.journal.activePromptId;
         if (activePromptId !== undefined) {
           // 上游流随后会以 stopReason=cancelled 终态收场 → turn_complete(cancelled) 也会到
@@ -293,6 +283,9 @@ export async function registerDaemonRoutes(
             lastEventId: Number.isFinite(parsed) ? parsed : undefined,
             snapshot,
           });
+        } catch (err) {
+          if (!reply.sent) return reply.code(502).send({ error: toApiError(err, 'GetAgentSessionEvents').message, code: 'events_upstream_failed' });
+          app.log.warn({ sessionId: id, kind: toApiError(err, 'GetAgentSessionEvents').kind }, 'OpenAPI events stream ended with an error');
         } finally {
           sseActive -= 1;
         }
@@ -307,13 +300,20 @@ export async function registerDaemonRoutes(
         return reply.code(204).send();
       });
 
+      for (const operation of ['model', 'approval-mode', 'config-option']) {
+        d.post(`/session/:id/${operation}`, async (_request, reply) => reply.code(409).send({
+          error: 'OpenAPI 当前仅支持创建会话时设置模型、审批模式和思考深度，请新建会话后选择配置。',
+          code: 'new_session_required',
+        }));
+      }
+
       d.get<{ Params: { id: string }; Querystring: { limit?: string; beforeRecordId?: string } }>(
         '/session/:id/transcript',
         async (request, reply) => {
           const id = request.params.id;
           const record = resolveSession(id);
           if (!record) return notFound(reply, id);
-          // 上游 load 无增量游标（BeginLogOffset 是死参数），整份 journal 即全部历史
+          // 此历史端点返回完整快照；在途 Prompt 的增量恢复由帧源单独处理
           return {
             v: 1,
             sessionId: id,
@@ -343,7 +343,6 @@ export async function registerDaemonRoutes(
       d.delete<{ Params: { id: string } }>('/session/:id', async (request, reply) => {
         const record = resolveSession(request.params.id);
         if (!record) return notFound(reply, request.params.id);
-        // 上游没有删除接口：本地标记隐藏（journal 保留，深链重开还能看到），重启后恢复
         record.deleted = true;
         return reply.code(204).send();
       });
@@ -371,8 +370,7 @@ export async function registerDaemonRoutes(
         let optionId = typeof body?.outcome?.optionId === 'string' ? body.outcome.optionId.trim() : '';
         const answers = body?.answers && typeof body.answers === 'object' ? body.answers : undefined;
         if (optionId === OPENAPI_ANSWERS_OPTION) {
-          if (typeof pending !== 'object' || !('openApiAnswersOnly' in pending) ||
-              pending.openApiAnswersOnly !== true || outcomeKind !== 'selected' ||
+          if ((typeof pending !== 'object' || !pending || !('openApiAnswersOnly' in pending) || pending.openApiAnswersOnly !== true) || outcomeKind !== 'selected' ||
               !answers || Object.keys(answers).length === 0) {
             return reply.code(400).send({ error: '问答提交必须包含 answers', code: 'invalid_permission_response' });
           }
@@ -383,41 +381,6 @@ export async function registerDaemonRoutes(
             error: 'outcome=selected 时必须带 optionId 或 answers（与 /api/sessions/:id/reply 同一契约）',
             code: 'invalid_permission_response',
           });
-        }
-
-        if (live) {
-          try {
-            const result = await liveReply(live, record.realId, {
-              permissionRequestId: requestId,
-              answers,
-              optionId: optionId !== '' ? optionId : undefined,
-              outcome: outcomeKind,
-            });
-            if (result.ok && result.result.accepted) {
-              record.pendingPermissions.delete(requestId);
-              record.journal.append(
-                permissionResolvedEvent(record.realId, requestId, {
-                  outcome: outcomeKind,
-                  ...(optionId !== '' ? { optionId } : {}),
-                }),
-              );
-              return reply.code(200).send({});
-            }
-            // 上游明确不接：按赛跑失败对待——本地移除并走 404 语义让客户端刷新
-            record.pendingPermissions.delete(requestId);
-            return reply.code(404).send({
-              error: result.ok
-                ? '上游明确 accepted=false（requestId 可能已过期或已被他人回覆）'
-                : `回覆被拒：${result.error.message}`,
-              code: 'permission_not_accepted',
-            });
-          } catch (err) {
-            app.log.warn({ err, sessionId: record.realId, requestId }, 'daemon permission 回覆上游失败');
-            return reply.code(502).send({
-              error: `回覆上游失败：${String(err instanceof Error ? err.message : err)}`,
-              code: 'permission_upstream_error',
-            });
-          }
         }
 
         // MOCK：回覆是本地教学闭环——上游无真通道，直接当已受理（/api 的 mock reply 是拒绝语义，
@@ -457,7 +420,7 @@ export async function registerDaemonRoutes(
 
       /**
        * 兜底 404：**记日志**。webshell 打到这里的就是 daemon 有、而我们（因为上游
-       * OpenAPI 缺接口或尚未实现）给不了的端点——这份日志是 OPENAPI-GAPS.md 的证据链。
+       * OpenAPI 缺接口或尚未实现）给不了的端点——日志用于定位未提供的能力。
        */
       d.setNotFoundHandler((request, reply) => {
         app.log.info({ method: request.method, url: request.url }, 'daemon-compat 未实现端点（缺口候选）');
@@ -471,45 +434,22 @@ export async function registerDaemonRoutes(
       async function loadSession(id: string, mode: 'load' | 'resume', reply: FastifyReply): Promise<unknown> {
         const record = resolveSession(id);
         if (!record || record.deleted) return notFound(reply, id);
-
-        // An active prompt owns the live journal. Upstream load can block awaiting its reply.
-        if (mode === 'load' && !record.journal.activePrompt) {
-          let frames: AcpFrame[] = [];
-          if (live) {
-            try {
-              frames = await liveLoadFrames(live, record.realId);
-            } catch (err) {
-              const api = toApiError(err, 'LoadAgentSession');
-              return reply.code(api.kind === 'transport' ? 502 : 404).send({
-                error: api.message,
-                code: 'standalone_session_not_found',
-              });
-            }
-          } else {
-            const scenario = findScenario(record.realId);
-            frames = scenario?.historyFixture ? readFixtureFrames(scenario.historyFixture) : [];
-          }
-          // 过滤 + 去重判据与 reduceHistory 同源（rid-less 污染 / load 伪轮次 /
-          // bridge-echo 重复回显都不进 journal）
-          const events = historyFramesToEvents(frames, id);
-          record.journal.seed(events);
-          // 用种子事件重建 pending：重启后这张卡能真正回得上去（这个调用必须每次都做——
-          // seed 幂等轮到时也要兜底；pendingPermissions 的因果跟着 journal 变化走）
+        if (mode === 'load') {
+          const scenario = findScenario(record.realId);
+          const frames = scenario?.historyFixture ? readFixtureFrames(scenario.historyFixture) : [];
+          record.journal.seed(historyFramesToEvents(frames, id));
           rebuildPendingPermissions(record);
         }
 
         return {
           ...standaloneSessionBody(record, id),
           state: {
-            models: [
-              {
-                modelId: 'data-agent',
-                baseModelId: 'data-agent',
-                name: 'DataWorks Data Agent',
-                isCurrent: true,
-                isRuntime: false,
-              },
-            ],
+            models: {
+              currentModelId: record.creationOptions?.modelServiceId ?? cfg.model ?? 'data-agent',
+              availableModels: record.creationOptions?.modelServiceId
+                ? [{ modelId: record.creationOptions.modelServiceId, name: '创建时指定的模型' }]
+                : [{ modelId: cfg.model ?? 'data-agent', name: '当前会话模型' }],
+            },
             modes: {},
             configOptions: null,
           },
@@ -525,18 +465,17 @@ export async function registerDaemonRoutes(
         const record = resolveSession(id);
         if (!record) return notFound(reply, id);
         const name = typeof displayName === 'string' ? displayName.trim() : '';
-        if (!name) {
+        if (!name || name.length > 512) {
           return reply.code(400).send({ error: 'displayName 不能为空', code: 'invalid_metadata' });
         }
-        // 进程级：上游没有改名接口（SessionTitle 恒为首条 prompt 原文），重启即失
         record.displayName = name;
         return { sessionId: id, displayName: name };
       }
 
-      function batchMutate(
+      async function batchMutate(
         action: 'archive' | 'unarchive' | 'delete',
         rawIds: unknown,
-      ): Record<string, unknown> {
+      ): Promise<Record<string, unknown>> {
         const ids = (Array.isArray(rawIds) ? rawIds : []).filter((v): v is string => typeof v === 'string');
         const done: string[] = [];
         const skipped: string[] = [];
@@ -544,7 +483,7 @@ export async function registerDaemonRoutes(
         const errors: Array<{ sessionId: string; code: string; message: string }> = [];
         for (const raw of ids) {
           const id = raw.toLowerCase();
-          const record = registry.resolve(id);
+          const record = resolveSession(id);
           if (!record) {
             notFoundIds.push(id);
             continue;

@@ -4,13 +4,11 @@ import com.das.java.config.AppConfig;
 import com.das.java.core.ApiError;
 import com.das.java.core.Constants;
 import com.das.java.core.Frames;
-import com.das.java.live.LiveClient;
 import com.das.java.live.Normalize;
 import com.das.java.live.Normalize.DasApiException;
 import com.das.java.mock.MockFixtures;
 import com.das.java.mock.MockFixtures.MockScenario;
 import com.das.java.mock.MockReplay;
-import com.das.java.live.SdkSseStream;
 import com.das.java.web.Inflight;
 import com.das.java.web.Inflight.AcquireResult;
 import com.das.java.web.Inflight.Acquired;
@@ -26,7 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * daemon prompt 准入与后台轮次。与 Node 实现的 server-node/daemon/runner.ts 同源同语义。
+ * MOCK daemon prompt 准入与后台轮次。与 Node 实现的 server-node/daemon/runner.ts 同源同语义。
  *
  * 所有校验都在**还没碰到上游**之前完成（写操作纪律），通过后立刻返回 202 所需的
  * {promptId, lastEventId}，轮次在后台跑、事件写 journal、SSE 分发。
@@ -49,12 +47,10 @@ public class Runner {
     public record Rejected(int status, String error, String code) implements Admission {}
 
     private final AppConfig cfg;
-    private final LiveClient live;
     private final Inflight inflight;
 
-    public Runner(AppConfig cfg, LiveClient live, Inflight inflight) {
+    public Runner(AppConfig cfg, Inflight inflight) {
         this.cfg = cfg;
-        this.live = live;
         this.inflight = inflight;
     }
 
@@ -71,7 +67,7 @@ public class Runner {
                 continue;
             }
             Object type = block instanceof Map<?, ?> map ? map.get("type") : null;
-            // 上游 PromptAgentSession 只收文本块；图片块如实拒绝而不是静默丢弃（缺口见 OPENAPI-GAPS）
+            // 上游 PromptAgentSession 只收文本块；图片块如实拒绝而不是静默丢弃
             return new Rejected(400,
                 "不支持的 prompt content block（type=" + type + "）：上游 data agent OpenAPI 仅接受文本",
                 "unsupported_prompt_content");
@@ -105,8 +101,11 @@ public class Runner {
             } catch (Throwable t) {
                 // runTurn 内部已兜所有已知路径；这里只防"兜底本身抛了"这种把进程带走的形态。
                 log.error("daemon prompt 后台任务异常退出 sessionId={} promptId={}", record.realId, promptId, t);
-                journal.activePrompt = false;
-                journal.activePromptId = null;
+                if (promptId.equals(journal.activePromptId)) {
+                    journal.activePrompt = false;
+                    journal.activePromptId = null;
+                }
+                acquired.release().run();
             }
         });
 
@@ -114,7 +113,7 @@ public class Runner {
     }
 
     /**
-     * 后台轮次：帧源（live=签名 SSE / mock=录制件回放）→ 翻译 → journal。
+     * MOCK 后台轮次：录制件回放→ 翻译 → journal。
      *
      * 收尾分类与 pipeline 同源：
      *  · 帧内 Error → 首个错误归一成 turn_error（后续帧继续收）；
@@ -163,13 +162,9 @@ public class Runner {
                     Map<String, Object> permissionEvent = Translate.frameToPermissionEvent(frame, clientFacingId);
                     if (permissionEvent != null) {
                         journal.append(permissionEvent);
-                        if (permissionEvent.get("data") instanceof Map<?, ?> dataMap
-                            && dataMap.get("requestId") instanceof String requestId) {
-                            if ("permission_request".equals(permissionEvent.get("type"))) {
-                                record.pendingPermissions.put(requestId, permissionEvent);
-                            } else {
-                                record.pendingPermissions.remove(requestId);
-                            }
+                        if (permissionEvent.get("data") instanceof Map<?, ?> data && data.get("requestId") instanceof String requestId) {
+                            if ("permission_request".equals(permissionEvent.get("type"))) record.pendingPermissions.put(requestId, permissionEvent);
+                            else record.pendingPermissions.remove(requestId);
                         }
                     }
                     Map<String, Object> event = Translate.frameToSessionUpdate(frame, clientFacingId, true, clientId);
@@ -201,7 +196,7 @@ public class Runner {
                         code instanceof Number n ? n.intValue() : null,
                         frameError.get("errorCode") instanceof String s ? s : null,
                         null));
-                    journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
+                    appendTerminal(record, Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
                 }
                 if (terminal == null) terminal = Frames.terminalOf(frame);
                 if (terminal != null) break; // Do not wait for HTTP EOF after protocol completion.
@@ -209,7 +204,7 @@ public class Runner {
 
             if (!errorSent) {
                 if (terminal != null) {
-                    journal.append(Events.turnComplete(clientFacingId,
+                    appendTerminal(record, Events.turnComplete(clientFacingId,
                         terminal.rawStopReason() != null ? terminal.rawStopReason() : "end_turn", promptId));
                 } else {
                     errorSent = true;
@@ -217,7 +212,7 @@ public class Runner {
                     ApiError api = frameCount == 0 && !acks.isEmpty()
                         ? ApiError.promptNotDispatched(acks.get(0), System.currentTimeMillis() - startedAt)
                         : ApiError.streamBreakWithoutTerminal(frameCount);
-                    journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
+                    appendTerminal(record, Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
                 }
             }
         } catch (DasApiException e) {
@@ -226,7 +221,7 @@ public class Runner {
                 outcome = "transport_exception";
                 errorSent = true;
                 ApiError api = ApiError.redact(e.apiError());
-                journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
+                appendTerminal(record, Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
             }
         } catch (Throwable t) {
             exceptionType = exceptionTypes(t);
@@ -234,13 +229,18 @@ public class Runner {
                 outcome = "transport_exception";
                 errorSent = true;
                 ApiError api = Normalize.toApiError(t, "PromptAgentSession");
-                journal.append(Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
+                appendTerminal(record, Events.turnError(clientFacingId, api.message(), promptId, api.kind(), api.kind()));
             }
         } finally {
-            source.close();
-            acquired.release().run();
-            journal.activePrompt = false;
-            journal.activePromptId = null;
+            try { source.close(); }
+            finally {
+                // Clear this admission before unlocking: the next admission may start inside release().
+                if (promptId.equals(journal.activePromptId)) {
+                    journal.activePrompt = false;
+                    journal.activePromptId = null;
+                }
+                acquired.release().run();
+            }
             Map<String, Object> stats = new LinkedHashMap<>();
             stats.put("event", "prompt_stream_end");
             stats.put("backend", "java");
@@ -264,6 +264,10 @@ public class Runner {
         }
     }
 
+    private void appendTerminal(Registry.Record record, Map<String, Object> event) {
+        record.journal.append(event);
+    }
+
     // ------------------------------------------------------------------
     // 帧源：mock 与 live 的统一抽象（与 PromptApiController 里的同款骨架，
     // 但 daemon 侧要带 userText 去重 + scrubber，所以不进同一个类）
@@ -277,9 +281,6 @@ public class Runner {
     }
 
     FrameSource openSource(String realId, String outbound, List<String> acks) {
-        if (live != null) {
-            return new LivePromptSource(live, realId, outbound, acks);
-        }
         MockScenario scenario = MockFixtures.findScenario(realId);
         List<Map<String, Object>> frames = scenario != null && scenario.promptFixture() != null
             ? MockFixtures.readFixtureFrames(cfg.repoRoot(), scenario.promptFixture())
@@ -304,65 +305,10 @@ public class Runner {
         public void close() {}
     }
 
-    private static final class LivePromptSource implements FrameSource {
-        private final LiveClient live;
-        private final String sessionId;
-        private final String outbound;
-        private final List<String> acks;
-        private SdkSseStream stream;
-
-        LivePromptSource(LiveClient live, String sessionId, String outbound, List<String> acks) {
-            this.live = live;
-            this.sessionId = sessionId;
-            this.outbound = outbound;
-            this.acks = acks;
-        }
-
-        @Override
-        public Map<String, Object> next() throws DasApiException {
-            if (stream == null) {
-                try {
-                    stream = live.openPromptStream(sessionId, outbound, acks);
-                } catch (Exception e) {
-                    if (e instanceof DasApiException de) throw de;
-                    throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"), e);
-                }
-            }
-            while (true) {
-                String data;
-                try {
-                    data = stream.next();
-                } catch (SdkSseStream.SseException e) {
-                    throw new DasApiException(Normalize.toApiError(e, "PromptAgentSession"), e);
-                }
-                if (data == null) return null;
-                Object parsed;
-                try {
-                    parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(data, Object.class);
-                } catch (Exception e) {
-                    continue;
-                }
-                Map<String, Object> frame = Frames.frameFromSdkBody(parsed);
-                if (frame != null) return frame;
-                String ack = Frames.popAckRequestId(parsed);
-                if (ack != null) {
-                    acks.add(ack);
-                }
-            }
-        }
-
-        @Override
-        public void close() {
-            if (stream != null) stream.close();
-        }
-    }
-
-    // Class names only; exception messages may contain prompts, URLs or credentials.
+    // Only exception types belong in diagnostics; messages may contain credentials.
     static String exceptionTypes(Throwable error) {
         List<String> names = new ArrayList<>();
-        for (int i = 0; error != null && i < 4; i++, error = error.getCause()) {
-            names.add(error.getClass().getSimpleName());
-        }
+        for (int i = 0; error != null && i < 4; i++, error = error.getCause()) names.add(error.getClass().getSimpleName());
         return String.join(" <- ", names);
     }
 

@@ -8,7 +8,7 @@ public final class Constants {
     private Constants() {}
 
     // Agent 发现
-    /** 实测：ListAgents 恒只返回 2 个 chatbi 系 agent，但用这个名字建会话照样成功。 */
+    /** Default Agent; DATAAGENT_AGENT_NAME overrides it for this process. */
     public static final String DEFAULT_AGENT_NAME = "dataworks_data_agent";
 
     // 时序（毫秒）

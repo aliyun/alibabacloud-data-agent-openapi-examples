@@ -1,4 +1,4 @@
-"""会话注册表：始终以 OpenAPI 返回的真实 sessionId 为身份。"""
+"""MOCK-only session Registry. LIVE routes never construct or access it."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import AppConfig
-from ..live import LiveContext, _list_sessions_result
 from ..marker import strip_marker_instruction
 from ..mock_fixtures import mock_sessions
 from .journal import SessionJournal
@@ -34,14 +33,20 @@ class SessionRecord:
     # 在途 permission 请求：requestId → permission_request 的事件本体。
     # 用户点卡时 /session/:id/permission/:requestId 共享这份状态；回覆成功或上游 resolved 时删除。
     pending_permissions: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # rename 覆盖（进程级：上游没有改名接口，SessionTitle 恒为首条 prompt 原文）。
+    # Cache of the last accepted title (MOCK mutates locally).
     display_name: str | None = None
     archived: bool = False
-    # 本地删除标记（上游没有删除接口，只能挡住列表展示，进程级）。
+    # MOCK-only deletion marker.
     deleted: bool = False
     created_at: int = field(default_factory=lambda: int(time.time() * 1000))
     # 最近一次列表拉取缓存的上游摘要（createdAt / 标题等真实值），单会话 lookup 兜底用。
     cached_summary: dict[str, Any] | None = None
+
+    def set_pending_permission(self, request_id: str, event: dict[str, Any] | None) -> None:
+        if event is None:
+            self.pending_permissions.pop(request_id, None)
+        else:
+            self.pending_permissions[request_id] = event
 
 
 StandaloneSummary = dict[str, Any]
@@ -76,20 +81,14 @@ class SessionRegistry:
     # 会话摘要（web-shell 语义下的 standalone summary）
     # ------------------------------------------------------------------
 
-    async def list_summaries(self, cfg: AppConfig, live: LiveContext | None) -> list[StandaloneSummary]:
-        """会话摘要列表（侧栏数据源）。上游失败时返回空列表——空侧栏比 500 诚实。"""
-        if live:
-            try:
-                base = (await _list_sessions_result(live))["sessions"]
-            except Exception:  # noqa: BLE001
-                return []
-        else:
-            base = mock_sessions(cfg.sessionSource)["sessions"]
+    async def list_summaries(self, cfg: AppConfig, archived: bool = False) -> list[StandaloneSummary]:
+        """MOCK 会话摘要列表。LIVE 目录由独立请求级路由查询。"""
+        base = mock_sessions(cfg.sessionSource)["sessions"]
 
         out: list[StandaloneSummary] = []
         for summary in base:
             record = self.resolve(summary["sessionId"])
-            if record is not None and (record.deleted or record.archived):
+            if record is not None and (record.deleted or (record.archived and not archived)):
                 continue
             standalone = self._to_standalone(summary, record)
             if record is not None:
@@ -150,23 +149,25 @@ class SessionRegistry:
         }
 
 
-def rebuild_pending_permissions(record: SessionRecord) -> None:
-    """**重启/置换场景**：用 journal 里的事件量重新看清 `pending_permissions`。
-
-    后端重启后 journal 丢光，pending_permissions 自然也丢。用户重开会话时 load 会把
-    上游历史播种回来——里面可能含着**仍然待解答**的 permission_request。
-    不重建的话，那张卡的 DOM requestId 会向一个空表回应 → 404「无法 response」。
-    重建规则：按 requestId 配对，permission_request 加，permission_resolved 减。
-    """
-    record.pending_permissions.clear()
-    for entry in record.journal.all():
-        ev = entry.event
+def rebuild_pending_permissions(record: SessionRecord, events: list[dict[str, Any]] | None = None,
+                                concurrent: dict[str, dict[str, Any] | None] | None = None) -> None:
+    """Rebuild the MOCK pending view from its journal or explicit test events."""
+    restored: dict[str, dict[str, Any]] = {}
+    source = events if events is not None else [entry.event for entry in record.journal.all()]
+    for ev in source:
         type_ = ev.get("type")
         data = ev.get("data") or {}
         request_id = data.get("requestId")
         if not isinstance(request_id, str):
             continue
         if type_ == "permission_request":
-            record.pending_permissions[request_id] = ev
+            restored[request_id] = ev
         elif type_ in ("permission_resolved", "permission_already_resolved"):
-            record.pending_permissions.pop(request_id, None)
+            restored.pop(request_id, None)
+    for request_id, event in (concurrent or {}).items():
+        if event is None:
+            restored.pop(request_id, None)
+        else:
+            restored[request_id] = event
+    record.pending_permissions.clear()
+    record.pending_permissions.update(restored)

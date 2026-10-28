@@ -2,7 +2,6 @@ package com.das.java.daemon;
 
 import com.das.java.config.AppConfig;
 import com.das.java.core.Marker;
-import com.das.java.live.LiveClient;
 import com.das.java.mock.MockFixtures;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -12,12 +11,9 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-/** 会话注册表：始终以 OpenAPI 返回的真实 sessionId 为身份。 */
+/** MOCK-only in-memory teaching journal and session metadata. */
 public class Registry {
-    private static final Logger log = LoggerFactory.getLogger(Registry.class);
 
     /**
      * standalone 会话没有真实工作区，但契约要求 workspaceCwd 为非空字符串。
@@ -41,10 +37,10 @@ public class Registry {
          * permission_resolved 时删除。
          */
         public final Map<String, Map<String, Object>> pendingPermissions = new java.util.concurrent.ConcurrentHashMap<>();
-        /** rename 覆盖（进程级：上游没有改名接口，SessionTitle 恒为首条 prompt 原文）。 */
+        /** MOCK-only UI metadata. */
         public volatile String displayName;
         public volatile boolean archived;
-        /** 本地删除标记（上游没有删除接口，只能挡住列表展示，进程级）。 */
+        /** MOCK deletion state. */
         public volatile boolean deleted;
         public final long createdAt = System.currentTimeMillis();
         /** 最近一次列表拉取缓存的上游摘要（createdAt / 标题等真实值），单会话 lookup 兜底用。 */
@@ -82,19 +78,19 @@ public class Registry {
      * 不重建的话，那张卡的 DOM requestId 会向一个空表回应 → 404「无法 response」。
      * 重建规则：按 requestId 配对，permission_request 加，permission_resolved 减。
      */
+    /** MOCK journal replay retains its original complete-rebuild semantics. */
     public static void rebuildPendingPermissions(Record record) {
-        record.pendingPermissions.clear();
-        for (Journal.Entry entry : record.journal.all()) {
-            Map<String, Object> ev = entry.event();
-            Object type = ev.get("type");
-            Object data = ev.get("data");
-            if (!(data instanceof Map<?, ?> dataMap)) continue;
-            Object requestId = dataMap.get("requestId");
-            if (!(requestId instanceof String rid)) continue;
-            if ("permission_request".equals(type)) {
-                record.pendingPermissions.put(rid, ev);
-            } else if ("permission_resolved".equals(type) || "permission_already_resolved".equals(type)) {
-                record.pendingPermissions.remove(rid);
+        rebuildPendingPermissions(record, record.journal.all().stream().map(Journal.Entry::event).toList());
+    }
+
+    public static void rebuildPendingPermissions(Record record, List<Map<String, Object>> events) {
+        synchronized (record) {
+            record.pendingPermissions.clear();
+            for (var event : events) {
+                if (!(event.get("data") instanceof Map<?, ?> data) || !(data.get("requestId") instanceof String id)) continue;
+                if ("permission_request".equals(event.get("type"))) record.pendingPermissions.put(id, event);
+                else if ("permission_resolved".equals(event.get("type")) || "permission_already_resolved".equals(event.get("type")))
+                    record.pendingPermissions.remove(id);
             }
         }
     }
@@ -116,32 +112,16 @@ public class Registry {
     // 会话摘要（webshell 语义下的 standalone summary）
     // ------------------------------------------------------------------
 
-    /** 会话摘要列表（侧栏数据源）。上游失败时返回空列表并 warn——空侧栏比 500 诚实。 */
-    public List<Map<String, Object>> listSummaries(AppConfig cfg, LiveClient live) {
-        List<Map<String, Object>> base;
-        if (live != null) {
-            try {
-                @SuppressWarnings("unchecked")
-                List<Map<String, Object>> sessions =
-                    (List<Map<String, Object>>) live.listSessions().get("sessions");
-                base = sessions != null ? sessions : List.of();
-            } catch (Exception e) {
-                log.warn("daemon 会话列表：上游 ListAgentSessions 失败，本次返回空列表：{}", e.getMessage());
-                return List.of();
-            }
-        } else {
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> sessions =
-                (List<Map<String, Object>>) MockFixtures.mockSessions(cfg.sessionSource()).get("sessions");
-            base = sessions;
-        }
-
+    /** MOCK-only side bar summaries. LIVE never constructs a Registry. */
+    public List<Map<String, Object>> listSummaries(AppConfig cfg) {
+        @SuppressWarnings("unchecked")
+        var base = (List<Map<String, Object>>)MockFixtures.mockSessions(cfg.sessionSource()).get("sessions");
         List<Map<String, Object>> out = new ArrayList<>();
-        for (Map<String, Object> summary : base) {
-            String sessionId = (String) summary.get("sessionId");
-            Record record = resolve(sessionId);
+        for (var summary : base) {
+            String id = (String)summary.get("sessionId");
+            Record record = resolve(id);
             if (record != null && (record.deleted || record.archived)) continue;
-            Map<String, Object> standalone = toStandalone(summary, record);
+            var standalone = toStandalone(summary, record, true);
             if (record != null) record.cachedSummary = standalone;
             out.add(standalone);
         }
@@ -149,14 +129,14 @@ public class Registry {
     }
 
     /** webshell 会话摘要：必填字段钉死在 SDK 的 parseStandaloneSummary 校验器上。 */
-    private Map<String, Object> toStandalone(Map<String, Object> summary, Record record) {
+    private Map<String, Object> toStandalone(Map<String, Object> summary, Record record, boolean allowLocalDisplayName) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("sessionId", summary.get("sessionId"));
         out.put("workspaceCwd", WORKSPACE_CWD);
         out.put("createdAt", isoOf(summary.get("createdAt")));
         out.put("updatedAt", isoOf(summary.get("updatedAt")));
         String title = summary.get("title") instanceof String s ? Marker.stripMarkerInstruction(s) : "";
-        String displayName = record != null && record.displayName != null
+        String displayName = allowLocalDisplayName && record != null && record.displayName != null
             ? record.displayName
             : (!title.isEmpty() ? title : String.valueOf(summary.get("sessionId")).substring(0, 8));
         out.put("displayName", displayName);

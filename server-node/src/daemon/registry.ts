@@ -1,13 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
-import type { FastifyBaseLogger } from 'fastify';
 
 import { stripMarkerInstruction, type SessionSummary } from '@das/shared';
 
 import type { AppConfig } from '../config.js';
-import { liveListSessions, type LiveContext } from '../live.js';
 import { mockSessions } from '../mock/fixtures.js';
 import { SessionJournal } from './journal.js';
+import type { SessionCreationOptions } from '../session-options.js';
 
 /**
  * webshell 语义下的会话摘要（standalone）。
@@ -36,25 +35,26 @@ export interface StandaloneSummary {
 export const WORKSPACE_CWD = '/data-agent';
 
 export interface SessionRecord {
-  /** 上游真实 SessionId——一切上游调用都用它。 */
+  /** MOCK 场景的会话标识。 */
   realId: string;
   /**
    * daemon 分配的客户端身份：create/load 响应里回显（session.clientId），客户端发
-   * prompt 时经 X-Qwen-Client-Id 带回——我们再盖上 user 回显事件的 originatorClientId，
-   * web-shell 的 suppressOwnUserEcho 靠它精确匹配抑制自己的回显。
+   * prompt 时经 X-Qwen-Client-Id 带回。LIVE POP 未保留可信的该身份，
+   * 前端使用权威远端 echo，不凭此本地 ID 猜测远端事件归属。
    */
   clientId: string;
   journal: SessionJournal;
+  creationOptions?: SessionCreationOptions;
   /**
    * 在途 permission 请求：requestId → permission_request 事件本体。
    * 用户点卡时 /session/:id/permission/:requestId 共享这份状态，
    * 回覆成功即移除；上游 permission_resolved 到帧时也移除。
    */
   pendingPermissions: Map<string, unknown>;
-  /** rename 覆盖（进程级：上游没有改名接口，SessionTitle 恒为首条 prompt 原文）。 */
+  /** MOCK 标题覆盖。 */
   displayName: string | undefined;
   archived: boolean;
-  /** 本地删除标记（上游没有删除接口，只能挡住列表展示，进程级）。 */
+  /** MOCK 删除的本地生命周期标记。 */
   deleted: boolean;
   createdAt: number;
   /** 最近一次列表拉取缓存的上游摘要（createdAt / 标题等真实值），单会话 lookup 兜底用。 */
@@ -84,7 +84,7 @@ export function rebuildPendingPermissions(record: SessionRecord): void {
   }
 }
 
-/** 会话注册表：始终以 OpenAPI 返回的真实 sessionId 为身份。 */
+/** 仅 MOCK 使用的会话注册表；LIVE 不创建此对象。 */
 export class SessionRegistry {
   private byKey = new Map<string, SessionRecord>();
   /** 记录集合，用于统计与本地元数据视图。 */
@@ -123,23 +123,8 @@ export class SessionRegistry {
   }
 
   /** 会话摘要列表（侧栏数据源）。上游失败时返回空列表并 warn——空侧栏比 500 诚实。 */
-  async listSummaries(
-    cfg: AppConfig,
-    live: LiveContext | undefined,
-    log?: FastifyBaseLogger,
-  ): Promise<StandaloneSummary[]> {
-    let base: SessionSummary[];
-    if (live) {
-      const result = await liveListSessions(live);
-      if (!result.ok) {
-        log?.warn({ kind: result.error.kind }, 'daemon 会话列表：上游 ListAgentSessions 失败，本次返回空列表');
-        return [];
-      }
-      base = result.result.sessions;
-    } else {
-      base = mockSessions(cfg).sessions;
-    }
-
+  async listSummaries(cfg: AppConfig): Promise<StandaloneSummary[]> {
+    const base = mockSessions(cfg).sessions;
     const out: StandaloneSummary[] = [];
     for (const summary of base) {
       const record = this.resolve(summary.sessionId);

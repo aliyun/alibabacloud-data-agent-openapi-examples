@@ -26,3 +26,43 @@ html, body, #root { height: 100%; margin: 0; }
   cursor: pointer;
 }
 .host-error pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.openapi-shell { height: 100%; min-height: 0; }
+.session-settings-button, .session-config-open { border: 0; background: transparent; color: inherit; cursor: pointer; border-radius: 6px; }
+.session-settings-button { display: grid; place-items: center; padding: 7px; opacity: .7; }
+.session-settings-button:hover, .session-config-open:hover { background: #8882; opacity: 1; }
+.session-configuration { display: flex; align-items: center; gap: 6px; min-width: 0; font: 11px/1.5 system-ui, sans-serif; color: #888; }
+.session-configuration-values { display: flex; flex-wrap: wrap; gap: 3px 10px; align-items: center; }
+.session-config-model { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-config-source { opacity: .65; font-size: 10px; }
+.session-config-open { font-size: 11px; padding: 2px 4px; white-space: nowrap; }
+.session-settings-dialog { --settings-bg: #1b1b1b; --settings-panel: #222; --settings-line: #393939; --settings-text: #eee; --settings-muted: #999;
+  position: fixed; inset: 0; margin: auto; height: fit-content; box-sizing: border-box; width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 0; border: 1px solid var(--settings-line);
+  border-radius: 14px; color: var(--settings-text); background: var(--settings-bg); box-shadow: 0 24px 90px #0007; font: 13px/1.6 system-ui, sans-serif; }
+.session-settings-dialog[data-theme="light"] { --settings-bg: #fff; --settings-panel: #f6f6f6; --settings-line: #e4e4e4; --settings-text: #222; --settings-muted: #777; }
+.session-settings-dialog::backdrop { background: #0006; backdrop-filter: blur(2px); }
+.session-settings-dialog header { display: flex; align-items: start; justify-content: space-between; padding: 22px 26px 18px; border-bottom: 1px solid var(--settings-line); }
+.session-settings-dialog h2, .session-settings-dialog h3, .session-settings-dialog p { margin: 0; }
+.session-settings-dialog h2 { font-size: 17px; font-weight: 600; }
+.session-settings-dialog h3 { font-size: 15px; font-weight: 600; margin-bottom: 5px; }
+.session-settings-dialog p { color: var(--settings-muted); font-size: 12px; }
+.session-settings-dialog button { cursor: pointer; color: inherit; font: inherit; border: 1px solid var(--settings-line); background: transparent; border-radius: 7px; padding: 6px 12px; }
+.session-settings-dialog header button { border: 0; font-size: 22px; padding: 0 4px; line-height: 1.2; }
+.session-settings-body { display: grid; grid-template-columns: 155px 1fr; overflow-y: auto; max-height: calc(100dvh - 225px); }
+.session-settings-body nav { background: var(--settings-panel); padding: 22px 12px; border-right: 1px solid var(--settings-line); }
+.session-settings-body nav span { display: block; border-radius: 6px; padding: 7px 10px; background: #8882; }
+.session-settings-body section { padding: 22px 26px; min-width: 0; }
+.session-settings-body label { display: grid; gap: 6px; margin-top: 18px; }
+.session-settings-body small { color: var(--settings-muted); font-size: 11px; }
+.session-settings-body input, .session-settings-body select { box-sizing: border-box; width: 100%; min-width: 0; border: 1px solid var(--settings-line); border-radius: 7px; padding: 8px 10px; color: var(--settings-text); background: var(--settings-panel); font: inherit; }
+.session-settings-body input[readonly] { color: var(--settings-muted); }
+.session-settings-options { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+.session-settings-dialog .session-settings-note { margin-top: 22px; }
+.session-settings-dialog footer { display: flex; justify-content: space-between; align-items: center; padding: 15px 26px; border-top: 1px solid var(--settings-line); }
+.session-settings-dialog .session-settings-done { background: var(--settings-text); color: var(--settings-bg); padding-inline: 24px; }
+.session-settings-dialog button:focus-visible, .session-settings-dialog input:focus-visible, .session-settings-dialog select:focus-visible,
+.session-settings-button:focus-visible, .session-config-open:focus-visible { outline: 2px solid #7a9de0; outline-offset: 2px; }
+@media (max-width: 560px) { .session-settings-body { grid-template-columns: 1fr; } .session-settings-body nav { display: none; } .session-settings-options { grid-template-columns: 1fr; gap: 0; } .session-config-model { max-width: 115px; } }
+
+.session-create-error { display: flex; justify-content: space-between; align-items: start; gap: 10px; padding: 10px 12px; border: 1px solid #b7644a66; border-radius: 8px; background: #b7644a12; color: #cc8169; font: 12px/1.5 system-ui,sans-serif; overflow-wrap: anywhere; }
+.session-create-error button { flex-shrink: 0; border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 18px; line-height: 1; }

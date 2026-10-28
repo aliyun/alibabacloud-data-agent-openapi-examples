@@ -19,6 +19,7 @@ import {
 } from '@das/shared';
 
 import type { AppConfig } from '../config.js';
+import { sessionOptions } from '../session-options.js';
 import {
   liveArtifacts,
   liveCancel,
@@ -109,16 +110,16 @@ export async function registerRestRoutes(
    * 停下等人（人卡，配下面的 /reply）；`yolo` = 全部自动放行。前端 UI 传 default
    * 对齐 Web Shell 的行为；自检与无人值守路径保持 yolo。
    */
-  app.post<{ Body: { title?: unknown; mode?: unknown } }>('/api/sessions', async (request, reply) => {
-    const rawMode = typeof request.body?.mode === 'string' ? request.body.mode : undefined;
-    const mode = rawMode === 'default' || rawMode === 'yolo' ? rawMode : undefined;
-    if (rawMode !== undefined && mode === undefined) {
+  app.post<{ Body: { title?: unknown; agentName?: unknown; mode?: unknown; approvalMode?: unknown; modelServiceId?: unknown; reasoningEffort?: unknown } }>('/api/sessions', async (request, reply) => {
+    let options;
+    try { options = sessionOptions(cfg, request.body ?? {}); }
+    catch (error) {
       return send<CreateSessionResult>(reply, {
         ok: false,
-        error: apiError('rpc_error', `mode 只接受 'yolo' | 'default'，收到：${rawMode}`),
+        error: apiError('rpc_error', (error as Error).message),
       });
     }
-    if (live) return send(reply, await liveCreateSession(live, mode ?? 'yolo'));
+    if (live) return send(reply, await liveCreateSession(live, options));
     const title = typeof request.body?.title === 'string' ? request.body.title : '新建会话';
     const result: CreateSessionResult = mockCreateSession(stripMarkerInstruction(title) || title);
     return send<CreateSessionResult>(reply, { ok: true, result });

@@ -13,6 +13,7 @@ export interface DaemonEvent {
   data: Record<string, unknown>;
   /** journal 分配的单调序号；SSE 帧的 `id:` 行与 `Last-Event-ID` 续传都靠它。 */
   id?: number;
+  promptId?: string;
   originatorClientId?: string;
   _meta?: Record<string, unknown>;
 }

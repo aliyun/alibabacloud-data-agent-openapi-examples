@@ -15,17 +15,7 @@ interface PromptBody {
   text?: unknown;
 }
 
-/**
- * `POST /api/sessions/:id/prompt` → `application/x-ndjson`。
- *
- * 这是全工程唯一一条流式路由，也是唯一一处"写操作"：prompt 一旦送出去，服务端那一轮
- * 就开始跑了，断开连接不会停掉它，也没有可用的应答/取消接口。所以下面每一处提前返回
- * 都刻意安排在"还没碰到上游"之前；hijack 之后就只剩一条路：把流写完或如实报错。
- *
- * 顺序因此是硬的：**校验参数 → 拿在途锁 → hijack → 调上游**。
- * 把锁放在 hijack 之前，被拒的那一方还能拿到一个普通 JSON 响应；
- * 反过来就得在已经发出去的流里塞一条错误，前端要处理两种形状。
- */
+/** Connection-owned NDJSON: LIVE concurrency belongs to POP; only MOCK uses the local admission lock. */
 export async function registerPromptRoutes(
   app: FastifyInstance,
   cfg: AppConfig,
@@ -48,13 +38,13 @@ export async function registerPromptRoutes(
     const outbound = text;
 
     /**
-     * 拿到帧源之后共用的那一段：上锁、hijack、把流写完、解锁。
+     * 共用的连接内流管道；只有 MOCK 使用并释放本地准入锁。
      *
-     * mock 与 live 走的是**同一个函数**，这是"mock 下验收通过"能推广到真实链路的前提。
+     * LIVE 不使用进程级会话锁；每个连接独立拥有 rid、恢复游标及终态。
      */
     async function pump(frames: AsyncIterable<AcpFrame>, popRequestIds: string[]): Promise<FastifyReply> {
-      const acquired = tryAcquire(sessionId);
-      if (!acquired.ok) {
+      const acquired = live ? undefined : tryAcquire(sessionId);
+      if (acquired && !acquired.ok) {
         app.log.info(
           {
             sessionId,
@@ -93,7 +83,7 @@ export async function registerPromptRoutes(
              * 等 streamWire 返回再赋值，锁条目在整个运行期都是 undefined。
              */
             onRid: (rid) => {
-              acquired.entry.rid = rid;
+              if (acquired?.ok) acquired.entry.rid = rid;
             },
           },
         );
@@ -112,7 +102,7 @@ export async function registerPromptRoutes(
           'prompt 流结束',
         );
       } finally {
-        acquired.release();
+        if (acquired?.ok) acquired.release();
       }
 
       // hijack 之后响应由 streamWire 自己收尾，这里不能再 send
@@ -122,7 +112,7 @@ export async function registerPromptRoutes(
     if (live) {
       /**
        * 注意这里只是**构造**了异步生成器，函数体要到第一次 `next()` 才执行，
-       * 所以在途锁之前调用它并不会碰到上游。
+       * 因此 streamWire 可先发出并 flush 响应头，再开始上游调用。
        *
        * popRequestIds 是同一个数组引用：生成器在迭代过程中往里填 POP 回执的 RequestId，
        * 管道收尾分类（零帧 ⇒ prompt_not_dispatched）时再读出来带进错误 message。

@@ -116,6 +116,8 @@ public final class Pipeline {
     public Map<String, Object> finish(List<String> popRequestIds) {
         if (errorSent) return null;
         if (terminal != null) {
+            if (!mock && terminal.stopReason() == null)
+                return onError(new DasApiException(ApiError.apiError("rpc_error", "Unrecognized remote stopReason")), "PromptAgentSession");
             Map<String, Object> done = new LinkedHashMap<>();
             done.put("rid", rid != null ? rid : "");
             done.put("stopReason", terminal.stopReason());
@@ -123,10 +125,9 @@ public final class Pipeline {
             done.put("frameCount", frameCount);
             return event("done", done);
         }
-        // 两种"没有终态"必须分开，处置完全相反：
-        //  · 收到过帧 ⇒ 断流，任务很可能还在服务端跑，动作是探测/拉历史接管，绝不重发；
-        //  · 一帧都没收到 ⇒ 上游收下了请求却没派发给执行端，任务**根本没开始**。
-        ApiError error = frameCount == 0
+        // LIVE EOF is an unknown execution result, including an empty or ACK-only response.
+        // MOCK keeps the recorded prompt_not_dispatched teaching scenario. Neither path resends Prompt.
+        ApiError error = mock && frameCount == 0
             ? ApiError.promptNotDispatched(
                 popRequestIds == null || popRequestIds.isEmpty() ? null : popRequestIds.get(0),
                 System.currentTimeMillis() - startedAt)

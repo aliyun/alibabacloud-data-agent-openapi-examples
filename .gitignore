@@ -10,6 +10,7 @@ target/
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 
 # 凭证：任何情况下都不要提交
 # .env.* 一并忽略，覆盖多环境的 .env.<name>（如 .env.beijing-pre，里面有真 AK/SK）；
@@ -19,6 +20,7 @@ __pycache__/
 !.env.example
 
 *.log
+logs
 npm-debug.log*
 .DS_Store
 .idea/
@@ -36,3 +38,13 @@ APP-META/docker-config/context/
 # Internal public-release candidates and private validation reports
 .public-candidate/
 .public-candidate.report.json
+
+# Local dependency configuration, caches and auxiliary checkouts
+/.npmrc
+/.pnpm-store/
+/worktrees/
+
+# Local investigation artifacts and superseded acceptance handoffs
+/docs/verification/
+/docs/OPENAPI-SERVICE-SWITCH-E2E.md
+/docs/SOURCEIDENTITY-HANDOFF.md

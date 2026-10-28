@@ -30,8 +30,14 @@ export interface AppConfig {
   agentName: string;
   sessionSource: string;
   resourceGroupId: string | undefined;
+  model?: string;
+  models?: string[];
+  mode?: string;
+  reasoningEffort?: string;
   accessKeyId: string | undefined;
   accessKeySecret: string | undefined;
+  /** Optional token for externally supplied temporary AK/SK credentials. */
+  securityToken?: string;
   /**
    * 监听地址。默认 127.0.0.1（本地开发：进程持有 AK/SK，暴露到局域网等于把
    * 凭证使用权一起暴露）。容器/内网部署时设 SERVER_HOST=0.0.0.0——同时会把
@@ -84,8 +90,13 @@ export function loadConfig(): AppConfig {
     agentName: nonEmpty(process.env.DATAAGENT_AGENT_NAME) ?? DEFAULT_AGENT_NAME,
     sessionSource: nonEmpty(process.env.SESSION_SOURCE) ?? DEFAULT_SESSION_SOURCE,
     resourceGroupId: nonEmpty(process.env.RESOURCE_GROUP_ID),
+    model: nonEmpty(process.env.DATAAGENT_MODEL),
+    models: nonEmpty(process.env.DATAAGENT_MODELS)?.split(',').map(v => v.trim()).filter(Boolean),
+    mode: nonEmpty(process.env.DATAAGENT_MODE) ?? 'yolo',
+    reasoningEffort: nonEmpty(process.env.DATAAGENT_REASONING_EFFORT),
     accessKeyId,
     accessKeySecret,
+    securityToken: nonEmpty(process.env.ALIBABA_CLOUD_SECURITY_TOKEN),
     serverHost: nonEmpty(process.env.SERVER_HOST) ?? '127.0.0.1',
     webDist: nonEmpty(process.env.WEB_DIST) ?? path.join(REPO_ROOT, 'web', 'dist'),
   };
@@ -159,7 +170,7 @@ function printMissingCredentials(): void {
     '     2) 填 ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET',
     '        建议单独建 RAM 用户，不要用主账号 AK/SK。',
     '     3) 填 DATAAGENT_REGION_ID（DataWorks 实例所在 region）',
-    '     4) 账号下 DataWorks 运行实例为零的话，还要填 RESOURCE_GROUP_ID',
+    '     4) 填 DATAAGENT_AGENT_NAME 指定已发布的 Agent；ACS 不要求资源组或 ProjectId',
     '     5) 要接预发/日常等内置映射不认识的上游，再填 END_POINT（域名，留空按 region 推导）',
     '',
     `  .env 应该放在仓库根：${path.join(REPO_ROOT, '.env')}`,

@@ -8,9 +8,8 @@ import java.util.Map;
  * 前后端之间的流式 wire 协议：NDJSON，一行一个 JSON 对象。
  * 与 Node 实现的 shared/protocol.ts、Python 实现的 protocol.py 同源同语义。
  *
- * 为什么不用 SSE：前端无论如何都要手解（EventSource 不支持 POST body）；更关键的是
- * SSE 的 id:/Last-Event-ID 语义**暗示可以断点续传**，而 BeginLogOffset 实测是死参数——
- * 用 SSE 等于在协议层撒谎。
+ * POST 响应使用 NDJSON。上游断流由后端按原轮 offset 调 LoadAgentSession 续接，
+ * 不依赖浏览器 EventSource / Last-Event-ID，也不重发 Prompt。
  */
 public final class Wire {
     private Wire() {}

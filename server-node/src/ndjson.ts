@@ -95,6 +95,7 @@ export async function streamWire(
   // 反代（nginx 等）默认会缓冲响应，这一行让它别缓冲
   headers['x-accel-buffering'] = 'no';
   raw.writeHead(200, headers);
+  raw.flushHeaders?.(); // Admission is observable before the first upstream/model frame.
 
   const outcome: StreamOutcome = {
     rid: undefined,

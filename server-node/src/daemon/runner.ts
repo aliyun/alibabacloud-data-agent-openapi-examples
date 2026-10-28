@@ -11,7 +11,6 @@ import {
 
 import type { AppConfig } from '../config.js';
 import { tryAcquire, type InflightEntry } from '../inflight.js';
-import { livePromptFrames, type LiveContext } from '../live.js';
 import { findScenario, readFixtureFrames } from '../mock/fixtures.js';
 import { replayFrames } from '../mock/replay.js';
 import { redactApiError, toApiError } from '../normalize.js';
@@ -21,7 +20,6 @@ import { errorOfFrame, frameToPermissionEvent, frameToSessionUpdate, terminalOfF
 
 export interface PromptDeps {
   cfg: AppConfig;
-  live: LiveContext | undefined;
   log: FastifyBaseLogger;
 }
 
@@ -66,7 +64,7 @@ export function admitPrompt(
       texts.push(block.text);
       continue;
     }
-    // 上游 PromptAgentSession 只收文本块；图片块如实拒绝而不是静默丢弃（缺口见 OPENAPI-GAPS）
+    // 上游 PromptAgentSession 只收文本块；图片块如实拒绝而不是静默丢弃
     return {
       ok: false,
       status: 400,
@@ -114,13 +112,13 @@ export function admitPrompt(
 }
 
 /**
- * 后台轮次：帧源（live=SDK SSE / mock=录制件回放）→ 翻译 → journal。
+ * MOCK 后台轮次：录制件回放 → 翻译 → journal。
  *
  * 收尾分类与 `pipeline.toWireEvents` 同源：
  *  · 帧内 Error → 首个错误归一成 turn_error（后续帧继续收，断流前已有 1200 帧的形态）；
  *  · Result.stopReason → turn_complete；
  *  · 无终态：有帧 ⇒ stream_break（任务可能仍在跑，绝不重发）；零帧+有回执 ⇒ prompt_not_dispatched。
- * 硬上限 330s 对齐实测断流墙，到点主动按 stream_break 收尾。
+ * 不设整轮时长上限；等待真实终态或明确的传输错误。
  */
 async function runTurn(
   deps: PromptDeps,
@@ -137,16 +135,11 @@ async function runTurn(
   const acks: string[] = [];
 
   let frames: AsyncIterable<AcpFrame>;
-  if (deps.live) {
-    frames = livePromptFrames(deps.live, record.realId, outbound, acks);
-  } else {
-    const scenario = findScenario(record.realId);
-    frames = replayFrames(scenario?.promptFixture ? readFixtureFrames(scenario.promptFixture) : [], {
-      realtime: deps.cfg.mockRealtime,
-      speed: deps.cfg.mockSpeed,
-    });
-    if (scenario?.popAck) acks.push(scenario.popAck);
-  }
+  const scenario = findScenario(record.realId);
+  frames = replayFrames(scenario?.promptFixture ? readFixtureFrames(scenario.promptFixture) : [], {
+    realtime: deps.cfg.mockRealtime, speed: deps.cfg.mockSpeed,
+  });
+  if (scenario?.popAck) acks.push(scenario.popAck);
 
   let frameCount = 0;
   let lastFrameAt: number | undefined;
@@ -158,6 +151,9 @@ async function runTurn(
   /** 本轮 user 回显的累积文本：上游会把 echo 发两份（bridge-echo，与归档态同款），
    *  去重判据与 historyFramesToEvents 同源，否则 LIVE 下用户消息显示两遍（实测）。 */
   let userText = '';
+  const appendOutcome = (event: ReturnType<typeof turnCompleteEvent>) => {
+    journal.append(event);
+  };
 
   try {
     for await (const frame of frames) {
@@ -213,7 +209,7 @@ async function runTurn(
         errorSent = true;
         outcome = 'upstream_error_frame';
         const api = redactApiError(classifyError(frameError));
-        journal.append(
+        appendOutcome(
           turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
         );
       }
@@ -224,18 +220,18 @@ async function runTurn(
 
     if (!errorSent) {
       if (terminal !== undefined) {
-        journal.append(turnCompleteEvent(clientFacingId, terminal.rawStopReason ?? 'end_turn', promptId));
+        appendOutcome(turnCompleteEvent(clientFacingId, terminal.rawStopReason ?? 'end_turn', promptId));
       } else if (frameCount === 0 && acks.length > 0) {
         errorSent = true;
         outcome = 'ack_without_frames';
         const api = promptNotDispatched(acks[0], Date.now() - startedAt);
-        journal.append(
+        appendOutcome(
           turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
         );
       } else {
         errorSent = true;
         const api = streamBreakWithoutTerminal(frameCount);
-        journal.append(
+        appendOutcome(
           turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
         );
       }
@@ -243,12 +239,12 @@ async function runTurn(
   } catch (err) {
     exception = exceptionFacts(err);
     if (!errorSent && terminal !== undefined) {
-      journal.append(turnCompleteEvent(clientFacingId, terminal.rawStopReason ?? 'end_turn', promptId));
+      appendOutcome(turnCompleteEvent(clientFacingId, terminal.rawStopReason ?? 'end_turn', promptId));
     } else if (!errorSent) {
       outcome = 'transport_exception';
       errorSent = true;
       const api = toApiError(err, 'PromptAgentSession');
-      journal.append(
+      appendOutcome(
         turnErrorEvent(clientFacingId, api.message, { promptId, code: api.kind, errorKind: api.kind }),
       );
     }

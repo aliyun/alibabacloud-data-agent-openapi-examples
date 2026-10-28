@@ -59,6 +59,7 @@ from .live import (
 from .mock_replay import replay_frames
 from .turn import reduce_history
 from .normalize import SdkError, to_api_error
+from .session_options import creation_options
 from .pipeline import PipelineInput, to_wire_events
 from .protocol import WIRE_CONTENT_TYPE, serialize
 
@@ -129,13 +130,13 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
     @app.post("/api/sessions")
     async def create_session(request: Request) -> Any:
         body = await _json_body(request)
-        raw_mode = body.get("mode") if isinstance(body.get("mode"), str) else None
-        mode = raw_mode if raw_mode in ("default", "yolo") else None
-        if raw_mode is not None and mode is None:
-            return send(err(api_error("rpc_error", f"mode 只接受 'yolo' | 'default'，收到：{raw_mode}")))
+        try:
+            creation_options(cfg, body)
+        except ValueError as exc:
+            return send(err(api_error("rpc_error", str(exc))))
         if live:
             try:
-                return send(ok(await live_create_session_result(live, mode or "yolo")))
+                return send(ok(await live_create_session_result(live, options=body)))
             except Exception as exc:  # noqa: BLE001
                 return send(live_error(exc, "CreateAgentSession"))
         title = body.get("title") if isinstance(body.get("title"), str) else "新建会话"
@@ -326,8 +327,7 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     # prompt（唯一的流式路由，也是唯一一处"写操作"）
     #
-    # 顺序因此是硬的：校验参数 → 拿在途锁 → 进流。
-    # 把锁放在流开始之前，被拒的那一方还能拿到一个普通 JSON 响应。
+    # LIVE 仅校验参数后连接上游；并发准入由上游判定。MOCK 保留本地在途锁。
     # ------------------------------------------------------------------
 
     @app.post("/api/sessions/{session_id}/prompt")
@@ -343,14 +343,12 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
         outbound = text
 
         def build_stream(frames_source: AsyncGenerator[dict[str, Any], None], pop_request_ids: list[str]) -> StreamingResponse | JSONResponse:
-            acquired_or = try_acquire(session_id)
-            if isinstance(acquired_or, Acquired):
-                acquired: Acquired | None = acquired_or
-            else:
-                acquired = None
-            if acquired is None:
-                rejected = acquired_or  # Rejected
-                return send({"ok": False, "error": rejected.error.to_dict()})
+            acquired = None
+            if live is None:
+                acquired_or = try_acquire(session_id)
+                if not isinstance(acquired_or, Acquired):
+                    return send({"ok": False, "error": acquired_or.error.to_dict()})
+                acquired = acquired_or
 
             async def stream() -> AsyncGenerator[bytes, None]:
                 """wire 事件 + 心跳，不设整轮时长上限。
@@ -358,7 +356,8 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
                 FastAPI 的 StreamingResponse 是 pull 模型：客户端断开时生成器被取消
                 （GeneratorExit），finally 释放在途锁与上游迭代器——不重发、不 cancel。
                 """
-                release = acquired.release
+                release = acquired.release if acquired else lambda: None
+                events = None
                 pending_next = None
                 last_activity = asyncio.get_event_loop().time()
                 try:
@@ -398,7 +397,12 @@ def create_app(cfg: AppConfig | None = None) -> FastAPI:
                         await asyncio.gather(pending_next, return_exceptions=True)
                     # 客户端断开（GeneratorExit）时释放上游迭代器：不 cancel、不重发——
                     # 服务端那一轮还在跑，重发等于写两遍。
-                    release()
+                    try:
+                        if events is not None:
+                            await events.aclose()
+                        await frames_source.aclose()
+                    finally:
+                        release()
 
             headers = {
                 "content-type": f"{WIRE_CONTENT_TYPE}; charset=utf-8",

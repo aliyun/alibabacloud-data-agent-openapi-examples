@@ -26,6 +26,10 @@ from .frames import frame_from_sdk_body, pop_ack_request_id
 from .normalize import SdkError, lower_first_keys, missing_result_error, read_non_stream_body, to_api_error
 from .rid import count_frames_for_rid
 from .turn import reduce_history
+from .pop import rpc
+from .session_options import creation_options, validate_agent_name
+from .prompt_recovery import recover_prompt_frames
+from .load_recovery import read_load_snapshot
 
 JSONRPC_VERSION = "2.0"
 MAX_PAGES = 10  # 列表分页的硬上限。上游没承诺页数收敛，不设上限等于把死循环留给线上。
@@ -71,6 +75,7 @@ def create_sdk_client(cfg: AppConfig) -> SdkClient:
         Config(
             access_key_id=cfg.accessKeyId,
             access_key_secret=cfg.accessKeySecret,
+            security_token=getattr(cfg, "securityToken", None),
             region_id=cfg.regionId,
             # 留空时 SDK 按 regionId 走内置映射；非空时直接当 host，覆盖映射（预发/日常网关靠它）。
             endpoint=cfg.endpoint,
@@ -146,7 +151,8 @@ async def _agents_result(ctx: LiveContext) -> dict[str, Any]:
     }
 
 
-async def _list_sessions_result(ctx: LiveContext) -> dict[str, Any]:
+async def _list_sessions_result(ctx: LiveContext, archived: bool = False, *, agent_name: str | None = None) -> dict[str, Any]:
+    selected_agent = validate_agent_name(ctx.cfg.agentName if agent_name is None else agent_name)
     api = "ListAgentSessions"
     collected: list[dict[str, Any]] = []
     next_token: str | None = None
@@ -154,25 +160,12 @@ async def _list_sessions_result(ctx: LiveContext) -> dict[str, Any]:
     truncated = False
 
     for page in range(MAX_PAGES):
-        resp = await ctx.client.list_agent_sessions_with_options_async(
-            sdk_models.ListAgentSessionsRequest(
-                id=_next_rpc_id(),
-                jsonrpc=JSONRPC_VERSION,
-                params=sdk_models.ListAgentSessionsRequestParams(
-                    # AgentName 实测**必填**；SessionSourceList 是生效的过滤器；
-                    # SessionTitle 过滤器被**静默忽略**——所以本端点不提供 q 参数。
-                    agent_name=ctx.cfg.agentName,
-                    session_source_list=[ctx.cfg.sessionSource],
-                    max_results=PAGE_SIZE,
-                    next_token=next_token,
-                ),
-            ),
-            runtime_for(),
-        )
-        body = read_non_stream_body(resp)
-        if body["result"] is None:
-            raise missing_result_error(api, body)
-
+        response = await rpc(ctx, api, {
+            "AgentName": selected_agent, "SessionSourceList": [ctx.cfg.sessionSource],
+            "MaxResults": PAGE_SIZE, "Archived": archived,
+            **({"NextToken": next_token} if next_token else {}),
+        })
+        body = response
         total_count = total_count if total_count is not None else _num(body["result"].get("totalCount"))
         for row in body["result"].get("agentSessions", []) or []:
             summary = _to_session_summary(row)
@@ -220,7 +213,11 @@ def _to_session_summary(row: Any) -> dict[str, Any] | None:
         # 恒为 RELEASED，同样不能当运行态用。
         "status": _str(meta.get("sessionStatus")) or "UNKNOWN",
         "source": _str(meta.get("sessionSource")),
+        **({"archived": meta["archived"]} if isinstance(meta.get("archived"), bool) else {}),
         "tags": tags,
+        **{key: row[key] for key in ("hasActivePrompt", "isWaitingForPermission") if isinstance(row.get(key), bool)},
+        **({"clientCount": row["clientCount"]} if isinstance(row.get("clientCount"), int)
+           and not isinstance(row["clientCount"], bool) and row["clientCount"] >= 0 else {}),
     }
 
 
@@ -270,40 +267,34 @@ async def _artifacts_result(ctx: LiveContext, session_id: str) -> dict[str, Any]
 
 
 async def _cancel_result(ctx: LiveContext, session_id: str) -> dict[str, Any]:
-    """cancel。【LIVE 09-18】上游已会真正取消：HTTP 200 + 流以 stopReason=cancelled 收场。
+    """Use explicit flags or the verified matching-session legacy ACK.
 
-    `delivered` = 上游接受了取消请求（HTTP 200）。取消失败的处置是让调用方知道
-    "没取消成"，而不是收到一个 5xx——所以异常记进 detail 透给前端，不当异常抛。
+    The generic transport retains JSON-RPC Error that the old SDK model drops.
+    A successful idle no-op is distinct from delivery to an active daemon turn.
     """
-    api = "CancelAgentSession"
-    upstream = "调用未返回"
-    status: int | None = None
-    try:
-        resp = await ctx.client.cancel_agent_session_with_options_async(
-            sdk_models.CancelAgentSessionRequest(
-                id=_next_rpc_id(), jsonrpc=JSONRPC_VERSION, params=sdk_models.CancelAgentSessionRequestParams(session_id=session_id)
-            ),
-            runtime_for(),
-        )
-        body = read_non_stream_body(resp)
-        status = body["statusCode"]
-        upstream = f"HTTP {status if status is not None else '?'}"
-    except Exception as err:  # noqa: BLE001
-        upstream = to_api_error(err if isinstance(err, Exception) else RuntimeError(str(err)), api).message
-
-    delivered = status == 200
-    detail = (
-        (
-            f"已向上游发出 {api}（{upstream}），取消请求已被接受。"
-            "若当时有执行中的轮次，流会以 `stopReason=cancelled` 终态收场"
-            "（实测 3/3：1200 字长文在 432 字处被截断；空闲会话上取消是 no-op）。"
-            "注意：cancelled 终态目前不落库——稍后 LoadAgentSession 里那一轮 "
-            "`terminated=false`、无 stopReason，属上游已知缺口，不代表取消失败。"
-        )
-        if delivered
-        else f"已向上游发出 {api} 但未获 200（本次结果：{upstream}）。取消未确认生效：那一轮可能仍在执行，结果稍后拉历史确认。"
-    )
-    return {"delivered": delivered, "warning": "cancel-accepted" if delivered else "cancel-upstream-error", "detail": detail}
+    result = (await rpc(ctx, "CancelAgentSession", {"SessionId": session_id}))["result"]
+    # Legacy deployments acknowledge only the matching public SessionId. This
+    # proves acceptance, not daemon delivery, idleness, or a cancelled terminal.
+    # Never let this compatibility path override explicit false/invalid flags.
+    if set(result) == {"sessionId"} and result["sessionId"] == session_id:
+        return {
+            "accepted": True,
+            "delivered": False,
+            "warning": "cancel-accepted-legacy",
+            "detail": "上游已受理匹配会话的取消请求；未确认送达，实际终态以真实事件为准。",
+        }
+    delivered = result.get("delivered")
+    noop = result.get("noop", False)
+    if not isinstance(delivered, bool) or not isinstance(noop, bool):
+        raise SdkError(api_error("rpc_error", "CancelAgentSession: invalid Delivered/Noop result"))
+    return {
+        "delivered": delivered,
+        "noop": noop,
+        "warning": "cancel-accepted" if delivered else "cancel-noop" if noop else "cancel-upstream-error",
+        "detail": ("上游确认取消请求已送达；执行终态以真实事件为准。" if delivered
+                   else "上游确认会话空闲，取消为空操作。" if noop
+                   else "上游未确认取消请求送达，执行可能仍在继续。"),
+    }
 
 
 async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any]) -> dict[str, Any]:
@@ -376,31 +367,40 @@ async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any
     }
 
 
-async def _load_frames(ctx: LiveContext, session_id: str) -> list[dict[str, Any]]:
-    """拉一整份历史帧。独立的 30s readTimeout（RUNNING 期 load 会阻塞到轮次结束）。
-
-    Meta.BeginLogOffset 是**死参数**：传任何值都返回全量，服务端没有增量续传。
-    """
-    frames: list[dict[str, Any]] = []
+async def _load_stream(ctx: LiveContext, session_id: str, rpc_id: str, offset: int | None,
+                       timeout_ms: int) -> AsyncGenerator[dict[str, Any], None]:
+    """历史快照与在途续传分别设置读预算；BeginLogOffset 是旧 LSP 的续点。"""
     stream = ctx.client.load_agent_session_with_sse_async(
         sdk_models.LoadAgentSessionRequest(
-            id=_next_rpc_id(),
+            id=rpc_id,
             jsonrpc=JSONRPC_VERSION,
             params=sdk_models.LoadAgentSessionRequestParams(
-                session_id=session_id, meta=sdk_models.LoadAgentSessionRequestParamsMeta(is_reload=True)
+                session_id=session_id, meta=sdk_models.LoadAgentSessionRequestParamsMeta(is_reload=True, begin_log_offset=offset)
             ),
         ),
-        runtime_for(HISTORY_READ_TIMEOUT_MS),
+        runtime_for(timeout_ms),
     )
     stream = await stream if hasattr(stream, "__await__") else stream
-    async for resp in _guard_async_iterable(stream, "LoadAgentSession"):
-        # SDK 的 resp.body 是模型对象，必须 to_map() 成线格式 dict——直接交给
-        # frame_from_sdk_body 会被 is_object(dict) 拒掉，全部漏成 unrecognized（LIVE 实测）。
-        mapped = _model_to_map(_body_of(resp))
-        frame = frame_from_sdk_body(mapped)
-        if frame:
-            frames.append(frame)
-    return frames
+    try:
+        async for resp in _guard_async_iterable(stream, "LoadAgentSession"):
+            # SDK 的 resp.body 是模型对象，必须 to_map() 成线格式 dict——直接交给
+            # frame_from_sdk_body 会被 is_object(dict) 拒掉，全部漏成 unrecognized（LIVE 实测）。
+            mapped = _model_to_map(_body_of(resp))
+            frame = frame_from_sdk_body(mapped)
+            if frame:
+                yield frame
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
+
+
+async def _load_frames(ctx: LiveContext, session_id: str) -> list[dict[str, Any]]:
+    def open_stream(timeout_ms: int):
+        rpc_id = _next_rpc_id()
+        return rpc_id, _load_stream(ctx, session_id, rpc_id, None, timeout_ms)
+
+    return await read_load_snapshot(open_stream, budget_ms=HISTORY_READ_TIMEOUT_MS)
 
 
 async def _probe_result(ctx: LiveContext, session_id: str, rid: str, baseline_tokens: float | None) -> dict[str, Any]:
@@ -440,57 +440,59 @@ def _body_of(resp: Any) -> Any:
     return getattr(resp, "body", None)
 
 
-async def _create_session_result(ctx: LiveContext, mode: str) -> dict[str, Any]:
-    api = "CreateAgentSession"
-    resp = await ctx.client.create_agent_session_with_options_async(_build_create_session_request(ctx.cfg, mode), runtime_for())
-    body = read_non_stream_body(resp)
-    if body["result"] is None:
-        # 空响应体是这条接口最常见的失败形态，单独归一类：处置方式与其它 rpc_error 完全不同。
-        # 包进 SdkError 再 raise：ApiError 不是 BaseException 的子类，裸 raise 会 TypeError。
-        raise SdkError(create_empty_body_error(
-            f"{api} 返回 HTTP {body['statusCode'] if body['statusCode'] is not None else '?'} 但没有 JsonRpcResponse.Result，拿不到 SessionId"
-            + (f"（RequestId {body['requestId']}）" if body["requestId"] else "")
-            + "。实测最常见的原因是账号下没有运行中的 DataWorks 实例，或者该账号需要 RESOURCE_GROUP_ID 而没配。"
-        ))
-    session_id = _str(body["result"].get("sessionId"))
-    # **成功判据只有 SessionId 非空**。HTTP 200 + 有 Result 但 SessionId 为空，仍是失败。
+async def _create_session_result(ctx: LiveContext, mode: str | None = None, *, options: dict[str, Any] | None = None) -> dict[str, Any]:
+    selected = creation_options(ctx.cfg, options if options is not None else ({"mode": mode} if mode else {}))
+    initial = sdk_models.CreateAgentSessionRequestParamsMetaInitialConfigOptions(
+        mode=selected["mode"], model=selected.get("model"),
+        reasoning_effort=selected.get("reasoningEffort"), resource_group_id=ctx.cfg.resourceGroupId or None,
+    ).to_map()
+    response = await rpc(ctx, "CreateAgentSession", {"Meta": {
+        "Agent": {"AgentName": selected["agentName"]},
+        "Config": {"SessionSource": ctx.cfg.sessionSource,
+                   "SessionTags": [{"SessionTagCode": ctx.cfg.sessionSource}]},
+        "InitialConfigOptions": initial,
+    }})
+    session_id = _str(response["result"].get("sessionId"))
     if not session_id:
-        raise SdkError(create_empty_body_error(f"{api} 返回了 Result 但 SessionId 为空"))
-    # 一律回"结果字典"，信封 {ok,result} 由路由层包一次（双层包封会断前端与契约断言）。
-    return {"sessionId": session_id, "requestId": body["requestId"]}
+        raise SdkError(create_empty_body_error("CreateAgentSession returned an empty SessionId"))
+    return {"sessionId": session_id, "requestId": response["requestId"]}
 
 
-def _build_create_session_request(cfg: AppConfig, mode: str) -> sdk_models.CreateAgentSessionRequest:
-    """CreateAgentSession 的请求构造。
-
-    嵌套关系是血泪教训：initialConfigOptions 只存在于 meta 之下，agentName 只存在于
-    meta.agent 之下——直接往 params 上塞同名字段，to_map() 会按 names() 声明静默丢弃，
-    wire 上就是 "Params": {} 的全空请求。
-    """
-    return sdk_models.CreateAgentSessionRequest(
-        id=_next_rpc_id(),
-        jsonrpc=JSONRPC_VERSION,
-        params=sdk_models.CreateAgentSessionRequestParams(
-            meta=sdk_models.CreateAgentSessionRequestParamsMeta(
-                agent=sdk_models.CreateAgentSessionRequestParamsMetaAgent(agent_name=cfg.agentName),
-                config=sdk_models.CreateAgentSessionRequestParamsMetaConfig(
-                    session_source=cfg.sessionSource,
-                    # 类型是 Array<{SessionTagCode}> 而不是 string[]：传字符串数组会被静默忽略。
-                    session_tags=[sdk_models.CreateAgentSessionRequestParamsMetaConfigSessionTags(session_tag_code=cfg.sessionSource)],
-                ),
-                # ResourceGroupId 走 InitialConfigOptions，且上游**不校验有效性**。
-                # mode：yolo 放行全部工具授权；default 停下等人（人卡，配 /reply 回覆）。
-                initial_config_options=sdk_models.CreateAgentSessionRequestParamsMetaInitialConfigOptions(
-                    resource_group_id=cfg.resourceGroupId, mode=mode
-                ),
-            ),
-        ),
-    )
+async def _mutate_session_result(ctx: LiveContext, session_id: str, action: str, value: Any = None) -> dict[str, Any]:
+    params = {"SessionId": session_id}
+    if action == "UpdateAgentSessionTitle":
+        params["Title"] = value
+    elif action == "ArchiveAgentSession":
+        params["Archived"] = value
+    result = (await rpc(ctx, action, params))["result"]
+    if action == "UpdateAgentSessionTitle" and (not isinstance(result.get("title"), str) or not result["title"].strip()):
+        raise SdkError(api_error("rpc_error", f"{action}: missing Result.Title"))
+    if action == "ArchiveAgentSession" and result.get("archived") is not value:
+        raise SdkError(api_error("rpc_error", f"{action}: Result.Archived does not confirm the requested state"))
+    return result
 
 
 async def _prompt_frames(
     ctx: LiveContext, session_id: str, outbound_text: str, acks: list[str] | None = None
 ) -> AsyncGenerator[dict[str, Any], None]:
+    rpc_id = _next_rpc_id()
+
+    def load(offset: int, timeout_ms: int):
+        load_id = _next_rpc_id()
+        return load_id, _load_stream(ctx, session_id, load_id, offset, timeout_ms)
+
+    recovering = recover_prompt_frames(
+        rpc_id, _initial_prompt_frames(ctx, session_id, outbound_text, rpc_id, acks), load
+    )
+    try:
+        async for frame in recovering:
+            yield frame
+    finally:
+        await recovering.aclose()
+
+
+async def _initial_prompt_frames(ctx: LiveContext, session_id: str, outbound_text: str,
+                                 rpc_id: str, acks: list[str] | None = None) -> AsyncGenerator[dict[str, Any], None]:
     """发一轮 prompt，返回**线格式帧**的异步流。
 
     三件事在这里定死（与 Node 版 live.ts 相同）：
@@ -500,7 +502,7 @@ async def _prompt_frames(
     """
     stream = ctx.client.prompt_agent_session_with_sse_async(
         sdk_models.PromptAgentSessionRequest(
-            id=_next_rpc_id(),
+            id=rpc_id,
             jsonrpc=JSONRPC_VERSION,
             params=sdk_models.PromptAgentSessionRequestParams(
                 session_id=session_id,
@@ -530,6 +532,9 @@ async def _prompt_frames(
                 continue
             unrecognized += 1
     finally:
-        # 放 finally：这条生成器最常见的结束方式是被外层 return() 掉（客户端断开/330s 硬上限）。
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
+        # 放 finally：生成器可能被外层提前关闭（例如客户端断开）。
         if unrecognized > 0:
             pass  # 日志由路由层记（Python 侧没有注入 logger 的对称结构，保持契约即可）
