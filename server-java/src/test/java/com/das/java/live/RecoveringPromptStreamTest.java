@@ -127,4 +127,101 @@ class RecoveringPromptStreamTest {
         var failure = assertThrows(Normalize.DasApiException.class, () -> collect(stream));
         assertEquals("stream_break", failure.apiError().kind());
     }
+    @Test void recoveringLoadErrorUsesItsOwnAckAndPreservesExistingRecoveryPolicy() throws Exception {
+        var original = new Source(List.of("{\"RequestId\":\"prompt-pop\"}", chunk(1)));
+        var calls = new ArrayList<Long>();
+        try (var stream = new RecoveringPromptStream("prompt", original, (offset, remaining) -> {
+            calls.add(offset);
+            return new Source(List.of("{\"RequestId\":\"load-pop\"}",
+                "{\"Id\":\"load\",\"RequestId\":\"load-rid\",\"Error\":{\"message\":\"denied\"}}"));
+        }, 3, 1000, 0)) {
+            stream.next(); stream.next();
+            var error = assertThrows(Normalize.DasApiException.class, stream::next);
+            assertEquals("load-pop", error.apiError().requestId());
+            assertEquals(List.of(1L), calls);
+        }
+    }
+
+
+    @Test void recoveryDoesNotReusePromptIdWhenLoadHasNoPopMetadata() throws Exception {
+        for (boolean eof : new boolean[]{false, true}) {
+            var original = new Source(List.of("{\"RequestId\":\"prompt-pop\"}", chunk(1)));
+            try (var stream = new RecoveringPromptStream("prompt", original, (offset, remaining) ->
+                new Source(eof ? List.of() : List.of("{\"Id\":\"load\",\"RequestId\":\"load-rid\",\"Error\":{\"message\":\"denied\"}}")), 1, 1000, 0)) {
+                stream.next(); stream.next();
+                if (eof) assertNull(stream.next());
+                else assertNull(assertThrows(Normalize.DasApiException.class, stream::next).apiError().requestId());
+                assertNull(stream.requestId());
+            }
+        }
+    }
+
+    @Test void headerWinsOverExceptionMetadataAndForeignErrorsStayFiltered() throws Exception {
+        var source = new Source(List.of("{\"RequestId\":\"ack-id\"}")) {
+            public String requestId() { return "header-id"; }
+        };
+        source.error = new Normalize.DasApiException(com.das.java.core.ApiError.apiError("rpc_error", "denied").withRequestId("exception-id"));
+        try (var stream = new RecoveringPromptStream("prompt", source, (o, r) -> { throw new AssertionError(); })) {
+            assertNotNull(stream.next());
+            assertEquals("header-id", assertThrows(Normalize.DasApiException.class, stream::next).apiError().requestId());
+        }
+        var stream = new RecoveringPromptStream("prompt", new Source(List.of(chunk(1))), (o, r) -> new Source(List.of(
+            "{\"RequestId\":\"foreign-rid\",\"Error\":{\"message\":\"old turn failed\"}}", end("prompt", "turn", "end_turn"))), 1, 1000, 0);
+        assertEquals(List.of(chunk(1), end("prompt", "turn", "end_turn")), collect(stream));
+    }
+
+    @Test void lastTransportExceptionIdSurvivesExhaustionAndResetsOnNextLoad() throws Exception {
+        var calls = new ArrayList<Integer>();
+        try (var stream = new RecoveringPromptStream("prompt", new Source(List.of(chunk(1))), (o, r) -> {
+            calls.add(1);
+            var source = new Source(List.of());
+            source.error = new Normalize.DasApiException(com.das.java.core.ApiError.transport("reset").withRequestId("last-load"));
+            return source;
+        }, 1, 1000, 0)) {
+            assertNotNull(stream.next()); assertNull(stream.next());
+            assertEquals("last-load", stream.requestId()); assertEquals(1, calls.size());
+        }
+        calls.clear();
+        try (var stream = new RecoveringPromptStream("prompt", new Source(List.of(chunk(1))), (o, r) -> {
+            var source = new Source(calls.isEmpty() ? List.of("{\"RequestId\":\"old-load\"}") : List.of());
+            if (!calls.isEmpty()) source.error = new Normalize.DasApiException(com.das.java.core.ApiError.apiError("rpc_error", "denied"));
+            calls.add(1); return source;
+        }, 2, 1000, 0)) {
+            assertNotNull(stream.next());
+            assertNull(assertThrows(Normalize.DasApiException.class, stream::next).apiError().requestId());
+            assertNull(stream.requestId()); assertEquals(2, calls.size());
+        }
+    }
+
+    @Test void pipelineCannotFallbackToEarlierLoadIdWhenNewLoadFailsWithoutMetadata() throws Exception {
+        var loads = new ArrayList<Integer>();
+        var initial = new Source(List.of(chunk(1))) {
+            public String requestId() { return "prompt-header"; }
+        };
+        var pipeline = new com.das.java.web.Pipeline("session", false, 0);
+        try (var stream = new RecoveringPromptStream("prompt", initial, (offset, remaining) -> {
+            loads.add(1);
+            if (loads.size() == 1) return new Source(List.of("{\"RequestId\":\"earlier-load\"}", chunk(2)));
+            var failed = new Source(List.of());
+            failed.error = new Normalize.DasApiException(com.das.java.core.ApiError.apiError("rpc_error", "new Load denied without ID"));
+            return failed;
+        }, 2, 1000, 0)) {
+            pipeline.onFrame(JSON.readValue(stream.next(), java.util.LinkedHashMap.class));
+            pipeline.requestId(stream.requestId());
+            assertEquals("prompt-header", stream.requestId());
+            pipeline.onFrame(JSON.readValue(stream.next(), java.util.LinkedHashMap.class));
+            pipeline.requestId(stream.requestId());
+            assertEquals("earlier-load", stream.requestId());
+            var failure = assertThrows(Normalize.DasApiException.class, () -> {
+                try { stream.next(); }
+                finally { pipeline.requestId(stream.requestId()); }
+            });
+            assertEquals(2, loads.size());
+            assertNull(failure.apiError().requestId());
+            assertNull(stream.requestId());
+            var event = pipeline.onError(failure, "PromptAgentSession");
+            assertFalse(((Map<?, ?>) event.get("error")).containsKey("requestId"));
+            assertFalse(((Map<?, ?>) pipeline.finish(List.of("earlier-load")).get("error")).containsKey("requestId"));
+        }
+    }
 }

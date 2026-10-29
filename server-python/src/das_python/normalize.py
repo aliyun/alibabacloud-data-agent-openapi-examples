@@ -15,12 +15,14 @@ Python 侧的两族异常（与 Node 的 ResponseError/AlibabaCloudError 对应�
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from alibabacloud_tea_openapi import exceptions as openapi_exceptions
 from darabonba.exceptions import DaraException
 
-from .errors import ApiError, classify_error, redact_api_error
+from .errors import ApiError, classify_error, initial_config_error_message, redact_api_error, safe_request_id
 
 
 class SdkError(Exception):
@@ -33,7 +35,40 @@ class SdkError(Exception):
 
 def to_api_error(err: Exception, api_name: str) -> ApiError:
     """SDK / 传输层抛出的一切 → ApiError（已脱敏、已带 API 名）。"""
-    return redact_api_error(_with_api(_raw(err), api_name))
+    return redact_api_error(_with_api(with_request_id(_raw(err), remote_request_id(err)), api_name))
+
+
+def with_request_id(error: ApiError, request_id: Any, *, prefer: bool = False) -> ApiError:
+    trusted = safe_request_id(request_id)
+    return replace(error, requestId=(trusted or error.requestId) if prefer else (error.requestId or trusted))
+
+
+def _sdk_request_id(value: Any) -> str | None:
+    attribute = getattr(value, "request_id", None)
+    data = getattr(value, "data", None)
+    if isinstance(data, Mapping):
+        # Tea stringifies missing/non-string IDs; never expose that coercion.
+        raw_id = data.get("RequestId") or data.get("requestId") or data.get("requestid")
+        if not safe_request_id(raw_id) and attribute == str(raw_id):
+            return None
+    return safe_request_id(attribute)
+
+
+def remote_request_id(value: Any) -> str | None:
+    """Read only SDK POP fields and allowlisted response headers, never rid/card IDs."""
+    data = getattr(value, "data", None)
+    response = getattr(value, "response", None)
+    candidates = [_sdk_request_id(value)]
+    if isinstance(data, Mapping):
+        candidates.extend(data.get(key) for key in ("RequestId", "requestId"))
+    headers = [value.get("headers") if isinstance(value, Mapping) else getattr(value, "headers", None),
+               data.get("headers") if isinstance(data, Mapping) else None,
+               response.get("headers") if isinstance(response, Mapping) else getattr(response, "headers", None)]
+    for header in headers:
+        if isinstance(header, Mapping):
+            candidates.extend(v for k, v in header.items() if isinstance(k, str)
+                              and k.lower() == "x-acs-request-id")
+    return next((rid for candidate in candidates if (rid := safe_request_id(candidate))), None)
 
 
 def _raw(err: Exception) -> ApiError:
@@ -68,7 +103,13 @@ def _describe_upstream(err: Exception) -> str:
     parts: list[str] = []
     message = getattr(err, "message", None)
     if message:
-        parts.append(str(message))
+        text = str(message)
+        raw_id = getattr(err, "request_id", None)
+        if isinstance(raw_id, str) and _sdk_request_id(err) is None:
+            # The SDK appends the ID to its message before validation. Remove
+            # only that known suffix when it contains an unsafe/coerced value.
+            text = text.removesuffix(f" request id: {raw_id}")
+        parts.append(text)
     code = getattr(err, "code", None)
     if code:
         parts.append(f"code={code}")
@@ -88,7 +129,7 @@ def _describe_upstream(err: Exception) -> str:
                 parts.append(f"accessDeniedDetail={json.dumps(access_denied, ensure_ascii=False)}")
             except (TypeError, ValueError):
                 parts.append(f"accessDeniedDetail={access_denied}")
-    request_id = getattr(err, "request_id", None) or (data.get("requestId") if isinstance(data, dict) else None)
+    request_id = _sdk_request_id(err) or (safe_request_id(data.get("requestId")) if isinstance(data, dict) else None)
     if request_id:
         parts.append(f"requestId={request_id}")
     retry_after = getattr(err, "retry_after", None)
@@ -147,11 +188,9 @@ def lower_first_keys(value: Any) -> Any:
 def read_non_stream_body(resp: Any) -> dict[str, Any]:
     """读非流式响应体。
 
-    **必须如实交代的一条限制**：非流式的响应模型只声明了 {id, jsonrpc, result}，
-    没有 error 字段，SDK 的 cast 会**静默丢弃模型未声明的键**——实测含
-    `JsonRpcResponse.Error` 的响应体过一遍 cast，Error 整个消失。
-    后果：非流式调用的"业务错误"与"空响应体"在 SDK 层**不可区分**。
-    所以这里绝不编造 code/message，只报告"Result 缺失"+ RequestId。
+    当前生成模型保留 JsonRpcResponse.Error，先处理业务错误再读取 Result。
+    旧版本模型可能在 cast 时丢弃未声明的 Error；详情已丢弃时只报告 Result 缺失
+    和 RequestId，不编造错误原因。
 
     Python 侧用 `body.to_map()` 取线格式 dict（PascalCase 键），Result 一律
     过 lower_first_keys 归一为 camelCase——与 Node 读 resp.body 的字段访问等价；
@@ -161,14 +200,28 @@ def read_non_stream_body(resp: Any) -> dict[str, Any]:
     request_id: Any = getattr(body, "request_id", None) if body is not None else None
     rpc = getattr(body, "jsonRpcResponse", None) or getattr(body, "json_rpc_response", None)
     result: Any = getattr(rpc, "result", None) if rpc is not None else None
+    error = getattr(rpc, "error", None)
+    if callable(getattr(error, "to_map", None)):
+        error = lower_first_keys(error.to_map())
 
     to_map = getattr(body, "to_map", None)
     mapped = to_map() if callable(to_map) else None
     if isinstance(mapped, dict):
-        request_id = mapped.get("RequestId") or request_id
+        request_id = safe_request_id(mapped.get("RequestId")) or request_id
         rpc_map = mapped.get("JsonRpcResponse") or {}
         if isinstance(rpc_map, dict) and rpc_map.get("Result") is not None:
             result = lower_first_keys(rpc_map["Result"])
+        if isinstance(rpc_map, dict) and isinstance(rpc_map.get("Error"), dict):
+            error = lower_first_keys(rpc_map["Error"])
+
+    request_id = safe_request_id(request_id) or remote_request_id(resp)
+    if isinstance(error, dict):
+        raise SdkError(redact_api_error(classify_error(
+            message=initial_config_error_message(error, "unknown error"),
+            code=error.get("code") if isinstance(error.get("code"), int) else None,
+            errorCode=error.get("errorCode") if isinstance(error.get("errorCode"), str) else None,
+            requestId=request_id,
+        )))
 
     status = getattr(resp, "status_code", None)
     if not isinstance(status, int):
@@ -176,7 +229,7 @@ def read_non_stream_body(resp: Any) -> dict[str, Any]:
 
     return {
         "statusCode": status,
-        "requestId": request_id if isinstance(request_id, str) else None,
+        "requestId": request_id,
         "result": result if isinstance(result, dict) else None,
     }
 
@@ -190,7 +243,7 @@ def missing_result_error(api_name: str, body: dict[str, Any]) -> SdkError:
     from .errors import api_error
 
     status = body.get("statusCode")
-    request_id = body.get("requestId")
+    request_id = safe_request_id(body.get("requestId"))
     return SdkError(
         api_error(
             "rpc_error",
@@ -198,5 +251,6 @@ def missing_result_error(api_name: str, body: dict[str, Any]) -> SdkError:
             "非流式响应模型未声明 Error 字段，SDK 的 cast 已把错误详情丢弃，所以这里拿不到 code 与 message"
             + (f"。可用 RequestId {request_id} 到控制台或工单查这次调用" if request_id else "")
             + ".",
+            requestId=request_id,
         )
     )

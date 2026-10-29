@@ -15,7 +15,7 @@ from ..marker import strip_marker_instruction
 from ..normalize import to_api_error
 from ..pop import session_events
 from ..session_options import creation_options, validate_agent_name
-from .events import OPENAPI_ANSWERS_OPTION, turn_error_event
+from .events import OPENAPI_ANSWERS_OPTION
 from .registry import WORKSPACE_CWD
 from .routes import _body, _error, _iso, _json, _not_found
 from .translate import history_frames_to_events
@@ -55,7 +55,8 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
             result = await _list_sessions_result(live, archived=archiveState == "archived", agent_name=selected_agent)
             return {"sessions": [_summary(row) for row in result["sessions"]]}
         except Exception as exc:
-            return _error(502, to_api_error(exc, "ListAgentSessions").message, "list_failed")
+            error = to_api_error(exc, "ListAgentSessions")
+            return _error(502, error.message, "list_failed", error.requestId)
 
     @app.post("/d/standalone/sessions")
     async def create_session(request: Request) -> Any:
@@ -68,7 +69,8 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
             result = await _create_session_result(live, options=body)
             return _session_body(result["sessionId"], result.get("createdAt"))
         except Exception as exc:
-            return _error(502, to_api_error(exc, "CreateAgentSession").message, "create_failed")
+            error = to_api_error(exc, "CreateAgentSession")
+            return _error(502, error.message, "create_failed", error.requestId)
 
     @app.get("/d/standalone/sessions/{session_id}")
     async def get_session(session_id: str, agentName: str | None = None) -> Any:
@@ -88,7 +90,8 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
                     return _error(502, "Remote directory lookup was truncated", "lookup_incomplete")
             return _not_found(session_id)
         except Exception as exc:
-            return _error(502, to_api_error(exc, "ListAgentSessions").message, "lookup_failed")
+            error = to_api_error(exc, "ListAgentSessions")
+            return _error(502, error.message, "lookup_failed", error.requestId)
 
     async def load_history(session_id: str, transcript: bool = False) -> Any:
         try:
@@ -96,7 +99,7 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
             events = history_frames_to_events(frames, session_id)
         except Exception as exc:
             error = to_api_error(exc, "LoadAgentSession")
-            return _error(502 if error.kind == "transport" else 404, error.message, "load_failed")
+            return _error(502 if error.kind == "transport" else 404, error.message, "load_failed", error.requestId)
         if transcript:
             return {"v": 1, "sessionId": session_id, "events": events, "hasMore": False}
         return {**_session_body(session_id),
@@ -125,7 +128,8 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
             result = await _mutate_session_result(live, session_id, "UpdateAgentSessionTitle", title)
             return {"sessionId": session_id, "displayName": result.get("title", title)}
         except Exception as exc:
-            return _error(502, to_api_error(exc, "UpdateAgentSessionTitle").message, "rename_failed")
+            error = to_api_error(exc, "UpdateAgentSessionTitle")
+            return _error(502, error.message, "rename_failed", error.requestId)
 
     async def batch_mutate(action: str, request: Request) -> dict[str, Any]:
         raw_ids = (await _body(request) or {}).get("sessionIds")
@@ -137,7 +141,9 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
                 await _mutate_session_result(live, sid, api, action == "archive")
                 done.append(sid)
             except Exception as exc:
-                errors.append({"sessionId": sid, "code": "upstream_error", "message": to_api_error(exc, api).message})
+                error = to_api_error(exc, api)
+                errors.append({"sessionId": sid, "code": "upstream_error", "message": error.message,
+                               **({"requestId": error.requestId} if error.requestId else {})})
         if action == "delete":
             return {"removed": done, "notFound": [], "errors": errors, "fileCleanupPending": []}
         key, already = ("archived", "alreadyArchived") if action == "archive" else ("unarchived", "alreadyActive")
@@ -161,7 +167,8 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
             await _mutate_session_result(live, session_id, "DeleteAgentSession")
             return Response(status_code=204)
         except Exception as exc:
-            return _error(502, to_api_error(exc, "DeleteAgentSession").message, "delete_failed")
+            error = to_api_error(exc, "DeleteAgentSession")
+            return _error(502, error.message, "delete_failed", error.requestId)
 
     @app.post("/d/session/{session_id}/prompt")
     @app.post("/d/session/{session_id}/openapi-prompt/{prompt_id}/receipt")
@@ -173,10 +180,11 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
         try:
             result = await _cancel_result(live, session_id)
             if not any(result.get(flag) for flag in ("accepted", "delivered", "noop")):
-                return _error(502, result.get("detail") or "Cancellation was not confirmed", "cancel_failed")
+                return _error(502, result.get("detail") or "Cancellation was not confirmed", "cancel_failed", result.get("requestId"))
             return Response(status_code=204)
         except Exception as exc:
-            return _error(502, to_api_error(exc, "CancelAgentSession").message, "cancel_failed")
+            error = to_api_error(exc, "CancelAgentSession")
+            return _error(502, error.message, "cancel_failed", error.requestId)
 
     @app.get("/d/session/{session_id}/events")
     async def events(request: Request, session_id: str) -> Any:
@@ -184,7 +192,16 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
         if cursor is not None and (not cursor.isascii() or not cursor.isdecimal()
                                    or len(cursor) > 20 or int(cursor) > 2**53 - 1):
             return _error(400, "Invalid Events cursor", "invalid_event_cursor")
-        return StreamingResponse(_remote_sse_stream(live, session_id, cursor), media_type="text/event-stream", headers={
+        upstream = session_events(live, session_id, cursor, expose_headers=True)
+        try:
+            first = await anext(upstream, None)
+        except Exception as exc:
+            await upstream.aclose()
+            error = to_api_error(exc, "GetAgentSessionEvents")
+            return _error(502, error.message, "events_upstream_error", error.requestId)
+        response_headers = first.get("responseHeaders", {}) if first else {}
+        return StreamingResponse(_remote_sse_stream(live, session_id, cursor, upstream=upstream), media_type="text/event-stream", headers={
+            **response_headers,
             "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no",
             "X-Qwen-Event-Epoch": _remote_epoch(cfg, session_id), "X-Qwen-Sse-Stream-Id": uuid.uuid4().hex})
 
@@ -219,9 +236,10 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
         try:
             result = await _reply_result(live, session_id, {"permissionRequestId": request_id,
                 "answers": answers, "optionId": option or None, "outcome": kind})
-            return {} if result.get("accepted") else _error(404, "Remote permission was not accepted", "permission_not_accepted")
+            return {} if result.get("accepted") else _error(404, "Remote permission was not accepted", "permission_not_accepted", result.get("requestId"))
         except Exception as exc:
-            return _error(502, to_api_error(exc, "ReplyAgentSession").message, "permission_upstream_error")
+            error = to_api_error(exc, "ReplyAgentSession")
+            return _error(502, error.message, "permission_upstream_error", error.requestId)
 
     @app.post("/d/permission/{request_id}")
     async def sidless_permission(request_id: str) -> Any:
@@ -236,9 +254,10 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
         return _error(404, "Unsupported daemon route", "not_implemented")
 
 
-async def _remote_sse_stream(live: LiveContext, session_id: str, last_event_id: str | None):
-    # session_events retains POP wrapper decoding, sid validation and cursor mapping.
-    upstream = session_events(live, session_id, last_event_id)
+async def _remote_sse_stream(live: LiveContext, session_id: str, last_event_id: str | None, *, upstream=None):
+    # After commit, propagate disconnects; never manufacture a remote terminal.
+    if upstream is None:
+        upstream = session_events(live, session_id, last_event_id)
     try:
         async for envelope in upstream:
             if envelope.get("heartbeat"):
@@ -251,9 +270,5 @@ async def _remote_sse_stream(live: LiveContext, session_id: str, last_event_id: 
                 raise ValueError("invalid Events event name")
             prefix = f"id: {cursor}\n" if cursor is not None else ""
             yield f"{prefix}event: {event}\ndata: {_json(data)}\n\n"
-    except Exception as exc:
-        error = to_api_error(exc, "GetAgentSessionEvents")
-        event = turn_error_event(session_id, error.message, code="events_upstream_error")
-        yield f"event: turn_error\ndata: {_json(event)}\n\n"
     finally:
         await upstream.aclose()

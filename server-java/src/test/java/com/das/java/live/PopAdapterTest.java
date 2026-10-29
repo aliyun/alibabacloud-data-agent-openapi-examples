@@ -39,6 +39,7 @@ class PopAdapterTest {
     private volatile String reply;
     private volatile int status = 200;
     private volatile boolean streaming;
+    private volatile String headerRequestId;
     private java.util.function.Function<Map<String, String>, String> responseBody;
 
     @BeforeEach void start() throws Exception {
@@ -52,6 +53,7 @@ class PopAdapterTest {
             request.put("cursor", exchange.getRequestHeaders().getFirst("Last-Event-Id"));
             requests.offer(request);
             exchange.getResponseHeaders().set("Content-Type", streaming ? "text/event-stream" : "application/json");
+            if (headerRequestId != null) exchange.getResponseHeaders().set("x-acs-request-id", headerRequestId);
             byte[] body = (responseBody == null ? reply : responseBody.apply(request)).getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(status, body.length);
             // Deliberately split Unicode and SSE lines across chunks.
@@ -176,6 +178,96 @@ class PopAdapterTest {
             JsonNode meta = JSON.readTree(request().get("Params")).path("Meta");
             assertEquals("custom-agent", meta.path("Agent").path("AgentName").asText());
             assertEquals(JSON.readTree("{\"Model\":\"model(openai)\",\"Mode\":\"plan\",\"ReasoningEffort\":\"high\"}"), meta.path("InitialConfigOptions"));
+        }
+    }
+
+    private void initialConfigError(Map<String, Object> error) throws Exception {
+        reply = JSON.writeValueAsString(Map.of("RequestId", "config-request-id", "JsonRpcResponse", Map.of("Error", error)));
+    }
+
+    @Test void generatedCreateSdkAndBrowserRouteExposeOnlyKnownInitialConfigReasons() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient())) {
+            var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+                new com.das.java.daemon.DaemonController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight())).build();
+            for (String reason : List.of("capabilities_unavailable", "ambiguous_model", "model_not_available", "reasoning_not_available")) {
+                for (boolean byCode : List.of(true, false)) {
+                    initialConfigError(Map.of("Code", 400,
+                        "ErrorCode", byCode ? "INVALID_SESSION_INITIAL_CONFIG" : "OTHER_ERROR",
+                        "Message", byCode ? "Configuration rejected" : "INVALID_SESSION_INITIAL_CONFIG",
+                        "Data", Map.of("reason", reason, "token", "fixture-secret", "messages", List.of("private diagnostic"))));
+                    var response = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .post("/d/standalone/sessions").contentType("application/json")
+                        .content("{\"modelServiceId\":\"deepseek-v4-flash-0731\",\"approvalMode\":\"yolo\"}"))
+                        .andReturn().getResponse();
+                    assertEquals(502, response.getStatus());
+                    var body = JSON.readTree(response.getContentAsString());
+                    String expected = "CreateAgentSession: " + (byCode ? "Configuration rejected" : "INVALID_SESSION_INITIAL_CONFIG")
+                        + " (reason=" + reason + ") | requestId=config-request-id";
+                    assertEquals(expected, body.path("error").asText());
+                    assertEquals("config-request-id", body.path("requestId").asText());
+                    assertFalse(response.getContentAsString().contains("fixture-secret"));
+                    assertFalse(response.getContentAsString().contains("private diagnostic"));
+                    var sent = request();
+                    assertEquals("CreateAgentSession", sent.get("action"));
+                    var initial = JSON.readTree(sent.get("Params")).path("Meta").path("InitialConfigOptions");
+                    assertEquals("deepseek-v4-flash-0731", initial.path("Model").asText());
+                    assertEquals("yolo", initial.path("Mode").asText());
+                    assertFalse(initial.has("ReasoningEffort"));
+                }
+            }
+        }
+    }
+
+    @Test void genericRpcAcceptsDataMapCasingButRejectsOtherErrorsAndUnsafeReasons() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient())) {
+            for (String key : List.of("Data", "data")) {
+                initialConfigError(Map.of("ErrorCode", "INVALID_SESSION_INITIAL_CONFIG", "Message", "rejected",
+                    key, Map.of("reason", "model_not_available", "token", "fixture-secret")));
+                var error = assertThrows(Normalize.DasApiException.class, () -> client.deleteSession("s")).apiError();
+                assertEquals("DeleteAgentSession: rejected (reason=model_not_available) | requestId=config-request-id", error.message());
+                assertEquals("config-request-id", error.requestId());
+                assertEquals("DeleteAgentSession", request().get("action"));
+            }
+            for (Object diagnostics : List.of(
+                Map.of("reason", "unknown-fixture-secret"), Map.of("reason", "model_not_available\nfixture-secret"),
+                Map.of("reason", "MODEL_NOT_AVAILABLE"), Map.of("reason", " model_not_available"),
+                Map.of("reason", Map.of("token", "fixture-secret")), Map.of("reason", 123),
+                Map.of("messages", List.of("fixture-secret")), List.of("fixture-secret"), "fixture-secret")) {
+                initialConfigError(Map.of("ErrorCode", "INVALID_SESSION_INITIAL_CONFIG", "Message", "rejected", "Data", diagnostics));
+                var error = assertThrows(Normalize.DasApiException.class, () -> client.deleteSession("s")).apiError();
+                assertEquals("DeleteAgentSession: rejected | requestId=config-request-id", error.message());
+                assertEquals("config-request-id", error.requestId());
+                request();
+            }
+            initialConfigError(Map.of("ErrorCode", "INVALID_SESSION_INITIAL_CONFIG_SUFFIX", "Message", "prefix INVALID_SESSION_INITIAL_CONFIG",
+                "Data", Map.of("reason", "model_not_available", "token", "fixture-secret")));
+            var error = assertThrows(Normalize.DasApiException.class, () -> client.deleteSession("s")).apiError();
+            assertEquals("DeleteAgentSession: prefix INVALID_SESSION_INITIAL_CONFIG | requestId=config-request-id", error.message());
+            request();
+        }
+    }
+
+    @Test void generatedCreateRouteDoesNotExposeUnknownReasonsOrArbitraryData() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient())) {
+            var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+                new com.das.java.daemon.DaemonController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight())).build();
+            for (Map<String, Object> error : List.of(
+                Map.<String, Object>of("ErrorCode", "INVALID_SESSION_INITIAL_CONFIG", "Message", "INVALID_SESSION_INITIAL_CONFIG",
+                    "Data", Map.of("reason", "unknown-fixture-secret", "token", "fixture-secret")),
+                Map.<String, Object>of("ErrorCode", "OTHER_ERROR", "Message", "prefix INVALID_SESSION_INITIAL_CONFIG",
+                    "Data", Map.of("reason", "model_not_available", "messages", List.of("fixture-secret"))),
+                Map.<String, Object>of("ErrorCode", "INVALID_SESSION_INITIAL_CONFIG", "Message", "INVALID_SESSION_INITIAL_CONFIG"))) {
+                initialConfigError(error);
+                var response = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                    .post("/d/standalone/sessions").contentType("application/json").content("{}"))
+                    .andReturn().getResponse();
+                assertEquals(502, response.getStatus());
+                var body = JSON.readTree(response.getContentAsString());
+                assertEquals("CreateAgentSession: " + error.get("Message") + " | requestId=config-request-id", body.path("error").asText());
+                assertEquals("config-request-id", body.path("requestId").asText());
+                assertFalse(response.getContentAsString().contains("fixture-secret"));
+                request();
+            }
         }
     }
 
@@ -454,4 +546,202 @@ class PopAdapterTest {
         }
     }
 
+    @Test void errorMetadataSurvivesSdk403RpcRejectionMissingResultAndRedaction() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient())) {
+            status = 403;
+            reply = "{\"Code\":\"Forbidden\",\"Message\":\"denied LTAIsecret123\",\"RequestId\":\"pop-403\",\"Extra\":\"must-not-leak\"}";
+            var forbidden = assertThrows(Normalize.DasApiException.class, () -> client.deleteSession("s")).apiError();
+            assertEquals("pop-403", forbidden.requestId());
+            assertEquals(403, forbidden.upstreamStatus());
+            assertFalse(forbidden.message().contains("LTAIsecret123"));
+            assertFalse(forbidden.message().contains("must-not-leak"));
+            assertEquals("DeleteAgentSession", request().get("action"));
+            status = 200;
+            for (String rpc : List.of("{\"Error\":{\"Code\":403,\"Message\":\"denied LTAIsecret123\"}}", "{}")) {
+                reply = "{\"RequestId\":\"pop-200\",\"JsonRpcResponse\":" + rpc + "}";
+                var error = assertThrows(Normalize.DasApiException.class, () -> client.renameSession("s", "t")).apiError();
+                assertEquals("pop-200", error.toMap().get("requestId"));
+                assertFalse(error.message().contains("LTAIsecret123"));
+                request();
+            }
+            reply = "{\"RequestId\":\"empty-create\",\"JsonRpcResponse\":{\"Result\":{}}}";
+            assertEquals("empty-create", assertThrows(Normalize.DasApiException.class,
+                () -> client.createSession("yolo")).apiError().requestId());
+            request();
+            headerRequestId = "header-only";
+            reply = "{}";
+            assertEquals("header-only", assertThrows(Normalize.DasApiException.class,
+                () -> client.renameSession("s", "t")).apiError().requestId());
+            request();
+            headerRequestId = null;
+            for (Object invalid : List.of("", " ", "bad\nID", "x".repeat(257), 123, Map.of("id", "fake"))) {
+                reply = JSON.writeValueAsString(Map.of("RequestId", invalid, "JsonRpcResponse", Map.of()));
+                assertFalse(assertThrows(Normalize.DasApiException.class,
+                    () -> client.deleteSession("s")).apiError().toMap().containsKey("requestId"));
+                request();
+            }
+            reply = "{\"JsonRpcResponse\":{\"Result\":{\"requestId\":\"business-id\"}}}";
+            assertFalse(client.cancel("s").containsKey("requestId"));
+            request();
+            assertTrue(requests.isEmpty(), "Error metadata must not introduce retries");
+        }
+    }
+
+    private org.springframework.test.web.servlet.MockMvc routes(LiveClient client) {
+        return org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+            new com.das.java.daemon.DaemonController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight())).build();
+    }
+
+    @Test void daemonCreateAndLoadWireErrorsCarryOnlyPopMetadata() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            var mvc = routes(client);
+            reply = "{\"RequestId\":\"create-pop\",\"JsonRpcResponse\":{\"Error\":{\"Message\":\"denied\"}}}";
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/d/standalone/sessions")
+                .contentType("application/json").content("{}"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadGateway())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.requestId").value("create-pop"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.error").isString());
+            request();
+            streaming = true;
+            for (boolean header : new boolean[]{true, false}) {
+                headerRequestId = header ? "load-header" : null;
+                // An ACP error's RequestId is the turn rid, never a POP ID.
+                reply = "data: {\"RequestId\":\"turn-rid\",\"Error\":{\"code\":403,\"message\":\"denied\"}}\n\n";
+                var result = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/d/standalone/sessions/s/load"))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadGateway()).andReturn();
+                var body = JSON.readTree(result.getResponse().getContentAsString());
+                if (header) assertEquals("load-header", body.path("requestId").asText());
+                else assertFalse(body.has("requestId"));
+                assertTrue(body.path("error").isTextual());
+                request();
+            }
+            headerRequestId = null;
+            reply = "data: {\"RequestId\":\"load-ack\"}\n\ndata: {\"Error\":{\"message\":\"denied\"}}\n\n";
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/d/standalone/sessions/s/load"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.requestId").value("load-ack"));
+            request();
+            assertTrue(requests.isEmpty());
+        }
+    }
+
+    @Test void ndjsonWireCarriesHeaderOrAckForErrorAndEofWithoutUsingTurnOrPermissionIds() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            var controller = new com.das.java.web.PromptApiController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight());
+            streaming = true;
+            for (String source : List.of("header", "ack", "none")) for (boolean error : new boolean[]{true, false}) {
+                headerRequestId = "header".equals(source) ? "prompt-header" : null;
+                reply = ("ack".equals(source) ? "data: {\"RequestId\":\"prompt-ack\"}\n\n" : "")
+                    + (error ? "data: {\"RequestId\":\"turn-rid\",\"Error\":{\"message\":\"denied LTAIsecret123\"}}\n\n"
+                    : "data: {\"RequestId\":\"turn-rid\",\"Id\":\"event-id\",\"Method\":\"_qwen/notify\",\"Params\":{\"kind\":\"permission_request\",\"data\":{\"requestId\":\"permission-id\"}}}\n\n");
+                var response = new org.springframework.mock.web.MockHttpServletResponse();
+                controller.prompt("s", Map.of("text", "question"), response);
+                var events = response.getContentAsString().lines().map(line -> {
+                    try { return JSON.readTree(line); } catch (Exception e) { throw new RuntimeException(e); }
+                }).toList();
+                var failure = events.stream().filter(event -> "error".equals(event.path("type").asText())).findFirst().orElseThrow().path("error");
+                if ("none".equals(source)) assertFalse(failure.has("requestId"));
+                else assertEquals("header".equals(source) ? "prompt-header" : "prompt-ack", failure.path("requestId").asText());
+                assertFalse(failure.path("message").asText().contains("LTAIsecret123"));
+                assertFalse(events.stream().anyMatch(event -> "done".equals(event.path("type").asText())));
+                assertEquals("PromptAgentSession", request().get("action"));
+                assertTrue(requests.isEmpty(), "No re-prompt, cancel or load without positioned frames");
+            }
+        }
+    }
+
+
+    @Test void generatedSseParseFailureBeforeFirstFrameKeepsHeaderWithoutUsingRid() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            streaming = true; headerRequestId = "parse-pop"; reply = "data: not-json\n\n";
+            var controller = new com.das.java.web.PromptApiController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight());
+            var response = new org.springframework.mock.web.MockHttpServletResponse();
+            org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(Duration.ofSeconds(10), () ->
+                controller.prompt("s", Map.of("text", "synthetic"), response));
+            var events = response.getContentAsString().lines().map(line -> {
+                try { return JSON.readTree(line); } catch (Exception e) { throw new RuntimeException(e); }
+            }).toList();
+            var error = events.stream().filter(event -> "error".equals(event.path("type").asText())).findFirst().orElseThrow().path("error");
+            assertEquals("parse-pop", error.path("requestId").asText());
+            assertFalse(events.stream().anyMatch(event -> "done".equals(event.path("type").asText())));
+            assertEquals("PromptAgentSession", request().get("action"));
+            assertTrue(requests.isEmpty());
+        }
+    }
+
+    @Test void eventsNonSuccessIsSafePrecommitJsonWithHeaderOrBodyRequestId() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            var controller = new com.das.java.daemon.DaemonController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight());
+            for (boolean header : new boolean[]{true, false}) {
+                status = 403; headerRequestId = header ? "header-pop" : null;
+                reply = "{\"RequestId\":\"body-pop\",\"Message\":\"private SDK dump\",\"credentials\":\"private-secret\"}";
+                var response = new org.springframework.mock.web.MockHttpServletResponse();
+                controller.events("s", null, null, response);
+                assertEquals(502, response.getStatus());
+                assertEquals(header ? "header-pop" : "body-pop", JSON.readTree(response.getContentAsString()).path("requestId").asText());
+                assertFalse(response.getContentAsString().contains("private"));
+                assertEquals("GetAgentSessionEvents", request().get("action"));
+                assertTrue(requests.isEmpty());
+            }
+        }
+    }
+
+    @Test void sseHeaderBeatsDifferentAckAndTruncatedPayloadStillCarriesIt() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            streaming = true; headerRequestId = "header-pop";
+            reply = "data: {\"RequestId\":\"ack-pop\"}\n\ndata: {\"RequestId\":\"turn-rid\",\"Error\":{\"message\":\"denied\"}}\n\n";
+            var controller = new com.das.java.web.PromptApiController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight());
+            var response = new org.springframework.mock.web.MockHttpServletResponse();
+            controller.prompt("s", Map.of("text", "synthetic"), response);
+            assertTrue(response.getContentAsString().contains("\"requestId\":\"header-pop\""));
+            assertFalse(response.getContentAsString().contains("\"requestId\":\"ack-pop\""));
+            request();
+            reply = "data: {\"RequestId\":\"turn-rid\",\"Params\":{}}\n\ndata: {";
+            response = new org.springframework.mock.web.MockHttpServletResponse();
+            controller.prompt("s", Map.of("text", "synthetic"), response);
+            assertTrue(response.getContentAsString().contains("\"requestId\":\"header-pop\""));
+            assertFalse(response.getContentAsString().contains("\"type\":\"done\""));
+            request(); assertTrue(requests.isEmpty());
+        }
+    }
+
+    @Test void sdkHttp403DoesNotInventIdWhenSdkDropsHeaderOnlyMetadata() throws Exception {
+        status = 403; headerRequestId = "header-403";
+        reply = "{\"Code\":\"Forbidden\",\"Message\":\"denied\"}";
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            var error = assertThrows(Normalize.DasApiException.class, () -> client.deleteSession("s")).apiError();
+            assertNull(error.requestId(), "Pinned SDK does not expose header-only metadata on ordinary HTTP failures");
+            request();
+            error = assertThrows(Normalize.DasApiException.class, () -> client.createSession("yolo")).apiError();
+            assertNull(error.requestId(), "Pinned SDK does not expose header-only metadata on ordinary HTTP failures");
+            request();
+            error = assertThrows(Normalize.DasApiException.class, () -> client.reply("s",
+                Map.of("permissionRequestId", "card-id", "outcome", "cancelled"))).apiError();
+            assertNull(error.requestId(), "Pinned SDK does not expose header-only metadata on ordinary HTTP failures");
+            request(); assertTrue(requests.isEmpty());
+        }
+    }
+
+    @Test void generatedSseHttp403KeepsStandardSdkIdWithoutLeakingIntoNextRpc() throws Exception {
+        try (LiveClient client = new LiveClient(cfg(), adapter, sdkClient(), sdkClient())) {
+            status = 403; headerRequestId = null;
+            reply = "{\"Code\":\"Forbidden\",\"Message\":\"denied\",\"RequestId\":\"sdk-body-403\"}";
+            var failure = assertThrows(Normalize.DasApiException.class, () -> client.loadFrames("s"));
+            assertEquals("sdk-body-403", failure.apiError().requestId());
+            request(); assertTrue(requests.isEmpty(), "Load business rejection must not retry");
+            var controller = new com.das.java.web.PromptApiController(cfg(), new LiveClientHolder(client), new com.das.java.web.Inflight());
+            var response = new org.springframework.mock.web.MockHttpServletResponse();
+            controller.prompt("s", Map.of("text", "synthetic"), response);
+            assertTrue(response.getContentAsString().contains("\"requestId\":\"sdk-body-403\""));
+            request(); assertTrue(requests.isEmpty());
+            reply = "{\"Code\":\"Forbidden\",\"Message\":\"denied\"}";
+            response = new org.springframework.mock.web.MockHttpServletResponse();
+            controller.prompt("s", Map.of("text", "synthetic"), response);
+            var lines = response.getContentAsString().lines().map(line -> {
+                try { return JSON.readTree(line); } catch (Exception e) { throw new RuntimeException(e); }
+            }).toList();
+            assertFalse(lines.stream().filter(event -> "error".equals(event.path("type").asText()))
+                .findFirst().orElseThrow().path("error").has("requestId"));
+            request(); assertTrue(requests.isEmpty());
+        }
+    }
 }

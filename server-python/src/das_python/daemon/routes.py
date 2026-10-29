@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import FastAPI, Path, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ..errors import safe_request_id
 from ..config import AppConfig
 from ..constants import HEARTBEAT_MS, STREAM_HARD_LIMIT_MS
 from ..live import LiveContext
@@ -32,8 +33,9 @@ EPOCH = uuid.uuid4().hex
 _PROCESS_STARTED_AT = int(time.time() * 1000)
 
 
-def _error(status: int, error: str, code: str) -> JSONResponse:
-    return JSONResponse({"error": error, "code": code}, status_code=status)
+def _error(status: int, error: str, code: str, request_id: str | None = None) -> JSONResponse:
+    rid = safe_request_id(request_id)
+    return JSONResponse({"error": error, "code": code, **({"requestId": rid} if rid else {})}, status_code=status)
 
 
 def _not_found(session_id: str) -> JSONResponse:
@@ -210,7 +212,7 @@ def register_daemon_routes(app: FastAPI, cfg: AppConfig, live: LiveContext | Non
             return {"sessions": await registry.list_summaries(cfg, archived=archiveState == "archived")}
         except Exception as exc:
             api = to_api_error(exc, "ListAgentSessions")
-            return _error(502, api.message, "list_failed")
+            return _error(502, api.message, "list_failed", api.requestId)
 
     @app.post("/d/standalone/sessions")
     async def d_create_session(request: Request) -> Any:

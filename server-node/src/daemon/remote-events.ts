@@ -3,6 +3,9 @@ import type { OutgoingHttpHeaders } from 'node:http';
 import type { LiveContext } from '../live.js';
 import { openSessionEvents, parseSse, type RawSseEvent } from '../openapi.js';
 import { permissionRequestEvent, type DaemonEvent } from './events.js';
+import { withRequestId } from '@das/shared';
+import { headerRequestId, toApiError } from '../normalize.js';
+import { SdkError } from '../sdk.js';
 
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const json = (v: unknown): unknown => typeof v === 'string' ? JSON.parse(v) : v;
@@ -59,10 +62,12 @@ export function remoteEvent(frame: RawSseEvent, sessionId: string): DaemonEvent 
 export async function streamRemoteEvents(reply: FastifyReply, ctx: LiveContext, sessionId: string,
   lastEventId: string | undefined): Promise<void> {
   const upstream = await openSessionEvents(ctx.client, sessionId, lastEventId);
+  const requestId = headerRequestId(upstream.headers);
+  if (requestId) reply.header('x-acs-request-id', requestId);
   const contentType = Object.entries(upstream.headers).find(([key]) => key.toLowerCase() === 'content-type')?.[1] ?? '';
   if (!contentType.toLowerCase().includes('text/event-stream')) {
     upstream.body.destroy();
-    throw new Error('GetAgentSessionEvents 未返回 text/event-stream');
+    throw new SdkError(withRequestId(toApiError(new Error('GetAgentSessionEvents 未返回 text/event-stream'), 'GetAgentSessionEvents'), requestId));
   }
   const raw = reply.raw;
   let closed = raw.destroyed;
@@ -92,6 +97,8 @@ export async function streamRemoteEvents(reply: FastifyReply, ctx: LiveContext, 
         raw.once('drain', done); raw.once('close', done); raw.once('error', done);
       });
     }
+  } catch (error) {
+    throw new SdkError(withRequestId(toApiError(error, 'GetAgentSessionEvents'), requestId));
   } finally {
     if (heartbeat) clearInterval(heartbeat);
     upstream.body.destroy();

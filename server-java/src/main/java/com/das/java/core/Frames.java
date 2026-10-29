@@ -73,8 +73,10 @@ public final class Frames {
     public static String popAckRequestId(Object body) {
         Object inner = unwrapEnvelope(body);
         if (!(inner instanceof Map<?, ?> map)) return null;
+        if (!POP_ONLY_KEYS.containsAll(map.keySet())) return null;
+        if (map.containsKey("Id") || map.containsKey("id")) return null;
         Object value = map.containsKey("RequestId") ? map.get("RequestId") : map.get("requestId");
-        return value instanceof String s && !s.isEmpty() ? s : null;
+        return ApiError.validRequestId(value);
     }
 
     /** 解析一行录制件（带信封）为帧；无法解析时返回 null。 */

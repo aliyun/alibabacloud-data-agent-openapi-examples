@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { AppConfig } from '../src/config.js';
-import { buildCreateSessionRequest } from '../src/live.js';
+import { buildCreateSessionRequest, liveCreateSession } from '../src/live.js';
 
 /**
  * CreateAgentSession 的 wire 级契约。
@@ -117,4 +117,21 @@ describe('buildCreateSessionRequest — wire 序列化（防 Params:{} 回归）
     expect(typeof map.Id).toBe('string');
     expect(map.Id?.length).toBeGreaterThan(0);
   });
+});
+
+// The creation entry point must expose the safe detail returned by generic POP.
+it('create retains a safe initial config reason and RequestId', async () => {
+  const client = { callApi: vi.fn().mockResolvedValue({ statusCode: 200, body: {
+    RequestId: 'create-rid', JsonRpcResponse: { Error: {
+      ErrorCode: 'INVALID_SESSION_INITIAL_CONFIG', Message: 'invalid configuration',
+      Data: { reason: 'model_not_available', secret: 'PRIVATE_DATA' },
+    } },
+  } }) };
+  const result = await liveCreateSession({ client, cfg: cfg() } as unknown as Parameters<typeof liveCreateSession>[0]);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.error.requestId).toBe('create-rid');
+    expect(result.error.message).toContain('reason=model_not_available');
+    expect(JSON.stringify(result.error)).not.toContain('PRIVATE_DATA');
+  }
 });

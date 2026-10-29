@@ -120,6 +120,7 @@ export interface ArtifactsResult {
  *    `terminated=false`、无 stopReason，历史侧无法区分"已取消"与"断流"。
  */
 export interface CancelResult {
+  requestId?: string;
   /** 上游确认已送达；实际终止以真实流的 stopReason 为准。 */
   delivered: boolean;
   /** Legacy Result.SessionId acknowledges receipt only, not actual delivery. */

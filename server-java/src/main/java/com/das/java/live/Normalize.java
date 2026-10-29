@@ -42,7 +42,54 @@ public final class Normalize {
     }
 
     public static ApiError toApiError(Throwable err, String apiName) {
-        return ApiError.redact(withApi(raw(unwrap(err)), apiName));
+        Throwable source = unwrap(err);
+        // SDK streaming and runtime wrappers can hide the structured POP exception.
+        Throwable current = source;
+        for (int depth = 0; current != null && depth < 16; depth++, current = current.getCause()) {
+            if (current instanceof DasApiException || current instanceof ClientException
+                || current instanceof ServerException) { source = current; break; }
+        }
+        return ApiError.redact(withApi(raw(source).withRequestId(requestId(err)), apiName));
+    }
+
+    /** Only structured SDK metadata is eligible, never parse exception messages. */
+    public static String requestId(Throwable error) {
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 16; depth++, current = current.getCause()) {
+            Object value = current instanceof PopClientException e ? sdkRequestId(e.getRequestId(), e.getData())
+                : current instanceof PopServerException e ? sdkRequestId(e.getRequestId(), e.getData())
+                : current instanceof DasApiException e ? e.apiError().requestId()
+                : current instanceof SdkSseStream.SseException e ? e.requestId() : null;
+            String id = ApiError.validRequestId(value);
+            if (id != null) return id;
+            java.util.Map<String, Object> data = current instanceof PopClientException e ? e.getData()
+                : current instanceof PopServerException e ? e.getData() : null;
+            if (data != null) {
+                id = ApiError.validRequestId(data.get("RequestId"));
+                if (id == null) id = ApiError.validRequestId(data.get("requestId"));
+                if (id == null && data.get("headers") instanceof java.util.Map<?, ?> headers)
+                    id = headerRequestId(headers);
+                if (id != null) return id;
+            }
+        }
+        return null;
+    }
+
+    private static String sdkRequestId(String attribute, java.util.Map<String, Object> data) {
+        if (data != null) {
+            Object raw = data.containsKey("RequestId") ? data.get("RequestId") : data.get("requestId");
+            if ((data.containsKey("RequestId") || data.containsKey("requestId"))
+                && ApiError.validRequestId(raw) == null && String.valueOf(raw).equals(attribute)) return null;
+        }
+        return ApiError.validRequestId(attribute);
+    }
+
+    public static String headerRequestId(java.util.Map<?, ?> headers) {
+        if (headers != null) for (var entry : headers.entrySet()) {
+            if (entry.getKey() instanceof String key && "x-acs-request-id".equalsIgnoreCase(key))
+                return ApiError.validRequestId(entry.getValue());
+        }
+        return null;
     }
 
     /** CompletableFuture join 出来的异常总被 Completion/ExecutionException 包着：先剥。 */
@@ -88,11 +135,13 @@ public final class Normalize {
 
     private static String describeUpstream(Throwable err) {
         if (err instanceof PopServerException e) {
-            return popDescription(e.getErrMessage(), e.getErrCode(), e.getRequestId(), e.getStatusCode(), e.getMessage());
+            return popDescription(e.getErrMessage(), e.getErrCode(), sdkRequestId(e.getRequestId(), e.getData()), e.getStatusCode());
         }
         if (err instanceof PopClientException e) {
-            return popDescription(e.getErrMessage(), e.getErrCode(), e.getRequestId(), e.getStatusCode(), e.getMessage());
+            return popDescription(e.getErrMessage(), e.getErrCode(), sdkRequestId(e.getRequestId(), e.getData()), e.getStatusCode());
         }
+        if (err instanceof ServerException || err instanceof ClientException)
+            return "上游 SDK 请求失败" + (upstreamStatus(err) == null ? "" : " | status=" + upstreamStatus(err));
         StringBuilder parts = new StringBuilder();
         String message = err.getMessage();
         if (message != null && !message.isEmpty()) parts.append(message);
@@ -111,13 +160,13 @@ public final class Normalize {
 
     /** POP 错误体的结构化呈现：errMessage 是上游原文；空壳字段一律不出现（不编造）。 */
     private static String popDescription(String errMessage, String errCode, String requestId,
-        Integer statusCode, String fallbackMessage) {
+        Integer statusCode) {
+        requestId = ApiError.validRequestId(requestId);
         StringBuilder parts = new StringBuilder();
         if (errMessage != null && !errMessage.isEmpty()) parts.append(errMessage);
         if (errCode != null && !errCode.isEmpty()) parts.append(" [").append(errCode).append(']');
         if (requestId != null && !requestId.isEmpty()) parts.append(" | requestId=").append(requestId);
         if (statusCode != null) parts.append(" | status=").append(statusCode);
-        if (parts.length() == 0 && fallbackMessage != null) parts.append(fallbackMessage);
         return parts.length() > 0 ? parts.toString() : "上游返回了一个没有描述的错误";
     }
 
@@ -137,7 +186,7 @@ public final class Normalize {
         if (apiName == null || error.message().contains(apiName)) return error;
         return new ApiError(
             error.kind(), error.code(), error.errorCode(), apiName + ": " + error.message(),
-            error.retryable(), error.fatalForSession(), error.upstreamStatus());
+            error.retryable(), error.fatalForSession(), error.upstreamStatus(), error.requestId());
     }
 
     /**
@@ -148,11 +197,12 @@ public final class Normalize {
      * 不可区分。所以这里绝不编造 code/message，只报告 Result 缺失 + RequestId。
      */
     public static ApiError missingResultError(String apiName, Integer statusCode, String requestId) {
+        requestId = ApiError.validRequestId(requestId);
         return ApiError.apiError("rpc_error",
             apiName + " 返回 HTTP " + (statusCode != null ? statusCode : "?")
                 + "，但响应体里没有 JsonRpcResponse.Result。"
                 + "非流式响应模型未声明 Error 字段，SDK 的 cast 已把错误详情丢弃，所以这里拿不到 code 与 message"
                 + (requestId != null ? "。可用 RequestId " + requestId + " 到控制台或工单查这次调用" : "")
-                + ".");
+                + ".").withRequestId(requestId);
     }
 }

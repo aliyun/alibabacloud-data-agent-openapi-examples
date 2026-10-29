@@ -250,4 +250,141 @@ class OpenapiRoutesTest {
         verifyNoMoreInteractions(live);
     }
 
+    @Test void allDaemonStringErrorsExposePopIdAndBatchKeepsPerCallIds() throws Exception {
+        var failure = new com.das.java.live.Normalize.DasApiException(
+            com.das.java.core.ApiError.apiError("rpc_error", "denied LTAIsecret123").withRequestId("remote-call"));
+        when(live.createSessionWithOptions(any())).thenThrow(failure);
+        when(live.listSessions(false)).thenThrow(failure);
+        when(live.sessionSummary("s")).thenThrow(failure);
+        when(live.loadFrames("s")).thenThrow(failure);
+        when(live.renameSession(eq("s"), anyString())).thenThrow(failure);
+        when(live.deleteSession("s")).thenThrow(failure);
+        when(live.cancel("s")).thenThrow(failure);
+        when(live.reply(eq("s"), anyMap())).thenThrow(failure);
+        when(live.archiveSession(eq("s"), anyBoolean())).thenThrow(failure);
+        var calls = List.of(
+            post("/d/standalone/sessions").contentType("application/json").content("{}"),
+            get("/d/standalone/sessions"), get("/d/standalone/sessions/s"),
+            post("/d/standalone/sessions/s/load"), get("/d/session/s/transcript"),
+            patch("/d/session/s/metadata").contentType("application/json").content("{\"displayName\":\"new\"}"),
+            delete("/d/session/s"), post("/d/session/s/cancel"),
+            post("/d/session/s/permission/permission-id").contentType("application/json")
+                .content("{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"yes\"}}"));
+        for (var call : calls) mvc.perform(call).andExpect(status().isBadGateway())
+            .andExpect(jsonPath("$.requestId").value("remote-call"))
+            .andExpect(jsonPath("$.error").isString())
+            .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("LTAIsecret123"))));
+        for (String action : List.of("archive", "unarchive", "delete"))
+            mvc.perform(post("/d/standalone/sessions/" + action).contentType("application/json")
+                .content("{\"sessionIds\":[\"s\"]}"))
+                .andExpect(jsonPath("$.errors[0].requestId").value("remote-call"))
+                .andExpect(jsonPath("$.errors[0].error").isString());
+        doReturn(Map.of("accepted", false, "requestId", "cancel-pop")).when(live).cancel("s");
+        mvc.perform(post("/d/session/s/cancel")).andExpect(jsonPath("$.requestId").value("cancel-pop"));
+        doReturn(Map.of("accepted", false, "requestId", "reply-pop")).when(live).reply(eq("s"), anyMap());
+        mvc.perform(post("/d/session/s/permission/permission-id").contentType("application/json")
+            .content("{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"yes\"}}"))
+            .andExpect(status().isNotFound()).andExpect(jsonPath("$.requestId").value("reply-pop"));
+        when(live.reply(eq("s"), anyMap())).thenReturn(Map.of("accepted", false));
+        mvc.perform(post("/d/session/s/permission/permission-id").contentType("application/json")
+            .content("{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"yes\"}}"))
+            .andExpect(jsonPath("$.requestId").doesNotExist());
+    }
+
+    @Test void eventsExposeExactHeaderBeforeAndAfterCommitWithoutFabricatingTerminal() throws Exception {
+        String id = "request:" + "x".repeat(180);
+        for (boolean committed : new boolean[]{false, true}) {
+            var remote = new RemoteEventStream();
+            remote.onStream(subscriber -> subscriber.onSubscribe(new Subscription() {
+                boolean sent;
+                public void request(long n) {
+                    if (sent) return;
+                    sent = true;
+                    if (committed) subscriber.onNext(ByteBuffer.wrap(
+                        "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"s\"}}\n\n".getBytes(StandardCharsets.UTF_8)));
+                    subscriber.onError(new java.io.IOException("private exception detail"));
+                }
+                public void cancel() {}
+            }), 200, new HttpHeaders(Map.of("Content-Type", "text/event-stream", "X-Acs-Request-Id", id)));
+            when(live.events("s", null)).thenReturn(remote);
+            var response = new MockHttpServletResponse();
+            if (committed) assertThrows(java.io.IOException.class, () -> controller.events("s", null, null, response));
+            else controller.events("s", null, null, response);
+            assertEquals(id, response.getHeader("x-acs-request-id"));
+            assertFalse(response.getContentAsString().contains("private exception detail"));
+            assertFalse(response.getContentAsString().contains("turn_complete"));
+            if (!committed) {
+                assertEquals(502, response.getStatus());
+                assertEquals(id, new com.fasterxml.jackson.databind.ObjectMapper().readTree(response.getContentAsString()).path("requestId").asText());
+            }
+        }
+    }
+
+
+    @Test void eventsOnlyForwardRealPopHeaderAndNeverOtherResponseHeaders() throws Exception {
+        for (String id : new String[]{"events-pop", "  events-pop  ", null, "bad\nheader", "\r\nevents-pop\r\n", "id with spaces", "unicode-你好", "x".repeat(257)}) {
+            var headers = new java.util.LinkedHashMap<String, String>();
+            headers.put("Content-Type", "text/event-stream");
+            headers.put("Authorization", "private-secret");
+            headers.put("Set-Cookie", "private-cookie");
+            if (id != null) headers.put("X-Acs-Request-Id", id);
+            var stream = new RemoteEventStream();
+            String wire = "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"s\"}}\n\n";
+            stream.onStream(subscriber -> subscriber.onSubscribe(new Subscription() {
+                boolean sent;
+                public void request(long n) {
+                    if (sent) return;
+                    sent = true;
+                    subscriber.onNext(ByteBuffer.wrap(wire.getBytes(StandardCharsets.UTF_8)));
+                    subscriber.onComplete();
+                }
+                public void cancel() {}
+            }), 200, new HttpHeaders(headers));
+            when(live.events("s", null)).thenReturn(stream);
+            var response = new MockHttpServletResponse();
+            controller.events("s", null, null, response);
+            assertEquals(200, response.getStatus());
+            assertEquals(id != null && id.replace(" ", "").equals("events-pop") ? "events-pop" : null, response.getHeader("x-acs-request-id"));
+            assertNull(response.getHeader("Authorization"));
+            assertNull(response.getHeader("Set-Cookie"));
+            assertEquals("event: stream_open\n" + wire, response.getContentAsString());
+        }
+    }
+
+    @Test void preResponseEventsSdkFailureUsesStructuredIdAndSafePublicError() throws Exception {
+        var sdk = new com.aliyun.sdk.gateway.pop.exception.PopServerException("private SDK dump");
+        sdk.setStatusCode(503);
+        sdk.setRequestId("events-sdk-pop");
+        var stream = new RemoteEventStream();
+        stream.onError(new java.util.concurrent.CompletionException(sdk));
+        when(live.events("s", null)).thenReturn(stream);
+        var response = new MockHttpServletResponse();
+        controller.events("s", null, null, response);
+        assertEquals(502, response.getStatus());
+        assertEquals("events-sdk-pop", response.getHeader("x-acs-request-id"));
+        var body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(response.getContentAsString());
+        assertEquals("events-sdk-pop", body.path("requestId").asText());
+        assertEquals(503, body.path("upstreamStatus").asInt());
+        assertFalse(response.getContentAsString().contains("private"));
+    }
+
+    @Test void ordinaryJsonErrorsKeepOptionalNestedIdAndDaemonErrorsKeepOptionalTopLevelId() throws Exception {
+        var api = MockMvcBuilders.standaloneSetup(new com.das.java.web.RestApiController(cfg, new LiveClientHolder(live))).build();
+        for (String id : new String[]{"create-pop", null}) {
+            var failure = new com.das.java.live.Normalize.DasApiException(
+                com.das.java.core.ApiError.apiError("rpc_error", "denied").withRequestId(id));
+            doThrow(failure).when(live).createSessionWithOptions(any());
+            var ordinary = api.perform(post("/api/sessions").contentType("application/json").content("{}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.ok").value(false));
+            var daemon = mvc.perform(post("/d/standalone/sessions").contentType("application/json").content("{}"))
+                .andExpect(status().isBadGateway()).andExpect(jsonPath("$.error").isString());
+            if (id == null) {
+                ordinary.andExpect(jsonPath("$.error.requestId").doesNotExist());
+                daemon.andExpect(jsonPath("$.requestId").doesNotExist());
+            } else {
+                ordinary.andExpect(jsonPath("$.error.requestId").value(id));
+                daemon.andExpect(jsonPath("$.requestId").value(id));
+            }
+        }
+    }
 }

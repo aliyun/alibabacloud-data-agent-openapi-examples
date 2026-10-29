@@ -9,13 +9,22 @@ from __future__ import annotations
 
 import re
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .constants import CONCURRENT_REJECTED_TEXT, ERROR_KINDS, UPSTREAM_STATUS_GHOST
 
 STREAM_ENDED_TEXT = "session stream ended without turn terminal"
 PROMPT_NOT_DISPATCHED_TEXT = "prompt accepted but never dispatched to an executor"
+
+
+def safe_request_id(value: Any) -> str | None:
+    """A scalar POP ID safe for JSON and HTTP headers; never strip controls."""
+    if not isinstance(value, str) or any(not 32 <= ord(c) <= 126 for c in value):
+        return None
+    value = value.strip(" ")
+    return value if value and len(value) <= 256 and all(33 <= ord(c) <= 126 for c in value) else None
+
 
 
 @dataclass(frozen=True)
@@ -29,9 +38,14 @@ class ApiError:
     retryable: bool = False
     fatalForSession: bool = False
     upstreamStatus: int | None = None
+    requestId: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "requestId", safe_request_id(self.requestId))
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            **({"requestId": self.requestId} if self.requestId else {}),
             "kind": self.kind,
             "code": self.code,
             "errorCode": self.errorCode,
@@ -124,6 +138,7 @@ def _build(kind: str, input_: dict[str, Any], message: str) -> ApiError:
         retryable=policy["retryable"],
         fatalForSession=policy["fatalForSession"],
         upstreamStatus=input_.get("upstreamStatus"),
+        requestId=input_.get("requestId"),
     )
 
 
@@ -132,13 +147,14 @@ def classify_error(
     code: int | None = None,
     errorCode: str | None = None,  # noqa: N803
     upstreamStatus: int | None = None,  # noqa: N803
+    requestId: str | None = None,
 ) -> ApiError:
     """把帧内 / JsonRpcResponse 里的 Error 分成六类。
 
     不能只看 code：实测断流、会话幽灵化、并发被拒三种处境的 code **全是 -32603**，
     只有 message 文本能区分。三条形态都来自真实抓包（见 shared/errors.ts 的注释）。
     """
-    input_ = {"code": code, "errorCode": errorCode, "upstreamStatus": upstreamStatus}
+    input_ = {"code": code, "errorCode": errorCode, "upstreamStatus": upstreamStatus, "requestId": requestId}
     msg = message or ""
 
     if upstreamStatus == UPSTREAM_STATUS_GHOST or f"upstream_status={UPSTREAM_STATUS_GHOST}" in msg:
@@ -150,17 +166,18 @@ def classify_error(
     return _build("rpc_error", input_, msg or "upstream returned an error without message")
 
 
-def stream_break_without_terminal(frame_count: int) -> ApiError:
+def stream_break_without_terminal(frame_count: int, request_id: str | None = None) -> ApiError:
     """流式生成器正常结束、却从头到尾没出现过 Result.stopReason ⇒ 必须算断流而不是成功。"""
     return _build(
         "stream_break",
-        {"message": STREAM_ENDED_TEXT},
+        {"message": STREAM_ENDED_TEXT, "requestId": request_id},
         f"{STREAM_ENDED_TEXT} (received {frame_count} frames, no Result.stopReason)",
     )
 
 
 def prompt_not_dispatched(pop_request_id: str | None = None, elapsed_ms: int | None = None) -> ApiError:
     """整轮**一个 ACP 内容帧都没收到**：上游只回了 POP 层回执（或什么都没回）就关流。"""
+    pop_request_id = safe_request_id(pop_request_id)
     clues = "，".join(
         [
             f"{elapsed_ms}ms" if elapsed_ms is not None else None,
@@ -169,7 +186,7 @@ def prompt_not_dispatched(pop_request_id: str | None = None, elapsed_ms: int | N
     )
     return _build(
         "prompt_not_dispatched",
-        {"message": PROMPT_NOT_DISPATCHED_TEXT},
+        {"message": PROMPT_NOT_DISPATCHED_TEXT, "requestId": pop_request_id},
         f"{PROMPT_NOT_DISPATCHED_TEXT}（{clues}）。整轮没有收到任何 ACP 帧，也没有 Result.stopReason。",
     )
 
@@ -178,9 +195,9 @@ def transport_error(message: str, upstream_status: int | None = None) -> ApiErro
     return _build("transport", {"message": message, "upstreamStatus": upstream_status}, message)
 
 
-def create_empty_body_error(detail: str | None = None) -> ApiError:
+def create_empty_body_error(detail: str | None = None, request_id: str | None = None) -> ApiError:
     detail = detail or "empty response body"
-    return _build("create_empty_body", {"message": detail}, detail)
+    return _build("create_empty_body", {"message": detail, "requestId": request_id}, detail)
 
 
 def redact_api_error(error: ApiError) -> ApiError:
@@ -194,12 +211,27 @@ def redact_api_error(error: ApiError) -> ApiError:
 
 
 # 帧内错误路径（pipeline）与异常路径（normalize）都要过脱敏：少过一条，AK 就漏进前端。
-def classify_frame_error(error: dict[str, Any]) -> ApiError:
+def initial_config_error_message(error: dict[str, Any], fallback: str) -> str:
+    """Expose only the documented reason enum, never arbitrary Error.Data."""
+    message = error.get("message") if isinstance(error.get("message"), str) else fallback
+    target = "INVALID_SESSION_INITIAL_CONFIG"
+    if error.get("errorCode") != target and error.get("message") != target:
+        return message
+    data = error.get("data")
+    reason = data.get("reason") if isinstance(data, dict) else None
+    if isinstance(reason, str) and reason in {
+        "capabilities_unavailable", "ambiguous_model", "model_not_available", "reasoning_not_available",
+    }:
+        return f"{message} (reason={reason})"
+    return message
+
+
+def classify_frame_error(error: dict[str, Any], request_id: str | None = None) -> ApiError:
     """帧内 Error（dict 形状）→ ApiError，已内置脱敏。"""
     code = error.get("code") if isinstance(error.get("code"), int) else None
     err_code = error.get("errorCode") if isinstance(error.get("errorCode"), str) else None
     msg = error.get("message") if isinstance(error.get("message"), str) else None
-    return redact_api_error(classify_error(message=msg, code=code, errorCode=err_code))
+    return redact_api_error(classify_error(message=msg, code=code, errorCode=err_code, requestId=request_id))
 
 
 def with_api_name(error: ApiError, api_name: str) -> ApiError:

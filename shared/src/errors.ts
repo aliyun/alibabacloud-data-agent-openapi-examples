@@ -13,6 +13,8 @@ import {
  */
 export interface ApiError {
   kind: ErrorKind;
+  /** Actual upstream OpenAPI request ID, never a turn/event/permission identifier. */
+  requestId?: string;
   /** JSON-RPC 错误码，例如 -32603；传输层故障时为空。 */
   code: number | undefined;
   /** 上游给的细分错误码（形如 0x48833000000000d1），有就带上，便于对照排查文档。 */
@@ -106,6 +108,7 @@ export function copyFor(kind: ErrorKind): ErrorCopy {
 // ---------------------------------------------------------------------------
 
 export interface ErrorInput {
+  requestId?: string;
   code?: number;
   errorCode?: string;
   message?: string;
@@ -136,6 +139,7 @@ function build(kind: ErrorKind, input: ErrorInput, message: string): ApiError {
   const policy = RETRY_POLICY[kind];
   return {
     kind,
+    ...(validRequestId(input.requestId) ? { requestId: input.requestId!.trim() } : {}),
     code: input.code,
     errorCode: input.errorCode,
     message,
@@ -143,6 +147,20 @@ function build(kind: ErrorKind, input: ErrorInput, message: string): ApiError {
     fatalForSession: policy.fatalForSession,
     upstreamStatus: input.upstreamStatus,
   };
+}
+
+/** Keep only a bounded, printable upstream ID; do not turn arbitrary response data into diagnostics. */
+export function validRequestId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const id = value.trim();
+  return id && id.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
+    && /^[\x21-\x7e]+$/.test(id) ? id : undefined;
+}
+
+export function withRequestId(error: ApiError, value: unknown, prefer = false): ApiError {
+  const requestId = prefer ? validRequestId(value) ?? validRequestId(error.requestId)
+    : validRequestId(error.requestId) ?? validRequestId(value);
+  return requestId ? { ...error, requestId } : error;
 }
 
 /**
@@ -206,7 +224,7 @@ export function promptNotDispatched(popRequestId?: string, elapsedMs?: number): 
   ].join('，');
   return build(
     'prompt_not_dispatched',
-    { message: PROMPT_NOT_DISPATCHED_TEXT },
+    { message: PROMPT_NOT_DISPATCHED_TEXT, requestId: validRequestId(popRequestId) },
     `${PROMPT_NOT_DISPATCHED_TEXT}（${clues}）。整轮没有收到任何 ACP 帧，也没有 Result.stopReason。`,
   );
 }
@@ -217,6 +235,6 @@ export function transportError(message: string, upstreamStatus?: number): ApiErr
 }
 
 /** 建会话拿到 HTTP 200 但响应体为空。 */
-export function createEmptyBodyError(detail?: string): ApiError {
-  return build('create_empty_body', { message: detail ?? 'empty response body' }, detail ?? 'empty response body');
+export function createEmptyBodyError(detail?: string, requestId?: string): ApiError {
+  return build('create_empty_body', { message: detail ?? 'empty response body', requestId }, detail ?? 'empty response body');
 }

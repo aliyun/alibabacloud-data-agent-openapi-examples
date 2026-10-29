@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import inspect
+from copy import copy
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -21,9 +22,10 @@ from darabonba.runtime import RuntimeOptions
 
 from .config import AppConfig
 from .constants import DEFAULT_READ_TIMEOUT_MS, HISTORY_READ_TIMEOUT_MS
-from .errors import api_error, create_empty_body_error, redact_api_error
+from .errors import api_error, create_empty_body_error, redact_api_error, safe_request_id
 from .frames import frame_from_sdk_body, pop_ack_request_id
-from .normalize import SdkError, lower_first_keys, missing_result_error, read_non_stream_body, to_api_error
+from .normalize import (SdkError, lower_first_keys, missing_result_error, read_non_stream_body,
+                        remote_request_id, to_api_error, with_request_id)
 from .rid import count_frames_for_rid
 from .turn import reduce_history
 from .pop import rpc
@@ -124,6 +126,36 @@ def _guard_async_iterable(value: Any, api_name: str) -> AsyncGenerator:
             _transport_error(f"{api_name} 没有返回可迭代的 SSE 流（拿到 {type(value).__name__}）；SDK 版本或上游形态可能不匹配")
         )
     return value
+
+
+def _sse_client(ctx: LiveContext, header_ids: list[str], observed_ids: list[str] | None) -> Any:
+    """Capture headers before the generated SDK parses SSE JSON, per call only.
+
+    A shallow client view preserves credentials/runtime and the generated request
+    construction, while leaving the shared client's methods and retry policy intact.
+    """
+    if not isinstance(ctx.client, SdkClient):
+        return ctx.client
+    scoped = copy(ctx.client)
+
+    async def capture(*args, **kwargs):
+        stream = ctx.client.call_sseapi_async(*args, **kwargs)
+        stream = await stream if inspect.isawaitable(stream) else stream
+        try:
+            async for response in stream:
+                request_id = remote_request_id(response)
+                if request_id:
+                    header_ids[:] = [request_id]
+                    if observed_ids is not None and (not observed_ids or observed_ids[-1] != request_id):
+                        observed_ids.append(request_id)
+                yield response
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
+    scoped.call_sseapi_async = capture
+    return scoped
 
 
 def _str(value: Any) -> str | None:
@@ -272,7 +304,8 @@ async def _cancel_result(ctx: LiveContext, session_id: str) -> dict[str, Any]:
     The generic transport retains JSON-RPC Error that the old SDK model drops.
     A successful idle no-op is distinct from delivery to an active daemon turn.
     """
-    result = (await rpc(ctx, "CancelAgentSession", {"SessionId": session_id}))["result"]
+    response = await rpc(ctx, "CancelAgentSession", {"SessionId": session_id})
+    result = response["result"]
     # Legacy deployments acknowledge only the matching public SessionId. This
     # proves acceptance, not daemon delivery, idleness, or a cancelled terminal.
     # Never let this compatibility path override explicit false/invalid flags.
@@ -286,8 +319,9 @@ async def _cancel_result(ctx: LiveContext, session_id: str) -> dict[str, Any]:
     delivered = result.get("delivered")
     noop = result.get("noop", False)
     if not isinstance(delivered, bool) or not isinstance(noop, bool):
-        raise SdkError(api_error("rpc_error", "CancelAgentSession: invalid Delivered/Noop result"))
+        raise SdkError(api_error("rpc_error", "CancelAgentSession: invalid Delivered/Noop result", requestId=response["requestId"]))
     return {
+        "requestId": response["requestId"],
         "delivered": delivered,
         "noop": noop,
         "warning": "cancel-accepted" if delivered else "cancel-noop" if noop else "cancel-upstream-error",
@@ -321,7 +355,7 @@ async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any
     body = getattr(resp, "body", None)
     rpc = getattr(body, "jsonRpcResponse", None) or getattr(body, "json_rpc_response", None)
     mapped = _model_to_map(body) or {}
-    request_id = _str(mapped.get("RequestId")) or _str(getattr(body, "request_id", None))
+    request_id = safe_request_id(mapped.get("RequestId")) or safe_request_id(getattr(body, "request_id", None)) or remote_request_id(resp)
     rpc_map = mapped.get("JsonRpcResponse") if isinstance(mapped.get("JsonRpcResponse"), dict) else {}
     # to_map 一律给 PascalCase 线格式键（{"Error":{"Message":…}}）：lower_first 归一为 camelCase 再读。
     error = lower_first_keys(rpc_map["Error"]) if isinstance(rpc_map.get("Error"), dict) else getattr(rpc, "error", None)
@@ -342,6 +376,7 @@ async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any
                     + (f" [{err_code}]" if isinstance(err_code, str) else "")
                     + (f" (code={code})" if isinstance(code, int) else "")
                     + (f"，RequestId {request_id}" if request_id else ""),
+                    requestId=request_id,
                 )
             )
         )
@@ -352,6 +387,7 @@ async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any
                     "rpc_error",
                     f"{api} 返回 HTTP 200 但没有 JsonRpcResponse.Result.accepted"
                     + (f"（RequestId {request_id}）" if request_id else ""),
+                    requestId=request_id,
                 )
             )
         )
@@ -368,9 +404,14 @@ async def _reply_result(ctx: LiveContext, session_id: str, input_: dict[str, Any
 
 
 async def _load_stream(ctx: LiveContext, session_id: str, rpc_id: str, offset: int | None,
-                       timeout_ms: int) -> AsyncGenerator[dict[str, Any], None]:
+                       timeout_ms: int, pop_request_ids: list[str] | None = None) -> AsyncGenerator[dict[str, Any], None]:
     """历史快照与在途续传分别设置读预算；BeginLogOffset 是旧 LSP 的续点。"""
-    stream = ctx.client.load_agent_session_with_sse_async(
+    # Recovery awaits the previous source's aclose() before advancing here.
+    # This shared list represents only this RPC, including when it has no ID.
+    if pop_request_ids is not None:
+        pop_request_ids.clear()
+    header_ids: list[str] = []
+    stream = _sse_client(ctx, header_ids, pop_request_ids).load_agent_session_with_sse_async(
         sdk_models.LoadAgentSessionRequest(
             id=rpc_id,
             jsonrpc=JSONRPC_VERSION,
@@ -381,14 +422,25 @@ async def _load_stream(ctx: LiveContext, session_id: str, rpc_id: str, offset: i
         runtime_for(timeout_ms),
     )
     stream = await stream if hasattr(stream, "__await__") else stream
+    pop_id = None
     try:
         async for resp in _guard_async_iterable(stream, "LoadAgentSession"):
             # SDK 的 resp.body 是模型对象，必须 to_map() 成线格式 dict——直接交给
             # frame_from_sdk_body 会被 is_object(dict) 拒掉，全部漏成 unrecognized（LIVE 实测）。
             mapped = _model_to_map(_body_of(resp))
             frame = frame_from_sdk_body(mapped)
+            header_id = remote_request_id(resp)
+            if header_id:
+                header_ids[:] = [header_id]
+            observed = (header_ids or [None])[-1] or (safe_request_id(pop_ack_request_id(mapped)) if not frame else None)
+            if observed:
+                pop_id = observed
+                if pop_request_ids is not None and (not pop_request_ids or pop_request_ids[-1] != pop_id):
+                    pop_request_ids.append(pop_id)
             if frame:
                 yield frame
+    except Exception as exc:
+        raise SdkError(with_request_id(to_api_error(exc, "LoadAgentSession"), (header_ids or [pop_id])[-1], prefer=bool(header_ids))) from exc
     finally:
         close = getattr(stream, "aclose", None)
         if close is not None:
@@ -396,11 +448,14 @@ async def _load_stream(ctx: LiveContext, session_id: str, rpc_id: str, offset: i
 
 
 async def _load_frames(ctx: LiveContext, session_id: str) -> list[dict[str, Any]]:
+    pop_request_ids: list[str] = []
+
     def open_stream(timeout_ms: int):
         rpc_id = _next_rpc_id()
-        return rpc_id, _load_stream(ctx, session_id, rpc_id, None, timeout_ms)
+        pop_request_ids.clear()
+        return rpc_id, _load_stream(ctx, session_id, rpc_id, None, timeout_ms, pop_request_ids)
 
-    return await read_load_snapshot(open_stream, budget_ms=HISTORY_READ_TIMEOUT_MS)
+    return await read_load_snapshot(open_stream, budget_ms=HISTORY_READ_TIMEOUT_MS, pop_request_ids=pop_request_ids)
 
 
 async def _probe_result(ctx: LiveContext, session_id: str, rid: str, baseline_tokens: float | None) -> dict[str, Any]:
@@ -454,7 +509,7 @@ async def _create_session_result(ctx: LiveContext, mode: str | None = None, *, o
     }})
     session_id = _str(response["result"].get("sessionId"))
     if not session_id:
-        raise SdkError(create_empty_body_error("CreateAgentSession returned an empty SessionId"))
+        raise SdkError(create_empty_body_error("CreateAgentSession returned an empty SessionId", response["requestId"]))
     return {"sessionId": session_id, "requestId": response["requestId"]}
 
 
@@ -464,11 +519,12 @@ async def _mutate_session_result(ctx: LiveContext, session_id: str, action: str,
         params["Title"] = value
     elif action == "ArchiveAgentSession":
         params["Archived"] = value
-    result = (await rpc(ctx, action, params))["result"]
+    response = await rpc(ctx, action, params)
+    result = response["result"]
     if action == "UpdateAgentSessionTitle" and (not isinstance(result.get("title"), str) or not result["title"].strip()):
-        raise SdkError(api_error("rpc_error", f"{action}: missing Result.Title"))
+        raise SdkError(api_error("rpc_error", f"{action}: missing Result.Title", requestId=response["requestId"]))
     if action == "ArchiveAgentSession" and result.get("archived") is not value:
-        raise SdkError(api_error("rpc_error", f"{action}: Result.Archived does not confirm the requested state"))
+        raise SdkError(api_error("rpc_error", f"{action}: Result.Archived does not confirm the requested state", requestId=response["requestId"]))
     return result
 
 
@@ -479,7 +535,7 @@ async def _prompt_frames(
 
     def load(offset: int, timeout_ms: int):
         load_id = _next_rpc_id()
-        return load_id, _load_stream(ctx, session_id, load_id, offset, timeout_ms)
+        return load_id, _load_stream(ctx, session_id, load_id, offset, timeout_ms, acks)
 
     recovering = recover_prompt_frames(
         rpc_id, _initial_prompt_frames(ctx, session_id, outbound_text, rpc_id, acks), load
@@ -500,7 +556,10 @@ async def _initial_prompt_frames(ctx: LiveContext, session_id: str, outbound_tex
       2. 每帧过 frame_from_sdk_body（SDK 的 cast 键名与线格式不同名，不归一化下游全瞎）；
       3. 抛出的异常不在这里吞，交给流管道归一化。
     """
-    stream = ctx.client.prompt_agent_session_with_sse_async(
+    if acks is not None:
+        acks.clear()
+    header_ids: list[str] = []
+    stream = _sse_client(ctx, header_ids, acks).prompt_agent_session_with_sse_async(
         sdk_models.PromptAgentSessionRequest(
             id=rpc_id,
             jsonrpc=JSONRPC_VERSION,
@@ -514,23 +573,31 @@ async def _initial_prompt_frames(ctx: LiveContext, session_id: str, outbound_tex
     stream = await stream if hasattr(stream, "__await__") else stream
 
     unrecognized = 0
+    pop_id = None
     try:
         async for resp in _guard_async_iterable(stream, "PromptAgentSession"):
             # SDK 的 resp.body 是模型对象，必须 to_map() 成线格式 dict——直接交给
             # frame_from_sdk_body 会被 is_object(dict) 拒掉，全部漏成 unrecognized（LIVE 实测）。
             body = _model_to_map(_body_of(resp))
             frame = frame_from_sdk_body(body)
+            header_id = remote_request_id(resp)
+            if header_id:
+                header_ids[:] = [header_id]
+            observed = (header_ids or [None])[-1] or (safe_request_id(pop_ack_request_id(body)) if not frame else None)
+            if observed:
+                pop_id = observed
+                if acks is not None and (not acks or acks[-1] != pop_id):
+                    acks.append(pop_id)
             if frame:
                 yield frame
                 continue
             # 不是帧的载荷两种：POP 回执（只有 RequestId，零帧场景唯一可查的线索）；
             # 真认不出来的形状（上游改了载荷，warn 一条）。
-            ack = pop_ack_request_id(body)
-            if ack:
-                if acks is not None:
-                    acks.append(ack)
+            if observed:
                 continue
             unrecognized += 1
+    except Exception as exc:
+        raise SdkError(with_request_id(to_api_error(exc, "PromptAgentSession"), (header_ids or [pop_id])[-1], prefer=bool(header_ids))) from exc
     finally:
         close = getattr(stream, "aclose", None)
         if close is not None:

@@ -20,9 +20,15 @@ final class LiveDaemon {
     LiveDaemon(AppConfig cfg, LiveClient live) { this.cfg = cfg; this.live = live; }
 
     static Map<String, Object> error(String message, String code) { return Map.of("error", message, "code", code); }
+    private static Map<String, Object> error(String message, String code, Object requestId) {
+        var out = new LinkedHashMap<String, Object>(error(message, code));
+        String id = com.das.java.core.ApiError.validRequestId(requestId);
+        if (id != null) out.put("requestId", id);
+        return out;
+    }
     static ResponseEntity<?> failure(Exception error, String action) {
         var api = Normalize.toApiError(error, action);
-        return ResponseEntity.status(502).body(error(api.message(), "upstream_error"));
+        return ResponseEntity.status(502).body(error(api.message(), "upstream_error", api.requestId()));
     }
     private Map<String, Object> session(String id) {
         Map<String, Object> out = new LinkedHashMap<>();
@@ -112,7 +118,7 @@ final class LiveDaemon {
             var result = live.cancel(id);
             if (!Boolean.TRUE.equals(result.get("accepted")) && !Boolean.TRUE.equals(result.get("delivered"))
                 && !Boolean.TRUE.equals(result.get("noop")))
-                return ResponseEntity.status(502).body(error(String.valueOf(result.getOrDefault("detail", "Cancel not accepted")), "cancel_failed"));
+                return ResponseEntity.status(502).body(error(String.valueOf(result.getOrDefault("detail", "Cancel not accepted")), "cancel_failed", result.get("requestId")));
             return ResponseEntity.noContent().build(); // Neither acceptance nor delivery fabricates a terminal.
         } catch (Exception error) { return failure(error, "CancelAgentSession"); }
     }
@@ -143,9 +149,10 @@ final class LiveDaemon {
         try {
             var result = live.reply(id, input);
             return Boolean.TRUE.equals(result.get("accepted")) ? ResponseEntity.ok(Map.of())
-                : ResponseEntity.status(404).body(error("Remote reply not accepted", "permission_not_accepted"));
+                : ResponseEntity.status(404).body(error("Remote reply not accepted", "permission_not_accepted", result.get("requestId")));
         } catch (Exception error) {
-            return ResponseEntity.status(502).body(error(Normalize.toApiError(error, "ReplyAgentSession").message(), "permission_upstream_error"));
+            var api = Normalize.toApiError(error, "ReplyAgentSession");
+            return ResponseEntity.status(502).body(error(api.message(), "permission_upstream_error", api.requestId()));
         }
     }
     Map<String, Object> batch(String action, Object rawIds) {
@@ -157,7 +164,12 @@ final class LiveDaemon {
                 if ("delete".equals(action)) live.deleteSession(id);
                 else live.archiveSession(id, "archive".equals(action));
                 done.add(id);
-            } catch (Exception error) { errors.add(Map.of("sessionId", id, "error", Normalize.toApiError(error, action).message())); }
+            } catch (Exception error) { var api = Normalize.toApiError(error, action);
+                var failure = new LinkedHashMap<String, Object>();
+                failure.put("sessionId", id);
+                failure.put("error", api.message());
+                if (api.requestId() != null) failure.put("requestId", api.requestId());
+                errors.add(failure); }
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("archive".equals(action) ? "archived" : "unarchive".equals(action) ? "unarchived" : "removed", done);

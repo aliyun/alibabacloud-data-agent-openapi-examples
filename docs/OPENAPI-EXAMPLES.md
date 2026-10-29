@@ -159,3 +159,15 @@ Java 创建和改名使用生成式方法，缺少生成方法的接口通过[Po
 | 管理：Create/Get/Update Agent | [agent-management.ts](../server-node/examples/agent-management.ts) | [agent_management.py](../server-python/examples/agent_management.py) | [AgentManagementExample](../server-java/src/main/java/com/das/java/live/AgentManagementExample.java) |
 
 HTTP 200 不等于业务成功：会话接口须检查 `JsonRpcResponse.Error/Result`，创建须得到非空 SessionId；Agent 管理须回读发布定义。SDK 最新版本也可能暂未生成某个 Action 的方法，本仓适配器仍使用官方 SDK 签名与传输。不要为处理连接失败自动重试 Prompt。
+
+## 排查失败请求
+
+取得远端 OpenAPI RequestId 时，`/api` JSON 和 Prompt NDJSON 的错误对象包含 `error.requestId`；`/d` 的字符串错误响应在顶层提供 `requestId`。Events 同时透传上游 `x-acs-request-id` 响应头，断流后也可在 Network 查看。页面报错会显示该 ID。
+
+```json
+{"error":"CreateAgentSession: INSTANCE_START_FAILED","code":"create_failed","requestId":"upstream-request-id"}
+```
+
+排查时提供时间、地域、sessionId 和 requestId。连接尚未到达上游等本地故障可能没有远端 ID，此时省略该字段；不会拿轮次 rid、事件游标或人卡 requestId 冒充。
+
+`INVALID_SESSION_INITIAL_CONFIG` 表示远端拒绝初始会话配置。若上游提供具体原因，错误信息会附带 `reason`：`model_not_available`（模型不在目标实例目录）、`ambiguous_model`（模型匹配不唯一）、`capabilities_unavailable`（模型目录未就绪）、`reasoning_not_available`（模型不支持指定思考选项）。模型需填写目标实例的 `modelId`；留空使用默认模型。样例不会自动换模型重试。

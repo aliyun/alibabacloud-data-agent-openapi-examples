@@ -194,10 +194,12 @@ describe('App new-session settings', () => {
     await mount();
     const previous = globalThis.fetch;
     vi.stubGlobal('fetch', vi.fn((input, init) => String(input).endsWith('/standalone/sessions')
-      ? Promise.resolve(Response.json({ error: 'denied' }, { status: 403 })) : previous(input, init)));
+      ? Promise.resolve(Response.json({ error: 'denied', requestId: 'POP-create-ui', token: 'hidden-response-token' }, { status: 403 })) : previous(input, init)));
     await act(async () => { await expect(harness.actions.createSession()).rejects.toThrow(); });
     expect(readSessionConfiguration(base, 'a', 'server-id')).toBeUndefined();
     expect(screen.getByRole('alert').textContent).toContain('denied');
+    expect(screen.getByRole('alert').textContent?.match(/requestId=POP-create-ui/g)).toHaveLength(1);
+    expect(screen.getByRole('alert').textContent).not.toContain('hidden-response-token');
   });
 
   it('uses the pane connection SID for split-view configuration, never another pane or defaults', async () => {

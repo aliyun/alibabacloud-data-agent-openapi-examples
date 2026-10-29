@@ -4,6 +4,9 @@ import type { Readable } from 'node:stream';
 import { $OpenApiUtil } from '@alicloud/openapi-core';
 import type { SdkClient } from './sdk.js';
 import { runtimeFor, runtimeForSse } from './sdk.js';
+import { headerRequestId } from './normalize.js';
+import { validRequestId } from '@das/shared';
+import { initialConfigErrorMessage } from './initial-config-error.js';
 
 /** Shared POP response handling; also covers Actions still absent from the generated SDK. */
 export async function callOpenApi(client: SdkClient, action: string, params: Record<string, unknown>) {
@@ -12,11 +15,12 @@ export async function callOpenApi(client: SdkClient, action: string, params: Rec
   new $OpenApiUtil.OpenApiRequest({ body: { Jsonrpc: '2.0', Id: randomUUID(), Params: JSON.stringify(params) } }), runtimeFor());
   const normalize = (value: unknown): unknown => Array.isArray(value) ? value.map(normalize)
     : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, val]) => [key[0]!.toLowerCase() + key.slice(1), normalize(val)])) : value;
-  const body = normalize(response.body) as { requestId?: string; jsonRpcResponse?: { error?: { code?: string | number; errorCode?: string; message?: string } } };
+  const body = normalize(response.body) as { requestId?: string; jsonRpcResponse?: { error?: { code?: string | number; errorCode?: string; message?: string; data?: unknown } } };
+  const requestId = validRequestId(body?.requestId) ?? headerRequestId(response.headers);
   if (body?.jsonRpcResponse?.error) {
     const error = body.jsonRpcResponse.error;
-    throw Object.assign(new Error(error.message ?? `${action} failed`), { code: error.code, errorCode: error.errorCode,
-      statusCode: response.statusCode, requestId: body.requestId, data: { RequestId: body.requestId, Code: error.code, ErrorCode: error.errorCode } });
+    throw Object.assign(new Error(initialConfigErrorMessage(error, `${action} failed`)), { code: error.code, errorCode: error.errorCode,
+      statusCode: response.statusCode, requestId, data: { RequestId: requestId, Code: error.code, ErrorCode: error.errorCode } });
   }
   return { ...response, body };
 }

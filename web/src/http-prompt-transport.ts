@@ -1,5 +1,6 @@
-import { DaemonHttpError, type DaemonClient, type DaemonEvent, type DaemonSessionClient, type PromptResult } from '@qwen-code/sdk/daemon';
+import { type DaemonClient, type DaemonEvent, type DaemonSessionClient, type PromptResult } from '@qwen-code/sdk/daemon';
 import { STOP_REASONS } from '@das/shared';
+import { apiHttpError, formatApiError } from './api-error';
 
 export type PromptTransport = 'http-stream' | 'daemon';
 type Outcome = { result: PromptResult; error?: never } | { error: Error; result?: never };
@@ -34,8 +35,8 @@ async function consume(body: ReadableStream<Uint8Array>): Promise<PromptResult> 
         if (!line) continue;
         const value: unknown = JSON.parse(line);
         if (!value || typeof value !== 'object' || !('type' in value)) throw new Error('无效的请求流事件');
-        const event = value as { type: unknown; stopReason?: unknown; error?: { message?: unknown } };
-        if (event.type === 'error') throw new Error(typeof event.error?.message === 'string' ? event.error.message : 'OpenAPI 请求失败');
+        const event = value as { type: unknown; stopReason?: unknown; error?: unknown };
+        if (event.type === 'error') throw new Error(formatApiError(value, 'OpenAPI 请求失败'));
         if (event.type === 'done') {
           if (typeof event.stopReason !== 'string' || !(STOP_REASONS as readonly string[]).includes(event.stopReason)) throw new Error('请求流缺少有效终态');
           return { stopReason: event.stopReason };
@@ -99,7 +100,7 @@ export function installHttpPromptTransport(client: DaemonClient, baseUrl: string
         body: JSON.stringify({ text }), signal: AbortSignal.any([controller.signal, disposal.signal]) });
       if (!response.ok || !response.headers.get('content-type')?.toLowerCase().includes('application/x-ndjson')) {
         const value: unknown = await response.json().catch(() => ({}));
-        throw new DaemonHttpError(response.status, value, 'OpenAPI 请求失败或未返回 NDJSON');
+        throw apiHttpError(response.status, value, 'OpenAPI 请求失败或未返回 NDJSON');
       }
       if (!response.body) throw new Error('OpenAPI 请求没有响应流');
       const finish = (outcome: Outcome, localAbort = false): Outcome => {
@@ -145,7 +146,7 @@ export function installHttpPromptTransport(client: DaemonClient, baseUrl: string
     if (await transport() === 'daemon') return originals.heartbeat.call(client, sessionId, clientId);
     const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionId)}/heartbeat`, { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: '{}', signal: AbortSignal.any([disposal.signal, AbortSignal.timeout(10_000)]) });
-    if (!response.ok) throw new DaemonHttpError(response.status, {}, 'heartbeat 失败');
+    if (!response.ok) throw apiHttpError(response.status, await response.json().catch(() => undefined), 'heartbeat 失败');
     // Adapter acknowledgement time, not proof of remote task liveness.
     return response.status === 204 ? { sessionId, clientId, lastSeenAt: Date.now() } : await response.json();
   };

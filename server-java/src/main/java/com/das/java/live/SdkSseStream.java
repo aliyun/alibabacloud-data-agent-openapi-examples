@@ -33,15 +33,24 @@ public final class SdkSseStream implements AutoCloseable {
 
     public static final class SseException extends Exception {
         private final Integer statusCode;
+        private final String requestId;
 
         public SseException(String message, Integer statusCode) {
+            this(message, statusCode, null);
+        }
+
+        public SseException(String message, Integer statusCode, String requestId) {
             super(message);
             this.statusCode = statusCode;
+            this.requestId = com.das.java.core.ApiError.validRequestId(requestId);
         }
+
+        public String requestId() { return requestId; }
 
         public SseException(String message, Throwable cause) {
             super(message, cause);
             this.statusCode = null;
+            this.requestId = null;
         }
 
         public Integer statusCode() {
@@ -50,6 +59,13 @@ public final class SdkSseStream implements AutoCloseable {
     }
 
     private static final Object END = new Object();
+
+    private final Supplier<Map<String, String>> headers;
+
+    public String requestId() {
+        try { return Normalize.headerRequestId(headers.get()); }
+        catch (Exception unavailable) { return null; }
+    }
 
     private final LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>();
     private volatile Thread reader;
@@ -64,6 +80,12 @@ public final class SdkSseStream implements AutoCloseable {
      * 由消费端用 next(timeoutMs) 逐次执行（load 30s 快速失败；prompt 不设整轮硬上限）。
      */
     public SdkSseStream(String api, Iterator<? extends TeaModel> source, Supplier<Integer> statusCode) {
+        this(api, source, statusCode, () -> null);
+    }
+
+    public SdkSseStream(String api, Iterator<? extends TeaModel> source, Supplier<Integer> statusCode,
+        Supplier<Map<String, String>> headers) {
+        this.headers = headers;
         reader = new Thread(() -> readLoop(api, source, statusCode), "sdk-sse-" + api);
         reader.setDaemon(true);
         reader.start();
@@ -90,7 +112,7 @@ public final class SdkSseStream implements AutoCloseable {
             } catch (Exception ignored) {
                 status = null;
             }
-            SseException failure = new SseException(api + " SSE 读取故障：" + describe(t), status);
+            SseException failure = new SseException(api + " SSE 读取故障：" + Normalize.toApiError(t, null).message(), status, requestId());
             failure.initCause(t);
             queue.offer(new Failure(failure));
         }
@@ -126,6 +148,7 @@ public final class SdkSseStream implements AutoCloseable {
      *                  HISTORY_READ_TIMEOUT_MS 的快速失败）。
      */
     public String next(long timeoutMs) throws SseException {
+        if (closed) return null;
         long deadline = timeoutMs > 0 ? System.nanoTime() + timeoutMs * 1_000_000L : Long.MAX_VALUE;
         while (true) {
             Object item;
@@ -138,10 +161,10 @@ public final class SdkSseStream implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 throw new SseException("SSE 消费被中断", e);
             }
+            if (closed) return null;
             if (item == null) {
-                if (closed) return null;
                 if (timeoutMs > 0 && System.nanoTime() >= deadline) {
-                    throw new SseException("SSE 读停滞超过 " + timeoutMs + "ms", (Integer) null);
+                    throw new SseException("SSE 读停滞超过 " + timeoutMs + "ms", (Integer) null, requestId());
                 }
                 continue;
             }
@@ -155,23 +178,11 @@ public final class SdkSseStream implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        queue.clear();
+        queue.offer(END);
         if (reader != null) {
             reader.interrupt();
         }
     }
 
-    /** 类名 + message + 根 cause：迭代器 sneakyThrow 的原异常必须能溯源到 SDK 内部类。 */
-    private static String describe(Throwable t) {
-        StringBuilder sb = new StringBuilder();
-        Throwable current = t;
-        for (int depth = 0; current != null && depth < 4; depth++) {
-            if (depth > 0) sb.append(" ← ");
-            sb.append(current.getClass().getSimpleName());
-            if (current.getMessage() != null && !current.getMessage().isEmpty()) {
-                sb.append('(').append(current.getMessage()).append(')');
-            }
-            current = current.getCause();
-        }
-        return sb.toString();
-    }
 }

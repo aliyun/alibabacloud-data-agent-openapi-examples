@@ -79,10 +79,14 @@ public final class LiveClient implements AutoCloseable {
     }
 
     LiveClient(AppConfig cfg, PopAdapter pop, AsyncClient rest) {
+        this(cfg, pop, rest, buildClient(cfg, null));
+    }
+
+    LiveClient(AppConfig cfg, PopAdapter pop, AsyncClient rest, AsyncClient sse) {
         this.cfg = cfg;
         this.pop = pop;
         this.rest = rest;
-        this.sse = buildClient(cfg, null);
+        this.sse = sse;
     }
 
     /**
@@ -171,9 +175,9 @@ public final class LiveClient implements AutoCloseable {
                     .params(ListAgentsRequest.Params.builder().maxResults(PAGE_SIZE).build())
                     .build()));
             var body = resp.getBody();
-            var rpc = body.getJsonRpcResponse();
+            var rpc = body == null ? null : body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
-            if (result == null) throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), body.getRequestId()));
+            if (result == null) throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), responseRequestId(body == null ? null : body.getRequestId(), resp.getHeaders())));
             List<String> agents = new ArrayList<>();
             if (result.getAgents() != null) {
                 for (var row : result.getAgents()) {
@@ -183,7 +187,8 @@ public final class LiveClient implements AutoCloseable {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("agents", agents);
             out.put("totalCount", result.getTotalCount());
-            out.put("requestId", body.getRequestId());
+            String responseId = responseRequestId(body.getRequestId(), resp.getHeaders());
+            if (responseId != null) out.put("requestId", responseId);
             return out;
         } catch (DasApiException e) {
             throw e;
@@ -203,10 +208,10 @@ public final class LiveClient implements AutoCloseable {
 
     public Map<String, Object> createSessionWithOptions(SessionOptions options) throws Exception {
         Map<String, Object> result = callResponse("CreateAgentSession", rest.createAgentSession(buildCreateSessionRequest(options))
-            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody())));
+            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody(), response.getHeaders())));
         Object sessionId = result.get("SessionId");
         if (!(sessionId instanceof String id) || id.isBlank())
-            throw new DasApiException(ApiError.createEmptyBody("CreateAgentSession returned no SessionId"));
+            throw new DasApiException(ApiError.createEmptyBody("CreateAgentSession returned no SessionId").withRequestId(result.get("requestId")));
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("sessionId", sessionId);
         if (result.get("requestId") != null) out.put("requestId", result.get("requestId"));
@@ -217,7 +222,7 @@ public final class LiveClient implements AutoCloseable {
         return callResponse("UpdateAgentSessionTitle", rest.updateAgentSessionTitle(UpdateAgentSessionTitleRequest.builder()
             .id(nextRpcId()).jsonrpc(JSONRPC_VERSION)
             .params(UpdateAgentSessionTitleRequest.Params.builder().sessionId(id).title(title).build()).build())
-            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody())));
+            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody(), response.getHeaders())));
     }
 
     public Map<String, Object> archiveSession(String id, boolean archived) throws Exception {
@@ -230,9 +235,15 @@ public final class LiveClient implements AutoCloseable {
 
     public RemoteEventStream events(String id, String cursor) { return pop.events(id, cursor); }
 
-    private static PopAdapter.Output sdkOutput(Integer status, TeaModel body) {
+    private static String responseRequestId(Object bodyId, Map<String, String> headers) {
+        String id = ApiError.validRequestId(bodyId);
+        return id != null ? id : Normalize.headerRequestId(headers);
+    }
+
+    private static PopAdapter.Output sdkOutput(Integer status, TeaModel body, Map<String, String> headers) {
         PopAdapter.Output output = new PopAdapter.Output();
         output.statusCode = status;
+        output.headers = headers;
         output.body = body == null ? null : body.toMap();
         return output;
     }
@@ -246,24 +257,44 @@ public final class LiveClient implements AutoCloseable {
         try {
             PopAdapter.Output output = join(response);
             Map<String, Object> body = output.body;
+            String requestId = body == null ? null : ApiError.validRequestId(body.get("RequestId"));
+            if (requestId == null) requestId = Normalize.headerRequestId(output.headers);
             Object rpcValue = body == null ? null : body.get("JsonRpcResponse");
             Map<?, ?> rpc = rpcValue instanceof Map<?, ?> map ? map : Map.of();
             if (rpc.get("Error") instanceof Map<?, ?> error) {
                 Integer code = error.get("Code") instanceof Number number ? number.intValue() : null;
                 String errorCode = error.get("ErrorCode") instanceof String text ? text : null;
-                String requestId = body.get("RequestId") instanceof String text ? text : null;
-                throw new DasApiException(ApiError.redact(ApiError.classify(api + ": " + error.get("Message")
-                    + (requestId == null ? "" : " | requestId=" + requestId), code, errorCode, output.statusCode)));
+                String message = error.get("Message") instanceof String text ? text : "Upstream JSON-RPC request failed";
+                message = initialConfigMessage(error, errorCode, message);
+                throw new DasApiException(ApiError.redact(ApiError.classify(api + ": " + message
+                    + (requestId == null ? "" : " | requestId=" + requestId), code, errorCode, output.statusCode).withRequestId(requestId)));
             }
             if (!(rpc.get("Result") instanceof Map<?, ?> result)) {
                 throw new DasApiException(ApiError.apiError("rpc_error", api + " returned no JsonRpcResponse.Result"
-                    + (body == null || body.get("RequestId") == null ? "" : " | requestId=" + body.get("RequestId"))));
+                    + (requestId == null ? "" : " | requestId=" + requestId)).withRequestId(requestId));
             }
             Map<String, Object> out = new LinkedHashMap<>((Map<String, Object>) result);
-            if (body.get("RequestId") != null) out.put("requestId", body.get("RequestId"));
+            out.remove("requestId"); // A Result field is not POP response metadata.
+            if (requestId != null) out.put("requestId", requestId);
             return out;
         } catch (DasApiException e) { throw e; }
         catch (Exception e) { throw toDas(e, api); }
+    }
+
+    /** Expose only this error's closed reason vocabulary, never arbitrary upstream diagnostics. */
+    private static String initialConfigMessage(Map<?, ?> error, String errorCode, String message) {
+        if (!"INVALID_SESSION_INITIAL_CONFIG".equals(errorCode) && !"INVALID_SESSION_INITIAL_CONFIG".equals(message)) return message;
+        Object data = error.get("Data");
+        if (!(data instanceof Map<?, ?>)) data = error.get("data");
+        if (data instanceof Map<?, ?> diagnostics && diagnostics.get("reason") instanceof String reason) {
+            switch (reason) {
+                case "capabilities_unavailable", "ambiguous_model", "model_not_available", "reasoning_not_available":
+                    return message + " (reason=" + reason + ")";
+                default:
+                    break;
+            }
+        }
+        return message;
     }
 
     /** 9.0.17 models all initial options used by the workbench. */
@@ -316,7 +347,7 @@ public final class LiveClient implements AutoCloseable {
 
             Map<String, Object> result = callResponse("ListAgentSessions", rest.listAgentSessions(ListAgentSessionsRequest.builder()
                 .id(nextRpcId()).jsonrpc(JSONRPC_VERSION).params(params.build()).build())
-                .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody())));
+                .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody(), response.getHeaders())));
             if (result.get("TotalCount") instanceof Number number) total = number.intValue();
             if (result.get("AgentSessions") instanceof List<?> rows) for (Object raw : rows) {
                 if (!(raw instanceof Map<?, ?> row) || !(row.get("SessionId") instanceof String id) || id.isBlank()) continue;
@@ -363,10 +394,10 @@ public final class LiveClient implements AutoCloseable {
                         .build())
                     .build()));
             var body = resp.getBody();
-            var rpc = body.getJsonRpcResponse();
+            var rpc = body == null ? null : body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
             if (result == null) {
-                throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), body.getRequestId()));
+                throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), responseRequestId(body == null ? null : body.getRequestId(), resp.getHeaders())));
             }
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("promptTokens", result.getPromptTokens());
@@ -375,7 +406,8 @@ public final class LiveClient implements AutoCloseable {
             out.put("cachedTokens", result.getCachedTokens());
             out.put("thoughtsTokens", result.getThoughtsTokens());
             out.put("elapsedMs", System.currentTimeMillis() - started);
-            if (body.getRequestId() != null) out.put("requestId", body.getRequestId());
+            String responseId = responseRequestId(body.getRequestId(), resp.getHeaders());
+            if (responseId != null) out.put("requestId", responseId);
             return out;
         } catch (DasApiException e) {
             throw e;
@@ -398,10 +430,10 @@ public final class LiveClient implements AutoCloseable {
                         .build())
                     .build()));
             var body = resp.getBody();
-            var rpc = body.getJsonRpcResponse();
+            var rpc = body == null ? null : body.getJsonRpcResponse();
             var result = rpc == null ? null : rpc.getResult();
             if (result == null) {
-                throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), body.getRequestId()));
+                throw new DasApiException(Normalize.missingResultError(api, resp.getStatusCode(), responseRequestId(body == null ? null : body.getRequestId(), resp.getHeaders())));
             }
             List<Object> artifacts = new ArrayList<>();
             if (result.getArtifacts() != null) {
@@ -450,7 +482,10 @@ public final class LiveClient implements AutoCloseable {
             return result;
         } catch (Exception error) {
             ApiError failure = Normalize.toApiError(error, "CancelAgentSession");
-            return Map.of("accepted", false, "delivered", false, "warning", "cancel-upstream-error", "detail", failure.message());
+            Map<String, Object> result = new LinkedHashMap<>(Map.of("accepted", false, "delivered", false,
+                "warning", "cancel-upstream-error", "detail", failure.message()));
+            if (failure.requestId() != null) result.put("requestId", failure.requestId());
+            return result;
         }
     }
 
@@ -489,20 +524,20 @@ public final class LiveClient implements AutoCloseable {
                     .build()));
 
             ReplyAgentSessionResponseBody body = resp.getBody();
-            var rpc = body.getJsonRpcResponse();
-            String requestId = body.getRequestId();
+            var rpc = body == null ? null : body.getJsonRpcResponse();
+            String requestId = responseRequestId(body == null ? null : body.getRequestId(), resp.getHeaders());
             if (rpc != null && rpc.getError() != null) {
                 var error = rpc.getError();
                 throw new DasApiException(ApiError.redact(ApiError.apiError("rpc_error",
                     api + " 被上游拒绝：" + (error.getMessage() != null ? error.getMessage() : "无 message")
                         + (error.getErrorCode() != null ? " [" + error.getErrorCode() + "]" : "")
                         + (error.getCode() != null ? " (code=" + error.getCode() + ")" : "")
-                        + (requestId != null ? "，RequestId " + requestId : ""))));
+                        + (requestId != null ? "，RequestId " + requestId : "")).withRequestId(requestId)));
             }
             if (rpc == null || rpc.getResult() == null || rpc.getResult().getAccepted() == null) {
                 throw new DasApiException(ApiError.redact(ApiError.apiError("rpc_error",
                     api + " 返回 HTTP 200 但没有 JsonRpcResponse.Result.accepted"
-                        + (requestId != null ? "（RequestId " + requestId + "）" : ""))));
+                        + (requestId != null ? "（RequestId " + requestId + "）" : "")).withRequestId(requestId)));
             }
             boolean accepted = rpc.getResult().getAccepted();
             Map<String, Object> out = new LinkedHashMap<>();
@@ -563,7 +598,7 @@ public final class LiveClient implements AutoCloseable {
                             .build())
                         .build());
             return new RecoveringPromptStream(promptId,
-                RecoveringPromptStream.wrap(new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode)),
+                RecoveringPromptStream.wrap(new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode, iterable::getHeaders)),
                 (offset, remainingMs) -> openLoadStream(sessionId, offset));
         } catch (Exception e) {
             throw toDas(e, api);
@@ -577,7 +612,7 @@ public final class LiveClient implements AutoCloseable {
             .params(LoadAgentSessionRequest.Params.builder().sessionId(sessionId)
                 .meta(LoadAgentSessionRequest.Meta.builder().isReload(true).beginLogOffset(offset).build())
                 .build()).build());
-        return RecoveringPromptStream.wrap(new SdkSseStream("LoadAgentSession", iterable.iterator(), iterable::getStatusCode), loadId);
+        return RecoveringPromptStream.wrap(new SdkSseStream("LoadAgentSession", iterable.iterator(), iterable::getStatusCode, iterable::getHeaders), loadId);
     }
 
 }

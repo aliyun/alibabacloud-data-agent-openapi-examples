@@ -2,6 +2,8 @@
 import { $OpenApiUtil } from '@alicloud/openapi-core';
 import type { SdkClient } from '../src/sdk.js';
 import { runtimeFor } from '../src/sdk.js';
+import { headerRequestId } from '../src/normalize.js';
+import { validRequestId } from '@das/shared';
 
 async function agentCall(client: SdkClient, action: string, fields: Record<string, unknown>) {
   // Agent management uses top-level form fields, NOT session JSON-RPC Params.
@@ -10,7 +12,10 @@ async function agentCall(client: SdkClient, action: string, fields: Record<strin
   const response = await client.callApi(new $OpenApiUtil.Params({ action, version: '2024-05-18', protocol: 'HTTPS',
     pathname: '/', method: 'POST', authType: 'AK', style: 'RPC', reqBodyType: 'formData', bodyType: 'json' }),
   new $OpenApiUtil.OpenApiRequest({ body }), runtimeFor());
-  if (!response.body?.Agent) throw new Error(`${action} 未返回 Agent；先查询结果，不能盲目重复写入`);
+  if (!response.body?.Agent || response.body?.Error) {
+    const requestId = validRequestId(response.body?.RequestId) ?? headerRequestId(response.headers);
+    throw Object.assign(new Error(`${action} 未返回有效 Agent；先查询结果，不能盲目重复写入`), requestId ? { requestId } : {});
+  }
   return response.body as Record<string, unknown>;
 }
 

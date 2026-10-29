@@ -12,6 +12,6 @@ labels: question
 
 **已排除的可能**
 
-- 已读过 [常见问题](../../README.md#常见问题) 与 [开发说明](../../docs/DEVELOPMENT.md)？
+- 已读过 [使用说明](../../README.md#网页使用) 与 [开发说明](../../docs/DEVELOPMENT.md)？
 - `npm run check` 三步自检的结果？
 - MOCK 模式（`MOCK=1`）下能复现吗？

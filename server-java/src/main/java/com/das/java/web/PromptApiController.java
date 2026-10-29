@@ -127,6 +127,7 @@ public class PromptApiController {
     private interface FrameSource extends AutoCloseable {
         /** 下一帧；源结束返回 null。故障抛 DasApiException。 */
         Map<String, Object> next() throws DasApiException;
+        default String requestId() { return null; }
 
         @Override
         void close();
@@ -166,6 +167,9 @@ public class PromptApiController {
             this.outbound = outbound;
             this.acks = acks;
         }
+
+        @Override
+        public String requestId() { return stream == null ? null : stream.requestId(); }
 
         @Override
         public Map<String, Object> next() throws DasApiException {
@@ -230,7 +234,9 @@ public class PromptApiController {
         Thread producer = new Thread(() -> {
             try {
                 while (true) {
-                    Map<String, Object> frame = source.next();
+                    Map<String, Object> frame;
+                    try { frame = source.next(); }
+                    finally { pipeline.requestId(source.requestId()); }
                     if (frame == null) break;
                     for (Map<String, Object> event : pipeline.onFrame(frame)) {
                         if (!enqueue(events, event, disconnected)) return;

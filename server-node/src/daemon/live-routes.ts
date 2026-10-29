@@ -50,7 +50,7 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
       try { context = forAgent(request.query?.agentName); }
       catch (error) { return reply.code(400).send({ error: (error as Error).message, code: 'invalid_agent_name' }); }
       const result = await liveListSessions(context, request.query?.archiveState === 'archived');
-      if (!result.ok) return reply.code(502).send({ error: result.error.message, code: 'list_failed' });
+      if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'list_failed' });
       return { sessions: result.result.sessions.map(summary), truncated: result.result.truncated === true };
     });
     d.post<{ Body: Record<string, unknown> }>('/standalone/sessions', async (request, reply) => {
@@ -58,7 +58,7 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
       try { options = sessionOptions(cfg, request.body ?? {}); }
       catch (error) { return reply.code(400).send({ error: (error as Error).message, code: 'invalid_session_options' }); }
       const result = await liveCreateSession(live, options);
-      if (!result.ok) return reply.code(502).send({ error: result.error.message, code: 'create_failed' });
+      if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'create_failed' });
       return sessionBody(result.result.sessionId);
     });
     d.get<{ Params: { id: string }; Querystring: { agentName?: unknown } }>('/standalone/sessions/:id', async (request, reply) => {
@@ -68,7 +68,7 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
       let truncated = false;
       for (const archived of [false, true]) {
         const result = await liveListSessions(context, archived);
-        if (!result.ok) return reply.code(502).send({ error: result.error.message, code: 'lookup_failed' });
+        if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'lookup_failed' });
         const row = result.result.sessions.find(row => row.sessionId === request.params.id);
         if (row) return summary(row);
         truncated ||= result.result.truncated === true;
@@ -84,7 +84,7 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
           eventEpoch: `openapi:${cfg.regionId}:${id}` };
       } catch (error) {
         const api = toApiError(error, 'LoadAgentSession');
-        return reply.code(api.kind === 'transport' ? 502 : 404).send({ error: api.message, code: 'load_failed' });
+        return reply.code(api.kind === 'transport' ? 502 : 404).send({ error: api.message, requestId: api.requestId, code: 'load_failed' });
       }
     }
     for (const operation of ['load', 'resume']) {
@@ -92,13 +92,13 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
     }
     d.get<{ Params: { id: string } }>('/session/:id/transcript', async (request, reply) => {
       try { return { v: 1, sessionId: request.params.id, events: historyFramesToEvents(await liveLoadFrames(live, request.params.id), request.params.id), hasMore: false }; }
-      catch (error) { return reply.code(502).send({ error: toApiError(error, 'LoadAgentSession').message, code: 'history_failed' }); }
+      catch (error) { return reply.code(502).send({ error: toApiError(error, 'LoadAgentSession').message, requestId: toApiError(error, 'LoadAgentSession').requestId, code: 'history_failed' }); }
     });
     async function rename(id: string, value: unknown, reply: FastifyReply) {
       const name = typeof value === 'string' ? value.trim() : '';
       if (!name || name.length > 512) return reply.code(400).send({ error: 'displayName 不能为空且最多512字符', code: 'invalid_metadata' });
       const result = await liveSessionMutation(live, 'UpdateAgentSessionTitle', id, { Title: name });
-      if (!result.ok) return reply.code(502).send({ error: result.error.message, code: 'rename_failed' });
+      if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'rename_failed' });
       return { sessionId: id, displayName: name };
     }
     for (const path of ['/session/:id/metadata', '/standalone/sessions/:id/metadata']) {
@@ -107,12 +107,12 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
     for (const action of ['archive', 'unarchive', 'delete'] as const) {
       d.post<{ Body: { sessionIds?: unknown } }>(`/standalone/sessions/${action}`, async request => {
         const ids = (Array.isArray(request.body?.sessionIds) ? request.body.sessionIds : []).filter((id): id is string => typeof id === 'string');
-        const done: string[] = []; const errors: Array<{ sessionId: string; code: string; message: string }> = [];
+        const done: string[] = []; const errors: Array<{ sessionId: string; code: string; message: string; requestId?: string }> = [];
         for (const id of ids) {
           const result = await liveSessionMutation(live, action === 'delete' ? 'DeleteAgentSession' : 'ArchiveAgentSession', id,
             action === 'delete' ? {} : { Archived: action === 'archive' });
           if (result.ok) done.push(id);
-          else errors.push({ sessionId: id, code: result.error.kind, message: result.error.message });
+          else errors.push({ sessionId: id, code: result.error.kind, message: result.error.message, requestId: result.error.requestId });
         }
         return action === 'delete' ? { removed: done, notFound: [], errors, fileCleanupPending: [] }
           : action === 'archive' ? { archived: done, alreadyArchived: [], notFound: [], errors }
@@ -121,12 +121,12 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
     }
     d.delete<{ Params: { id: string } }>('/session/:id', async (request, reply) => {
       const result = await liveSessionMutation(live, 'DeleteAgentSession', request.params.id);
-      return result.ok ? reply.code(204).send() : reply.code(502).send({ error: result.error.message, code: 'delete_failed' });
+      return result.ok ? reply.code(204).send() : reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'delete_failed' });
     });
     d.post<{ Params: { id: string } }>('/session/:id/cancel', async (request, reply) => {
       const result = await liveCancel(live, request.params.id);
       if (!result.ok || (!result.result.delivered && !result.result.noop && !result.result.accepted)) {
-        return reply.code(502).send({ error: result.ok ? result.result.detail : result.error.message, code: 'cancel_failed' });
+        return reply.code(502).send({ error: result.ok ? result.result.detail : result.error.message, requestId: result.ok ? result.result.requestId : result.error.requestId, code: 'cancel_failed' });
       }
       return reply.code(204).send();
     });
@@ -142,8 +142,8 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
       }
       try { await streamRemoteEvents(reply, live, request.params.id, cursor); }
       catch (error) {
-        if (!reply.sent) return reply.code(502).send({ error: toApiError(error, 'GetAgentSessionEvents').message, code: 'events_upstream_failed' });
-        app.log.warn({ sessionId: request.params.id }, '远端 Events 流结束；不重发 Prompt');
+        if (!reply.sent) return reply.code(502).send({ error: toApiError(error, 'GetAgentSessionEvents').message, requestId: toApiError(error, 'GetAgentSessionEvents').requestId, code: 'events_upstream_failed' });
+        app.log.warn({ sessionId: request.params.id, requestId: toApiError(error, 'GetAgentSessionEvents').requestId }, '远端 Events 流结束；不重发 Prompt');
       }
       return reply;
     });
@@ -159,8 +159,8 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
         if (kind === 'selected' && !optionId && (!answers || !Object.keys(answers).length)) return reply.code(400).send({ error: '需要 optionId 或 answers', code: 'invalid_permission_response' });
         const result = await liveReply(live, request.params.id, { permissionRequestId: request.params.requestId, outcome: kind, answers,
           ...(optionId ? { optionId } : {}) });
-        if (!result.ok) return reply.code(502).send({ error: result.error.message, code: 'permission_upstream_error' });
-        return result.result.accepted ? reply.send({}) : reply.code(404).send({ error: '上游未接受此回覆', code: 'permission_not_accepted' });
+        if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'permission_upstream_error' });
+        return result.result.accepted ? reply.send({}) : reply.code(404).send({ error: '上游未接受此回覆', requestId: result.result.requestId, code: 'permission_not_accepted' });
       });
     d.post('/permission/:requestId', async (_request, reply) => reply.code(410).send({ error: 'LIVE 回覆必须提供 sessionId', code: 'session_id_required' }));
     for (const operation of ['model', 'approval-mode', 'config-option']) {

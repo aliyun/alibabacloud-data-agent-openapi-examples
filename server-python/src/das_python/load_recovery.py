@@ -5,12 +5,12 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from .errors import api_error, classify_error
-from .normalize import SdkError, to_api_error
+from .normalize import SdkError, to_api_error, with_request_id
 
 
 async def read_load_snapshot(open_stream: Callable[[int], tuple[str, AsyncIterator[dict[str, Any]]]],
                              *, budget_ms: int = 30_000, attempts: int = 3,
-                             delay_ms: int = 250) -> list[dict[str, Any]]:
+                             delay_ms: int = 250, pop_request_ids: list[str] | None = None) -> list[dict[str, Any]]:
     deadline = time.monotonic() + budget_ms / 1000
     for attempt in range(attempts):
         if time.monotonic() >= deadline:
@@ -33,12 +33,13 @@ async def read_load_snapshot(open_stream: Callable[[int], tuple[str, AsyncIterat
                 reason = (frame.get("Result") or {}).get("stopReason")
                 if own and isinstance(reason, str) and reason:
                     if reason != "end_turn":
-                        raise SdkError(api_error("stream_break", "Load 历史快照未正常完成。"))
+                        raise SdkError(api_error("stream_break", "Load 历史快照未正常完成。", requestId=(pop_request_ids or [None])[-1]))
                     return frames
         except Exception as error:
-            if to_api_error(error, "LoadAgentSession").kind != "transport":
-                raise
-            if time.monotonic() >= deadline or attempt + 1 >= attempts:
+            api = with_request_id(to_api_error(error, "LoadAgentSession"), (pop_request_ids or [None])[-1])
+            if api.kind != "transport" or time.monotonic() >= deadline or attempt + 1 >= attempts:
+                if api.requestId:
+                    raise SdkError(api) from error
                 raise
         finally:
             if source is not None:
@@ -49,4 +50,4 @@ async def read_load_snapshot(open_stream: Callable[[int], tuple[str, AsyncIterat
         if time.monotonic() + delay >= deadline:
             break
         await asyncio.sleep(delay)
-    raise SdkError(api_error("stream_break", "Load 历史流中断，未取得本次快照终态；未返回部分历史。"))
+    raise SdkError(api_error("stream_break", "Load 历史流中断，未取得本次快照终态；未返回部分历史。", requestId=(pop_request_ids or [None])[-1]))

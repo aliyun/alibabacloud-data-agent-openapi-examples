@@ -74,7 +74,8 @@ async def test_remote_events_error_closes_without_waiting_for_a_local_receipt():
             yield
     stream = _remote_sse_stream(LiveContext(Broken(), config()), 's', None)
     try:
-        assert 'events_upstream_error' in await asyncio.wait_for(anext(stream), .2)
+        with pytest.raises(ConnectionError, match='synthetic remote failure'):
+            await asyncio.wait_for(anext(stream), .2)
         with pytest.raises(StopAsyncIteration):
             await asyncio.wait_for(anext(stream), .2)
     finally:

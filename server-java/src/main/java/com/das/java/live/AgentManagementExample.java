@@ -139,7 +139,9 @@ public final class AgentManagementExample implements AutoCloseable {
             Map<String, Object> body = response.body;
             if (body == null || Boolean.FALSE.equals(body.get("Success")) || Boolean.FALSE.equals(body.get("success"))
                 || body.get("Error") != null || body.get("error") != null || !(body.get("Agent") instanceof Map<?, ?>))
-                throw new Normalize.DasApiException(ApiError.apiError("rpc_error", action + " returned an error or no Agent"));
+                throw new Normalize.DasApiException(ApiError.apiError("rpc_error", action + " returned an error or no Agent")
+                    .withRequestId(body == null ? null : body.get("RequestId"))
+                    .withRequestId(Normalize.headerRequestId(response.headers)));
             return java.util.Collections.unmodifiableMap(new LinkedHashMap<>(body));
         } catch (Exception error) {
             throw new Normalize.DasApiException(Normalize.toApiError(error, action), error);

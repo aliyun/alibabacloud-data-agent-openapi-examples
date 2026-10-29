@@ -25,6 +25,13 @@ public final class Pipeline {
     private final long startedAt;
 
     private String rid;
+    private String popRequestId;
+    private boolean requestMetadataSet;
+
+    public void requestId(String value) {
+        requestMetadataSet = true;
+        popRequestId = ApiError.validRequestId(value);
+    }
     private boolean metaSent;
     private int frameCount;
     private Frames.TerminalInfo terminal;
@@ -80,7 +87,7 @@ public final class Pipeline {
                 frameError.get("message") instanceof String s ? s : null,
                 code instanceof Number n ? n.intValue() : null,
                 frameError.get("errorCode") instanceof String s ? s : null,
-                null));
+                null).withRequestId(popRequestId));
             Map<String, Object> errorEvent = new LinkedHashMap<>();
             errorEvent.put("rid", rid != null ? rid : "");
             errorEvent.put("error", error.toMap());
@@ -98,12 +105,12 @@ public final class Pipeline {
     public Map<String, Object> onError(DasApiException error, String apiName) {
         Map<String, Object> errorEvent = new LinkedHashMap<>();
         errorEvent.put("rid", rid != null ? rid : "");
-        ApiError normalized = ApiError.redact(error.apiError());
+        ApiError normalized = ApiError.redact(error.apiError().withRequestId(popRequestId));
         String message = normalized.message();
         if (apiName != null && !message.contains(apiName)) {
             normalized = new ApiError(
                 normalized.kind(), normalized.code(), normalized.errorCode(), apiName + ": " + message,
-                normalized.retryable(), normalized.fatalForSession(), normalized.upstreamStatus());
+                normalized.retryable(), normalized.fatalForSession(), normalized.upstreamStatus(), normalized.requestId());
         }
         errorEvent.put("error", normalized.toMap());
         return event("error", errorEvent);
@@ -114,6 +121,12 @@ public final class Pipeline {
      * popRequestIds：上游只回 POP 回执、零帧时那些回执的 RequestId（唯一可查的线索）。
      */
     public Map<String, Object> finish(List<String> popRequestIds) {
+        if (!requestMetadataSet && popRequestId == null && popRequestIds != null) {
+            for (String id : popRequestIds) {
+                String valid = ApiError.validRequestId(id);
+                if (valid != null) { popRequestId = valid; break; }
+            }
+        }
         if (errorSent) return null;
         if (terminal != null) {
             if (!mock && terminal.stopReason() == null)
@@ -134,7 +147,7 @@ public final class Pipeline {
             : ApiError.streamBreakWithoutTerminal(frameCount);
         Map<String, Object> errorEvent = new LinkedHashMap<>();
         errorEvent.put("rid", rid != null ? rid : "");
-        errorEvent.put("error", error.toMap());
+        errorEvent.put("error", error.withRequestId(popRequestId).toMap());
         return event("error", errorEvent);
     }
 
@@ -147,6 +160,7 @@ public final class Pipeline {
         error.put("message", "session stream ended without turn terminal (hard limit reached)");
         error.put("retryable", false);
         error.put("fatalForSession", false);
+        if (popRequestId != null) error.put("requestId", popRequestId);
         errorEvent.put("error", error);
         return event("error", errorEvent);
     }

@@ -66,4 +66,48 @@ class LoadSnapshotReaderTest {
         }, 30, 3, 0));
         assertEquals(1, calls.size()); assertTrue(calls.get(0).closed);
     }
+    @Test void ackSurvivesEofAndTransportFailureButHistoricalRidDoesNotBecomePopId() {
+        for (boolean transport : new boolean[]{false, true}) {
+            var source = new Source(List.of("{\"RequestId\":\"pop-load\"}", CHUNK));
+            if (transport) source.error = new IOException("reset");
+            var failure = assertThrows(DasApiException.class,
+                () -> LoadSnapshotReader.read(remaining -> source, 1000, 1, 0));
+            assertEquals("pop-load", failure.apiError().requestId());
+        }
+        var source = new Source(List.of("{\"RequestId\":\"turn-rid\",\"Params\":{}}"));
+        var failure = assertThrows(DasApiException.class,
+            () -> LoadSnapshotReader.read(remaining -> source, 1000, 1, 0));
+        assertNull(failure.apiError().requestId());
+    }
+
+
+    @Test void headerWinsOverAckAndExceptionIdWithoutChangingRetryCount() {
+        var source = new Source(List.of("{\"RequestId\":\"ack-id\"}")) {
+            public String requestId() { return "header-id"; }
+        };
+        source.error = new DasApiException(com.das.java.core.ApiError.apiError("rpc_error", "denied").withRequestId("exception-id"));
+        var failure = assertThrows(DasApiException.class,
+            () -> LoadSnapshotReader.read(remaining -> source, 1000, 1, 0));
+        assertEquals("header-id", failure.apiError().requestId());
+    }
+
+    @Test void retryDoesNotReusePriorLoadMetadata() {
+        var calls = new ArrayList<Source>();
+        var failure = assertThrows(DasApiException.class, () -> LoadSnapshotReader.read(remaining -> {
+            var source = new Source(calls.isEmpty() ? List.of("{\"RequestId\":\"first-load\"}") : List.of());
+            if (!calls.isEmpty()) source.error = new DasApiException(com.das.java.core.ApiError.apiError("rpc_error", "denied"));
+            calls.add(source); return source;
+        }, 1000, 3, 0));
+        assertEquals(2, calls.size());
+        assertNull(failure.apiError().requestId());
+    }
+
+    @Test void unsafeHeaderDoesNotBlockAValidPureAck() {
+        var source = new Source(List.of("{\"RequestId\":\"valid-ack\"}")) {
+            public String requestId() { return "bad\nheader"; }
+        };
+        var failure = assertThrows(DasApiException.class,
+            () -> LoadSnapshotReader.read(remaining -> source, 1000, 1, 0));
+        assertEquals("valid-ack", failure.apiError().requestId());
+    }
 }

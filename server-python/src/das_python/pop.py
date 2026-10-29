@@ -11,8 +11,9 @@ from typing import Any
 
 from alibabacloud_tea_openapi.utils_models import OpenApiRequest, Params
 
-from .errors import api_error, redact_api_error
-from .normalize import SdkError, lower_first_keys
+from .errors import api_error, initial_config_error_message, redact_api_error, safe_request_id
+from .normalize import SdkError, lower_first_keys, remote_request_id, to_api_error, with_request_id
+from .frames import pop_ack_request_id
 
 
 def descriptor(action: str, method: str = "POST") -> Params:
@@ -27,17 +28,19 @@ async def rpc(ctx: Any, action: str, params: dict[str, Any]) -> dict[str, Any]:
     response = await ctx.client.call_api_async(descriptor(action), request, runtime_for())
     body = response.get("body") if isinstance(response, dict) else None
     if not isinstance(body, dict):
-        raise SdkError(api_error("rpc_error", f"{action}: missing response body"))
+        raise SdkError(api_error("rpc_error", f"{action}: missing response body", requestId=remote_request_id(response)))
     body = lower_first_keys(body)
-    envelope = body.get("jsonRpcResponse") or {}
+    request_id = safe_request_id(body.get("requestId")) or remote_request_id(response)
+    envelope = body.get("jsonRpcResponse")
+    envelope = envelope if isinstance(envelope, dict) else {}
     error = envelope.get("error")
     if error is not None:
-        message = error.get("message", "unknown error") if isinstance(error, dict) else str(error)
-        raise SdkError(redact_api_error(api_error("rpc_error", f"{action}: {message} (RequestId={body.get('requestId', '')})")))
+        message = initial_config_error_message(error, "unknown error") if isinstance(error, dict) else str(error)
+        raise SdkError(redact_api_error(api_error("rpc_error", f"{action}: {message} (RequestId={request_id or ''})", requestId=request_id)))
     result = envelope.get("result")
     if not isinstance(result, dict):
-        raise SdkError(api_error("rpc_error", f"{action}: missing JsonRpcResponse.Result"))
-    return {"result": result, "requestId": body.get("requestId")}
+        raise SdkError(api_error("rpc_error", f"{action}: missing JsonRpcResponse.Result", requestId=request_id))
+    return {"result": result, "requestId": request_id}
 
 
 def _event_object(value: Any) -> dict[str, Any] | None:
@@ -110,7 +113,7 @@ def _parse_event(payload: Any, outer_id: Any, outer_event: str | None, session_i
     return {"id": cursor, "event": kind, "data": data}
 
 
-async def session_events(ctx: Any, session_id: str, last_event_id: str | None):
+async def session_events(ctx: Any, session_id: str, last_event_id: str | None, *, expose_headers: bool = False):
     """Decode raw/POP SSE without product-model casting or journal cursors."""
     from .live import runtime_for
     last_event_id = _safe_cursor(last_event_id)
@@ -118,15 +121,29 @@ async def session_events(ctx: Any, session_id: str, last_event_id: str | None):
                              headers={"accept": "text/event-stream", **({"Last-Event-Id": last_event_id} if last_event_id else {})})
     stream = ctx.client.call_sseapi_async(descriptor("GetAgentSessionEvents", "GET"), request, runtime_for())
     stream = await stream if inspect.isawaitable(stream) else stream
+    pop_id = None
+    header_id = None
+    announced = False
     try:
         async for response in stream:
+            header_id = remote_request_id(response) or header_id
+            pop_id = header_id or pop_id
             event = response.event
             if event is None or not event.data:
-                yield {"heartbeat": True}
-                continue
-            parsed = _parse_event(json.loads(event.data), event.id, event.event, session_id)
+                parsed = {"heartbeat": True}
+            else:
+                payload = json.loads(event.data)
+                pop_id = header_id or safe_request_id(pop_ack_request_id(payload)) or pop_id
+                parsed = _parse_event(payload, event.id, event.event, session_id)
+            if expose_headers and not announced:
+                announced = True
+                yield {"responseHeaders": {"x-acs-request-id": header_id} if header_id else {}}
             if parsed is not None:
                 yield parsed
+    except Exception as exc:
+        if not pop_id:
+            raise
+        raise SdkError(with_request_id(to_api_error(exc, "GetAgentSessionEvents"), pop_id, prefer=bool(header_id))) from exc
     finally:
         close = getattr(stream, "aclose", None)
         if close:

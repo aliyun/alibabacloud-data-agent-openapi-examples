@@ -10,6 +10,7 @@ import { replayFrames } from '../mock/replay.js';
 import { streamWire } from '../ndjson.js';
 import { toWireEvents } from '../pipeline.js';
 import type { SdkClient } from '../sdk.js';
+import type { StreamTraceScope } from '../stream-diagnostics.js';
 
 interface PromptBody {
   text?: unknown;
@@ -42,7 +43,7 @@ export async function registerPromptRoutes(
      *
      * LIVE 不使用进程级会话锁；每个连接独立拥有 rid、恢复游标及终态。
      */
-    async function pump(frames: AsyncIterable<AcpFrame>, popRequestIds: string[]): Promise<FastifyReply> {
+    async function pump(frames: AsyncIterable<AcpFrame>, popRequestIds: string[], trace?: StreamTraceScope): Promise<FastifyReply> {
       const acquired = live ? undefined : tryAcquire(sessionId);
       if (acquired && !acquired.ok) {
         app.log.info(
@@ -71,6 +72,7 @@ export async function registerPromptRoutes(
             startedAt: Date.now(),
             apiName: 'PromptAgentSession',
             popRequestIds,
+            trace,
           }),
           {
             log: app.log as FastifyBaseLogger,
@@ -118,7 +120,8 @@ export async function registerPromptRoutes(
        * 管道收尾分类（零帧 ⇒ prompt_not_dispatched）时再读出来带进错误 message。
        */
       const popRequestIds: string[] = [];
-      return pump(livePromptFrames(live, sessionId, outbound, popRequestIds), popRequestIds);
+      const trace: StreamTraceScope = {};
+      return pump(livePromptFrames(live, sessionId, outbound, popRequestIds, trace), popRequestIds, trace);
     }
 
     const scenario = findScenario(sessionId);

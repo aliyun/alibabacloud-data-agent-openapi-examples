@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from .constants import STOP_REASONS
+from .errors import safe_request_id
 
 # ---------------------------------------------------------------------------
 # 宽松帧形状
@@ -104,10 +105,11 @@ def pop_ack_request_id(body: Any) -> str | None:
     它不是 rid（不能用来过滤历史），但在零帧场景下是唯一还能拿去查这次调用的线索。
     """
     inner = unwrap_envelope(body)
-    if not is_object(inner):
+    if (not is_object(inner) or not set(inner).issubset(POP_ONLY_KEYS)
+            or "Id" in inner or "id" in inner):
         return None
     value = inner.get("RequestId", inner.get("requestId"))
-    return value if isinstance(value, str) and value else None
+    return safe_request_id(value)
 
 
 def parse_recorded_line(line: str) -> Frame | None:

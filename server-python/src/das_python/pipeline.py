@@ -25,7 +25,7 @@ from .errors import (
     stream_break_without_terminal,
 )
 from .frames import error_of, offset_of, request_id_of, terminal_of
-from .normalize import SdkError, to_api_error
+from .normalize import SdkError, to_api_error, with_request_id
 
 
 class PipelineInput:
@@ -79,7 +79,7 @@ async def to_wire_events(input_: PipelineInput) -> AsyncGenerator[dict[str, Any]
                 error_sent = True
                 # 这一条也要过脱敏：上游鉴权类报文会把调用方的 AccessKeyId 原文回显出来，
                 # 而 wire 事件是要渲染进前端的。异常路径在 toApiError 里已内置，帧内路径在这里。
-                yield {"type": "error", "rid": rid or "", "error": redact_api_error(classify_frame_error(frame_error)).to_dict()}
+                yield {"type": "error", "rid": rid or "", "error": redact_api_error(classify_frame_error(frame_error, (input_.popRequestIds or [None])[-1])).to_dict()}
 
             terminal = terminal if terminal is not None else terminal_of(frame)
     except SdkError as err:
@@ -87,14 +87,14 @@ async def to_wire_events(input_: PipelineInput) -> AsyncGenerator[dict[str, Any]
         # 必须在这里捕获：走到这一步响应已经进入流式传输，异常再往上抛没有任何人能
         # 把它翻译成前端看得懂的东西。归一成一条 error 事件后直接结束。
         if not error_sent:
-            yield {"type": "error", "rid": rid or "", "error": to_api_error(err, input_.apiName or "upstream").to_dict()}
+            yield {"type": "error", "rid": rid or "", "error": with_request_id(to_api_error(err, input_.apiName or "upstream"), (input_.popRequestIds or [None])[-1]).to_dict()}
         return
     except Exception as err:  # noqa: BLE001
         if not error_sent:
             api_err: ApiError = to_api_error(
                 err if isinstance(err, Exception) else RuntimeError(str(err)), input_.apiName or "upstream"
             )
-            yield {"type": "error", "rid": rid or "", "error": api_err.to_dict()}
+            yield {"type": "error", "rid": rid or "", "error": with_request_id(api_err, (input_.popRequestIds or [None])[-1]).to_dict()}
         return
 
     if terminal and not error_sent:
@@ -112,8 +112,8 @@ async def to_wire_events(input_: PipelineInput) -> AsyncGenerator[dict[str, Any]
         #  · 收到过帧 ⇒ 断流，任务很可能还在服务端跑，动作是探测/拉历史接管，绝不重发；
         #  · 一帧都没收到 ⇒ 上游收下了请求却没派发给执行端，任务**根本没开始**。
         error = (
-            prompt_not_dispatched((input_.popRequestIds or [None])[0], int(time.time() * 1000) - input_.startedAt)
+            prompt_not_dispatched((input_.popRequestIds or [None])[-1], int(time.time() * 1000) - input_.startedAt)
             if frame_count == 0
-            else stream_break_without_terminal(frame_count)
+            else stream_break_without_terminal(frame_count, (input_.popRequestIds or [None])[-1])
         )
         yield {"type": "error", "rid": rid or "", "error": error.to_dict()}

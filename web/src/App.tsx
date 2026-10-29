@@ -11,6 +11,7 @@ import { clearPreferences, effectiveDefaults, readPreferences, readPreferenceSta
 import { sessionIdFromLocation, writeSessionRoute } from './session-route';
 import { saveSessionConfiguration, saveSessionAgent, readSessionAgent } from './session-configuration';
 import { SessionSettingsContext, SessionSettingsButton, SessionSettingsDialog, SessionCreateError } from './session-settings';
+import { apiHttpError } from './api-error';
 import { resolveClientId } from './client-id';
 import dataAgentLogo from './assets/data-agent-logo.png';
 
@@ -225,7 +226,7 @@ export function OpenApiSessionCreation({ children, theme = 'dark' }: { children:
     let mounted = true;
     const readDefaults = async () => {
       const response = await fetch(`${baseUrl}/openapi/session-options`, { signal: AbortSignal.timeout(10_000) });
-      if (!response.ok) throw new Error('无法读取会话配置，请确认后端版本');
+      if (!response.ok) throw apiHttpError(response.status, await response.json().catch(() => undefined), '无法读取会话配置，请确认后端版本');
       const remote = await response.json() as SessionDefaults;
       const options = { ...remote, agentName: readSelectedAgent(baseUrl) };
       if (!options || typeof options.agentName !== 'string' || !Array.isArray(options.models)) throw new Error('无效的会话默认配置');

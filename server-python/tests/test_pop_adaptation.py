@@ -293,9 +293,9 @@ async def test_events_error_is_visible_and_never_uses_local_fallback():
             yield
     record = SessionRecord("s")
     record.journal.append({"type": "local_only", "data": {}})
-    output = "".join([part async for part in _remote_sse_stream(LiveContext(Broken(), config()), record.real_id, None)])
-    assert "turn_error" in output and "subscription unavailable" in output
-    assert "local_only" not in output
+    with pytest.raises(RuntimeError, match="subscription unavailable"):
+        _ = [part async for part in _remote_sse_stream(LiveContext(Broken(), config()), record.real_id, None)]
+    assert record.journal.all()[0].event["type"] == "local_only"
 
 
 
@@ -370,9 +370,8 @@ async def test_payload_cursor_fallback_and_crosssession_rejection():
     forbidden = {"v": 1, "type": "permission_request", "data": {"sessionId": "other", "requestId": "p"}}
     client = FakeEvents([("20", None, {"Event": json.dumps(forbidden)})])
     record = SessionRecord("s")
-    output = "".join([part async for part in _remote_sse_stream(LiveContext(client, config()), record.real_id, None)])
-    assert "another session" in output and "event: turn_error" in output
-    assert "event: permission_request" not in output and "id: 20" not in output
+    with pytest.raises(ValueError, match="another session"):
+        _ = [part async for part in _remote_sse_stream(LiveContext(client, config()), record.real_id, None)]
     assert record.pending_permissions == {}
 
 
@@ -533,3 +532,20 @@ def test_pending_permissions_rebuild_can_use_fresh_history_without_seed():
     rebuild_pending_permissions(record, [fresh])
     assert record.pending_permissions == {"fresh": fresh}
     assert record.journal.all()[0].event["data"]["requestId"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_create_retains_safe_initial_config_reason_and_request_id():
+    class InvalidConfig:
+        async def call_api_async(self, *args):
+            return {"body": {"RequestId": "create-rid", "JsonRpcResponse": {"Error": {
+                "ErrorCode": "INVALID_SESSION_INITIAL_CONFIG", "Message": "invalid configuration",
+                "Data": {"reason": "model_not_available", "secret": "PRIVATE_DATA"},
+            }}}}
+
+    with pytest.raises(SdkError) as caught:
+        await _create_session_result(LiveContext(InvalidConfig(), config()))
+    error = caught.value.api_error
+    assert error.requestId == "create-rid"
+    assert "reason=model_not_available" in error.message
+    assert "PRIVATE_DATA" not in str(error.to_dict())

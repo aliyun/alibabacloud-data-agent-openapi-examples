@@ -6,12 +6,14 @@ import {
   requestIdOf,
   streamBreakWithoutTerminal,
   terminalOf,
+  withRequestId,
   type AcpFrame,
   type TerminalInfo,
   type WireEvent,
 } from '@das/shared';
 
 import { redactApiError, toApiError } from './normalize.js';
+import type { StreamTraceScope } from './stream-diagnostics.js';
 
 export interface PipelineInput {
   /** 上游帧流：mock 是录制件回放，live 是 SDK 的 async generator。两者形状一致。 */
@@ -27,6 +29,7 @@ export interface PipelineInput {
    * 所以必须出现在错误 message 里，而不是只留在服务端日志里。
    */
   popRequestIds?: string[];
+  trace?: StreamTraceScope;
 }
 
 /**
@@ -76,7 +79,8 @@ export async function* toWireEvents(input: PipelineInput): AsyncGenerator<WireEv
         errorSent = true;
         // 这一条也要过脱敏：上游鉴权类报文会把调用方的 AccessKeyId 原文回显出来，
         // 而 wire 事件是要渲染进前端的。异常路径在 toApiError 里已内置，帧内路径在这里。
-        yield { type: 'error', rid: rid ?? '', error: redactApiError(classifyError(frameError)) };
+        const api = classifyError(frameError);
+        yield { type: 'error', rid: rid ?? '', error: redactApiError(input.trace?.current?.withError(api) ?? api) };
       }
 
       // 终态只看顶层 Result.stopReason；服务端的状态字段问不出运行态（恒 RELEASED）。
@@ -93,7 +97,8 @@ export async function* toWireEvents(input: PipelineInput): AsyncGenerator<WireEv
      * 归一成一条 error 事件后直接结束，也不再补发 stream_break（已经有更具体的结论了）。
      */
     if (!errorSent) {
-      yield { type: 'error', rid: rid ?? '', error: toApiError(err, input.apiName ?? 'upstream') };
+      const api = toApiError(err, input.apiName ?? 'upstream');
+      yield { type: 'error', rid: rid ?? '', error: input.trace?.current?.withError(api) ?? api };
     }
     return;
   }
@@ -116,13 +121,12 @@ export async function* toWireEvents(input: PipelineInput): AsyncGenerator<WireEv
      *  · 一帧都没收到 ⇒ 上游收下了请求却没派发给执行端（实测历史里只留一个 end_turn
      *    空轮次），任务**根本没开始**，所以"探测是否完成"是错误指引。
      */
+    const requestId = input.trace ? input.trace.current?.requestId() : frameCount === 0 ? input.popRequestIds?.at(-1) : undefined;
+    const api = frameCount === 0 ? promptNotDispatched(requestId, Date.now() - input.startedAt) : streamBreakWithoutTerminal(frameCount);
     yield {
       type: 'error',
       rid: rid ?? '',
-      error:
-        frameCount === 0
-          ? promptNotDispatched(input.popRequestIds?.[0], Date.now() - input.startedAt)
-          : streamBreakWithoutTerminal(frameCount),
+      error: input.trace?.current?.withError(api) ?? withRequestId(api, requestId),
     };
   }
 }

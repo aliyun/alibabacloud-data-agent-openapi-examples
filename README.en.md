@@ -116,3 +116,5 @@ See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md), and [LICENSE](LICE
 See the [OpenAPI call guide](docs/OPENAPI-EXAMPLES.md) for POP Actions, exact creation fields, Node/Python/Java snippets, Events cursors, session rename/archive/delete, and administrator-only Agent examples. The optional [AssumeRole example](docs/ASSUME-ROLE.md) acquires STS credentials and launches any backend; the default startup continues to use your configured AK/SK. All three backends pass the optional security token. The example does not automatically refresh credentials.
 
 Choose an already published Agent in **Session settings** (default: `dataworks_data_agent`). The browser saves the Agent name and keeps model/mode/reasoning defaults separate for each Agent. This only affects new sessions; existing sessions continue by their original session ID. Agent creation and publishing remain backend administrator examples.
+
+Errors include the upstream OpenAPI `requestId` when available; the UI displays it, and Events forwards the `x-acs-request-id` response header. Local failures before a response may have no ID. Turn IDs and permission request IDs are not substituted.

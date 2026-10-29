@@ -137,10 +137,79 @@ class SdkSseStreamTest {
 
     @Test
     void closeTurnsBlockingNextIntoNull() throws Exception {
-        List<TeaModel> items = new ArrayList<>();
-        items.add(frame("session/update", "only", "rid", 1L));
-        SdkSseStream stream = new SdkSseStream("PromptAgentSession", items.iterator(), () -> 200);
-        stream.close();
-        assertNull(stream.next(3000));
+        var buffered = new java.util.concurrent.CountDownLatch(1);
+        Iterator<TeaModel> items = new Iterator<>() {
+            boolean first = true;
+            @Override public boolean hasNext() {
+                if (first) return true;
+                // readLoop has queued the first item before checking for the next.
+                buffered.countDown();
+                return false;
+            }
+            @Override public TeaModel next() {
+                first = false;
+                return frame("session/update", "only", "rid", 1L);
+            }
+        };
+        try (var stream = new SdkSseStream("PromptAgentSession", items, () -> 200)) {
+            assertTrue(buffered.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            stream.close();
+            assertNull(stream.next(3000));
+            assertNull(stream.next());
+        }
+    }
+
+    @Test
+    void closeWakesBlockedConsumerWithoutWaitingForUpstream() throws Exception {
+        var waiting = new java.util.concurrent.CountDownLatch(1);
+        Iterator<TeaModel> stalled = new Iterator<>() {
+            @Override public boolean hasNext() {
+                waiting.countDown();
+                try { new java.util.concurrent.CountDownLatch(1).await(); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return false;
+            }
+            @Override public TeaModel next() { throw new AssertionError("No payload expected"); }
+        };
+        try (var stream = new SdkSseStream("LoadAgentSession", stalled, () -> 200)) {
+            assertTrue(waiting.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            var next = new java.util.concurrent.FutureTask<>(() -> stream.next());
+            Thread consumer = new Thread(next, "test-close-sse-reader");
+            consumer.setDaemon(true);
+            consumer.start();
+            stream.close();
+            assertNull(next.get(3, java.util.concurrent.TimeUnit.SECONDS));
+        }
+    }
+
+    @Test void popHeadersAreCaseInsensitiveAndIndependentOfAcpPayloadIds() throws Exception {
+        try (var stream = new SdkSseStream("PromptAgentSession",
+            List.of(frame("session/update", "x", "turn-rid", 1)).iterator(), () -> 200,
+            () -> Map.of("X-ACS-REQUEST-ID", "pop-header", "Authorization", "private"))) {
+            assertEquals("turn-rid", MAPPER.readValue(stream.next(), Map.class).get("RequestId"));
+            assertEquals("pop-header", stream.requestId());
+            assertNull(stream.next());
+            assertEquals("pop-header", stream.requestId());
+        }
+        try (var stream = new SdkSseStream("LoadAgentSession", List.<TeaModel>of().iterator(), () -> 200,
+            () -> { throw new IllegalStateException("private headers unavailable"); })) {
+            assertNull(stream.next());
+            assertNull(stream.requestId());
+        }
+    }
+
+    @Test void directSdkDecodeFailureRetainsHeaderAheadOfCauseId() throws Exception {
+        var sdk = new com.aliyun.sdk.gateway.pop.exception.PopClientException("private SDK dump");
+        sdk.setStatusCode(403); sdk.setErrMessage("denied"); sdk.setRequestId("exception-id");
+        Iterator<TeaModel> broken = new Iterator<>() {
+            public boolean hasNext() { throw sdk; }
+            public TeaModel next() { throw new AssertionError(); }
+        };
+        try (var stream = new SdkSseStream("LoadAgentSession", broken, () -> 403,
+            () -> Map.of("x-acs-request-id", "header-id", "Authorization", "private"))) {
+            var failure = assertThrows(SseException.class, stream::next);
+            assertEquals("header-id", Normalize.toApiError(failure, "LoadAgentSession").requestId());
+            assertFalse(Normalize.toApiError(failure, "LoadAgentSession").message().contains("private"));
+        }
     }
 }

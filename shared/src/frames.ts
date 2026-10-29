@@ -1,4 +1,5 @@
 import { STOP_REASONS, type StopReason } from './constants.js';
+import { validRequestId } from './errors.js';
 
 /**
  * 上游 ACP JSON-RPC 帧。
@@ -172,8 +173,9 @@ export function frameFromSdkBody(body: unknown): AcpFrame | undefined {
 export function popAckRequestId(body: unknown): string | undefined {
   const inner = unwrapEnvelope(body);
   if (!isObject(inner)) return undefined;
+  if (!Object.keys(inner).every(key => POP_ONLY_KEYS.has(key)) || 'Id' in inner || 'id' in inner) return undefined;
   const value = 'RequestId' in inner ? inner.RequestId : inner.requestId;
-  return typeof value === 'string' && value ? value : undefined;
+  return validRequestId(value);
 }
 
 /**

@@ -10,6 +10,7 @@ import java.util.Map;
 public final class RecoveringPromptStream implements AutoCloseable {
     interface Source extends AutoCloseable {
         String next(long timeoutMs) throws Exception;
+        default String requestId() { return null; }
         default String rpcId() { return null; }
         @Override void close();
     }
@@ -23,6 +24,9 @@ public final class RecoveringPromptStream implements AutoCloseable {
     private volatile Source source;
     private volatile boolean closed;
     private String rid;
+    private String popRequestId;
+
+    public String requestId() { return popRequestId; }
     private long offset;
     private String sessionId;
     private boolean ended;
@@ -46,6 +50,7 @@ public final class RecoveringPromptStream implements AutoCloseable {
     static Source wrap(SdkSseStream stream, String rpcId) {
         return new Source() {
             public String next(long timeoutMs) throws Exception { return stream.next(timeoutMs); }
+            public String requestId() { return stream.requestId(); }
             public String rpcId() { return rpcId; }
             public void close() { stream.close(); }
         };
@@ -73,7 +78,7 @@ public final class RecoveringPromptStream implements AutoCloseable {
             throw new DasApiException(ApiError.classify(
                 error.get("message") instanceof String text ? text : "LoadAgentSession failed",
                 error.get("code") instanceof Number n ? n.intValue() : null,
-                error.get("errorCode") instanceof String text ? text : null, null));
+                error.get("errorCode") instanceof String text ? text : null, null).withRequestId(popRequestId));
         }
         if (replay && frame.get("Id") != null && String.valueOf(frame.get("Id")).equals(source.rpcId())) return false;
         if (replay && !own && !response) return false;
@@ -86,7 +91,7 @@ public final class RecoveringPromptStream implements AutoCloseable {
             offset = Math.max(offset, next);
         } else if (replay && params.get("update") != null && !terminal) {
             if (!Boolean.TRUE.equals(meta.get("waitForResponse"))) {
-                throw new DasApiException(ApiError.streamBreakWithoutTerminal(0));
+                throw new DasApiException(ApiError.streamBreakWithoutTerminal(0).withRequestId(popRequestId));
             }
             return false;
         }
@@ -99,12 +104,22 @@ public final class RecoveringPromptStream implements AutoCloseable {
         while (!closed && !ended) {
             if (deadline > 0 && System.nanoTime() >= deadline) return null;
             try {
-                if (source == null) source = loader.open(offset, remainingMs());
+                if (source == null) {
+                    popRequestId = null;
+                    source = loader.open(offset, remainingMs());
+                }
                 if (closed) { source.close(); return null; }
                 String data = source.next(deadline == 0 ? 0 : remainingMs());
+                String headerId = ApiError.validRequestId(source.requestId());
+                if (headerId != null) popRequestId = ApiError.validRequestId(headerId);
                 if (data != null) {
                     Map<String, Object> frame;
-                    try { frame = Frames.frameFromSdkBody(JSON.readValue(data, Object.class)); }
+                    try {
+                        Object parsed = JSON.readValue(data, Object.class);
+                        String ack = Frames.popAckRequestId(parsed);
+                        if (ack != null && headerId == null) popRequestId = ack;
+                        frame = Frames.frameFromSdkBody(parsed);
+                    }
                     catch (Exception malformed) { continue; }
                     if (frame == null) { if (attempt == 0) return data; continue; }
                     if (take(frame)) return data;
@@ -112,7 +127,11 @@ public final class RecoveringPromptStream implements AutoCloseable {
                 }
             } catch (Exception error) {
                 if (closed || Thread.currentThread().isInterrupted()) return null;
-                ApiError api = Normalize.toApiError(error, attempt == 0 ? "PromptAgentSession" : "LoadAgentSession");
+                String headerId = source == null ? null : ApiError.validRequestId(source.requestId());
+                if (headerId != null) popRequestId = ApiError.validRequestId(headerId);
+                ApiError api = Normalize.toApiError(error, attempt == 0 ? "PromptAgentSession" : "LoadAgentSession")
+                    .withRequestId(popRequestId).withPreferredRequestId(headerId);
+                popRequestId = api.requestId();
                 if (!resumable() || !"transport".equals(api.kind())) throw new DasApiException(api);
             }
             if (source != null) source.close();

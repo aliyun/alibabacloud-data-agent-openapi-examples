@@ -1,8 +1,9 @@
 import { ResponseError } from '@darabonba/typescript';
 
-import { apiError, classifyError, type ApiError } from '@das/shared';
+import { apiError, classifyError, validRequestId, withRequestId, type ApiError } from '@das/shared';
 
 import { SdkError } from './sdk.js';
+import { initialConfigErrorMessage } from './initial-config-error.js';
 
 /** openapi-core 抛的错误都在 ResponseError 之下，并额外带 POP 层的 RequestId 与鉴权明细。 */
 interface UpstreamError extends ResponseError {
@@ -23,7 +24,29 @@ interface UpstreamError extends ResponseError {
  * （shared/classifyError），保证前后端对同一个 `-32603` 得出同一个 kind。
  */
 export function toApiError(err: unknown, apiName: string): ApiError {
-  return redactApiError(withApi(raw(err), apiName));
+  return redactApiError(withApi(withRequestId(raw(err), sdkRequestId(err)), apiName));
+}
+
+const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+
+/** HTTP response headers are diagnostic IDs; do not inspect daemon/ACP data for an ID. */
+export function headerRequestId(headers: unknown): string | undefined {
+  if (!object(headers)) return undefined;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === 'x-acs-request-id') return validRequestId(value);
+  }
+  return undefined;
+}
+
+/** SDK exception shapes vary; only known exception/envelope fields and causes are inspected. */
+export function sdkRequestId(value: unknown, depth = 0): string | undefined {
+  if (!object(value) || depth > 4) return undefined;
+  const direct = validRequestId(value.requestId) ?? validRequestId(value.RequestId) ?? validRequestId(value.request_id);
+  const data = object(value.data) ? value.data : undefined;
+  const response = object(value.response) ? value.response : undefined;
+  return direct ?? headerRequestId(value.headers) ?? headerRequestId(response?.headers)
+    ?? validRequestId(data?.RequestId) ?? validRequestId(data?.requestId)
+    ?? sdkRequestId(value.cause, depth + 1);
 }
 
 function raw(err: unknown): ApiError {
@@ -172,29 +195,30 @@ export interface NonStreamBody {
 /**
  * 读非流式响应体。
  *
- * **这里有一条必须如实交代的限制**：非流式的响应模型
- * （`CreateAgentSessionResponseBodyJsonRpcResponse` 等）只声明了 `{id, jsonrpc, result}`，
- * **没有 error 字段**。SDK 内部用 `$dara.cast` 把线格式转成模型实例，而 cast 会
- * **静默丢弃模型未声明的键**——实测把含 `JsonRpcResponse.Error` 的响应体过一遍 cast，
- * Error 整个消失，只剩 `{"jsonRpcResponse":{"id":"1","jsonrpc":"2.0"}}`；
- * 响应体为空时则 cast 成 `{}`。
- *
- * 后果：非流式调用的"业务错误"与"空响应体"在 SDK 层**不可区分**。
- * 所以本函数绝不编造 code/message，只报告"Result 缺失"+ RequestId。
- * 流式那两个接口（prompt/load）的响应模型声明了 error，不受此限制——
- * 它们的错误走 `shared/frameFromSdkBody` + `classifyError`。
+ * 当前生成模型保留 JsonRpcResponse.Error，先处理业务错误再读取 Result。
+ * 旧版本模型可能在 cast 时丢弃未声明的 Error；详情已丢弃时只报告 Result 缺失
+ * 和 RequestId，不编造错误原因。
  */
 export function readNonStreamBody(resp: unknown): NonStreamBody {
   const envelope = resp as {
     statusCode?: number;
-    body?: { requestId?: string; jsonRpcResponse?: { result?: unknown } };
+    headers?: unknown;
+    body?: { requestId?: string; jsonRpcResponse?: { result?: unknown; error?: { code?: number; errorCode?: string; message?: string; data?: unknown } } };
   } | null;
 
   const body = envelope?.body;
   const result = body?.jsonRpcResponse?.result;
+  const requestId = validRequestId(body?.requestId) ?? headerRequestId(envelope?.headers);
+  const error = body?.jsonRpcResponse?.error;
+  if (error) {
+    throw new SdkError(redactApiError(classifyError({
+      message: initialConfigErrorMessage(error, 'unknown error'), code: error.code,
+      errorCode: error.errorCode, requestId,
+    })));
+  }
   return {
     statusCode: envelope?.statusCode,
-    requestId: typeof body?.requestId === 'string' ? body.requestId : undefined,
+    requestId,
     result: isPlainObject(result) ? result : undefined,
   };
 }
@@ -207,7 +231,7 @@ export function missingResultError(apiName: string, body: NonStreamBody): ApiErr
       '非流式响应模型未声明 Error 字段，SDK 的 cast 已把错误详情丢弃，所以这里拿不到 code 与 message' +
       (body.requestId ? `。可用 RequestId ${body.requestId} 到控制台或工单查这次调用` : '') +
       '。',
-    { upstreamStatus: body.statusCode },
+    { upstreamStatus: body.statusCode, requestId: body.requestId },
   );
 }
 

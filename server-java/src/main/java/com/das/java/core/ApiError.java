@@ -14,8 +14,42 @@ public record ApiError(
     String message,
     boolean retryable,
     boolean fatalForSession,
-    Integer upstreamStatus
+    Integer upstreamStatus,
+    String requestId
 ) {
+    public ApiError {
+        requestId = validRequestId(requestId);
+    }
+
+    /** Preserve the original constructor for callers without POP metadata. */
+    public ApiError(String kind, Integer code, String errorCode, String message,
+        boolean retryable, boolean fatalForSession, Integer upstreamStatus) {
+        this(kind, code, errorCode, message, retryable, fatalForSession, upstreamStatus, null);
+    }
+
+    /** Validate only trusted POP metadata; never call this with ACP rid or permission/event IDs. */
+    public static String validRequestId(Object value) {
+        if (!(value instanceof String raw)
+            || raw.chars().anyMatch(c -> c < 0x20 || c > 0x7e)) return null;
+        // Validate the original first: trim must never turn CR/LF into an accepted ID.
+        String id = raw.trim();
+        if (id.isEmpty() || id.length() > 256 || id.chars().anyMatch(c -> c == 0x20)) return null;
+        return id;
+    }
+
+    public ApiError withRequestId(Object value) {
+        String id = validRequestId(value);
+        if (requestId != null || id == null) return this;
+        return new ApiError(kind, code, errorCode, message, retryable, fatalForSession, upstreamStatus, id);
+    }
+
+    /** A verified HTTP SSE header takes precedence over body/exception metadata. */
+    public ApiError withPreferredRequestId(Object value) {
+        String id = validRequestId(value);
+        return id == null ? this : new ApiError(kind, code, errorCode, message,
+            retryable, fatalForSession, upstreamStatus, id);
+    }
+
     private static final Map<String, boolean[]> RETRY_POLICY = Map.of(
         "stream_break", new boolean[]{false, false},
         // retryable=false 的理由不是"怕重复写入"（实测这一轮压根没落地），
@@ -38,6 +72,7 @@ public record ApiError(
         out.put("retryable", retryable);
         out.put("fatalForSession", fatalForSession);
         if (upstreamStatus != null) out.put("upstreamStatus", upstreamStatus);
+        if (requestId != null) out.put("requestId", requestId);
         return out;
     }
 
@@ -84,11 +119,12 @@ public record ApiError(
     }
 
     public static ApiError promptNotDispatched(String popRequestId, Long elapsedMs) {
+        popRequestId = validRequestId(popRequestId);
         String clues = (elapsedMs != null ? elapsedMs + "ms" : null) + "，"
             + (popRequestId != null ? "POP RequestId " + popRequestId : "上游未给出 RequestId");
         return of("prompt_not_dispatched",
             Constants.PROMPT_NOT_DISPATCHED_TEXT + "（" + clues + "）。整轮没有收到任何 ACP 帧，也没有 Result.stopReason。",
-            null, null, null);
+            null, null, null).withRequestId(popRequestId);
     }
 
     public static ApiError transport(String message) {
@@ -107,7 +143,7 @@ public record ApiError(
         String message = ACCESS_KEY_ID.matcher(error.message).replaceAll("<AccessKeyId 已隐去>");
         return message.equals(error.message) ? error : new ApiError(
             error.kind, error.code, error.errorCode, message,
-            error.retryable, error.fatalForSession, error.upstreamStatus
+            error.retryable, error.fatalForSession, error.upstreamStatus, error.requestId
         );
     }
 }

@@ -244,15 +244,15 @@ public class DaemonController {
     }
 
     @GetMapping("/standalone/sessions")
-    public Map<String, Object> listSessions(@RequestParam(name = "archiveState", required = false) String archiveState,
+    public ResponseEntity<?> listSessions(@RequestParam(name = "archiveState", required = false) String archiveState,
         @RequestParam(name = "agentName", required = false) String agentName) {
         agentName = queryAgentName(agentName);
         boolean archived = "archived".equals(archiveState);
         if (remote != null) {
-            try { return remote.list(archived, agentName); }
-            catch (Exception error) { throw new org.springframework.web.server.ResponseStatusException(HttpStatus.BAD_GATEWAY, "ListAgentSessions failed"); }
+            try { return ResponseEntity.ok(remote.list(archived, agentName)); }
+            catch (Exception error) { return LiveDaemon.failure(error, "ListAgentSessions"); }
         }
-        return Map.of("sessions", archived ? registry.archivedSummaries() : registry.listSummaries(cfg));
+        return ResponseEntity.ok(Map.of("sessions", archived ? registry.archivedSummaries() : registry.listSummaries(cfg)));
     }
 
     @PostMapping("/standalone/sessions")
@@ -374,9 +374,28 @@ public class DaemonController {
                 upstreamRequestId = metadata.headers().entrySet().stream()
                     .filter(header -> header.getKey().equalsIgnoreCase("x-acs-request-id"))
                     .map(Map.Entry::getValue).findFirst().orElse(null);
+                upstreamRequestId = com.das.java.core.ApiError.validRequestId(upstreamRequestId);
+                if (upstreamRequestId != null) response.setHeader("x-acs-request-id", upstreamRequestId);
                 String contentType = metadata.headers().entrySet().stream()
                     .filter(header -> header.getKey().equalsIgnoreCase("Content-Type"))
                     .map(Map.Entry::getValue).findFirst().orElse("");
+                if (metadata.status() / 100 != 2) {
+                    // Before committing JSON, extract only a bounded scalar POP ID;
+                    // raw SDK/POP failure bodies may contain credentials or headers.
+                    if (upstreamRequestId == null) {
+                        var bytes = new java.io.ByteArrayOutputStream();
+                        byte[] chunk;
+                        while ((chunk = stream.next()) != null && bytes.size() + chunk.length <= 65_536)
+                            bytes.write(chunk);
+                        try {
+                            var body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(bytes.toByteArray());
+                            var rawId = body.has("RequestId") ? body.get("RequestId") : body.get("requestId");
+                            if (rawId != null && rawId.isTextual())
+                                upstreamRequestId = com.das.java.core.ApiError.validRequestId(rawId.textValue());
+                        } catch (Exception ignored) { /* Keep the safe public failure below. */ }
+                    }
+                    throw new IOException("GetAgentSessionEvents returned a non-success response");
+                }
                 if (metadata.status() / 100 == 2 && !contentType.split(";", 2)[0].trim().equalsIgnoreCase("text/event-stream"))
                     throw new IOException("GetAgentSessionEvents returned a non-SSE response");
                 response.setStatus(metadata.status());
@@ -407,8 +426,7 @@ public class DaemonController {
                     cause = cause.getCause();
                 }
                 // Structured diagnostics only: never log messages, request headers, body, config or credentials.
-                if (upstreamRequestId != null) upstreamRequestId = upstreamRequestId.replaceAll("[^A-Za-z0-9._:-]", "");
-                if (upstreamRequestId != null && upstreamRequestId.length() > 128) upstreamRequestId = upstreamRequestId.substring(0, 128);
+                upstreamRequestId = com.das.java.core.ApiError.validRequestId(upstreamRequestId);
                 log.warn("openapi_events_failure code=events_failed status={} requestId={} exceptionType={}",
                     upstreamStatus, upstreamRequestId, cause.getClass().getSimpleName());
                 if (!response.isCommitted()) {
@@ -417,7 +435,10 @@ public class DaemonController {
                     response.setContentType("application/json; charset=utf-8");
                     var failure = errorBody("GetAgentSessionEvents failed", "events_failed");
                     if (upstreamStatus != null) failure.put("upstreamStatus", upstreamStatus);
-                    if (upstreamRequestId != null) failure.put("requestId", upstreamRequestId);
+                    if (upstreamRequestId != null) {
+                        failure.put("requestId", upstreamRequestId);
+                        response.setHeader("x-acs-request-id", upstreamRequestId);
+                    }
                     response.getWriter().write(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(failure));
                 } else if (error instanceof IOException io) throw io;
                 else throw new IOException("GetAgentSessionEvents failed", error);

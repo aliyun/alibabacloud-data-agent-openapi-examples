@@ -27,6 +27,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import {
   HISTORY_READ_TIMEOUT_MS,
   apiError,
+  classifyError,
   countFramesForRid,
   createEmptyBodyError,
   frameFromSdkBody,
@@ -44,6 +45,8 @@ import {
   type SessionSummary,
   type SessionsResult,
   type UsageResult,
+  validRequestId,
+  withRequestId,
 } from '@das/shared';
 
 import type { AppConfig } from './config.js';
@@ -51,8 +54,9 @@ import { recoverPromptFrames } from './prompt-recovery.js';
 import { readLoadSnapshot } from './load-recovery.js';
 import { sessionOptions, type SessionCreationOptions } from './session-options.js';
 import { callOpenApi } from './openapi.js';
-import { missingResultError, readNonStreamBody, toApiError } from './normalize.js';
+import { headerRequestId, missingResultError, readNonStreamBody, toApiError } from './normalize.js';
 import { SdkError, runtimeFor, runtimeForSse, type SdkClient } from './sdk.js';
+import { trackedSse, type StreamTraceScope } from './stream-diagnostics.js';
 
 /**
  * 真实上游调用。**所有 LIVE 路径都在这里，一处也不散到路由里**——
@@ -205,6 +209,7 @@ export async function liveCreateSession(ctx: LiveContext, mode: SessionMode | Se
           `${api} 返回 HTTP ${body.statusCode ?? '?'} 但没有 JsonRpcResponse.Result，拿不到 SessionId` +
             (body.requestId ? `（RequestId ${body.requestId}）` : '') +
             '。请根据 RequestId 排查实例准备或上游响应；ACS 模式无需配置资源组。',
+          body.requestId,
         ),
       };
     }
@@ -213,7 +218,7 @@ export async function liveCreateSession(ctx: LiveContext, mode: SessionMode | Se
     // **成功判据只有 SessionId 非空**。HTTP 200 + 有 Result 但 SessionId 为空，
     // 仍然是失败，且同样归 create_empty_body。
     if (!sessionId) {
-      return { ok: false, error: createEmptyBodyError(`${api} 返回了 Result 但 SessionId 为空`) };
+      return { ok: false, error: createEmptyBodyError(`${api} 返回了 Result 但 SessionId 为空`, body.requestId) };
     }
     return { ok: true, result: { sessionId, requestId: body.requestId } };
   } catch (err) {
@@ -335,27 +340,43 @@ function toSessionSummary(row: unknown): SessionSummary | undefined {
 
 /** 历史快照与在途续传使用不同预算；恢复时必须消费原轮终态。 */
 async function* liveLoadStream(ctx: LiveContext, sessionId: string, id: string,
-  offset: number | undefined, timeoutMs: number): AsyncGenerator<AcpFrame> {
-  const stream = ctx.client.loadAgentSessionWithSSE(
+  offset: number | undefined, timeoutMs: number, scope: StreamTraceScope): AsyncGenerator<AcpFrame> {
+  delete scope.current;
+  const tracked = trackedSse(ctx.client, receiver => receiver.loadAgentSessionWithSSE(
     new LoadAgentSessionRequest({ id, jsonrpc: JSONRPC_VERSION,
       params: new LoadAgentSessionRequestParams({ sessionId,
         meta: new LoadAgentSessionRequestParamsMeta({ isReload: true,
           ...(offset === undefined ? {} : { beginLogOffset: offset }) }),
       }),
     }), runtimeForSse(timeoutMs),
-  );
-  for await (const resp of guardAsyncIterable(stream, 'LoadAgentSession')) {
-    const frame = frameFromSdkBody((resp as { body?: unknown }).body);
-    if (frame) yield frame;
+  ));
+  scope.current = tracked;
+  try {
+    for await (const resp of guardAsyncIterable(tracked.stream, 'LoadAgentSession')) {
+      tracked.observe(resp);
+      const body = (resp as { body?: unknown }).body;
+      const frame = frameFromSdkBody(body);
+      if (!frame) tracked.acknowledgement(popAckRequestId(body));
+      // Recovery must perform its own turn filtering before considering an Error.
+      if (frame) yield frame;
+    }
+  } catch (error) {
+    throw new SdkError(tracked.withError(toApiError(error, 'LoadAgentSession')));
   }
 }
 
 export async function liveLoadFrames(ctx: LiveContext, sessionId: string): Promise<AcpFrame[]> {
-  return readLoadSnapshot(timeoutMs => {
-    const id = nextRpcId();
-    return { id, frames: liveLoadStream(ctx, sessionId, id, undefined, timeoutMs) };
-  }, error => toApiError(error, 'LoadAgentSession').kind === 'transport',
-  { budgetMs: HISTORY_READ_TIMEOUT_MS });
+  const scope: StreamTraceScope = {};
+  try {
+    return await readLoadSnapshot(timeoutMs => {
+      const id = nextRpcId();
+      return { id, frames: liveLoadStream(ctx, sessionId, id, undefined, timeoutMs, scope) };
+    }, error => toApiError(error, 'LoadAgentSession').kind === 'transport',
+    { budgetMs: HISTORY_READ_TIMEOUT_MS });
+  } catch (error) {
+    const api = toApiError(error, 'LoadAgentSession');
+    throw new SdkError(scope.current ? scope.current.withError(api) : api);
+  }
 }
 
 export async function liveHistory(ctx: LiveContext, sessionId: string): Promise<ApiResult<HistoryResult>> {
@@ -454,18 +475,18 @@ export async function liveCancel(ctx: LiveContext, sessionId: string): Promise<A
   const api = 'CancelAgentSession';
   try {
     const resp = await callOpenApi(ctx.client, api, { SessionId: sessionId });
-    const { result } = readNonStreamBody(resp);
+    const { result, requestId } = readNonStreamBody(resp);
     if (result && result.delivered === undefined && result.noop === undefined && result.sessionId === sessionId) {
-      return { ok: true, result: { delivered: false, accepted: true, warning: 'cancel-accepted-legacy',
+      return { ok: true, result: { delivered: false, accepted: true, requestId, warning: 'cancel-accepted-legacy',
         detail: '旧版接口已回执此会话的取消请求；未提供 Delivered/Noop，实际终止以远端事件为准。' } };
     }
     if (typeof result?.delivered !== 'boolean' || (result.noop !== undefined && typeof result.noop !== 'boolean')) {
-      return { ok: false, error: toApiError(new Error('CancelAgentSession 未返回有效的 Delivered/Noop 结果'), api) };
+      return { ok: false, error: withRequestId(toApiError(new Error('CancelAgentSession 未返回有效的 Delivered/Noop 结果'), api), requestId) };
     }
     const delivered = result.delivered;
     const noop = result.noop === true;
     return { ok: true, result: {
-      delivered, noop,
+      delivered, noop, requestId,
       warning: delivered ? 'cancel-accepted' : noop ? 'cancel-noop' : 'cancel-upstream-error',
       detail: delivered ? '上游确认取消请求已送达；执行终态以真实事件为准。'
         : noop ? '上游确认会话空闲，取消为空操作。' : '上游未确认取消请求送达，执行可能仍在继续。',
@@ -521,7 +542,7 @@ export async function liveReply(ctx: LiveContext, sessionId: string, input: Repl
       };
     }).body;
     const rpc = body?.jsonRpcResponse;
-    const requestId = typeof body?.requestId === 'string' ? body.requestId : undefined;
+    const requestId = validRequestId(body?.requestId) ?? headerRequestId((resp as { headers?: unknown }).headers);
 
     if (rpc?.error) {
       const e = rpc.error;
@@ -533,6 +554,7 @@ export async function liveReply(ctx: LiveContext, sessionId: string, input: Repl
             (e.errorCode ? ` [${e.errorCode}]` : '') +
             (e.code !== undefined ? ` (code=${e.code})` : '') +
             (requestId ? `，RequestId ${requestId}` : ''),
+          { requestId },
         ),
       };
     }
@@ -543,6 +565,7 @@ export async function liveReply(ctx: LiveContext, sessionId: string, input: Repl
           'rpc_error',
           `${api} 返回 HTTP ${body ? '200' : '?'} 但没有 JsonRpcResponse.Result.accepted` +
             (requestId ? `（RequestId ${requestId}）` : ''),
+          { requestId },
         ),
       };
     }
@@ -655,22 +678,27 @@ export async function* livePromptFrames(
   sessionId: string,
   outboundText: string,
   acks?: string[],
+  scope: StreamTraceScope = {},
 ): AsyncGenerator<AcpFrame, void, unknown> {
   const id = nextRpcId();
-  yield* recoverPromptFrames(
-    { id, frames: initialPromptFrames(ctx, sessionId, outboundText, id, acks) },
+  try { yield* recoverPromptFrames(
+    { id, frames: initialPromptFrames(ctx, sessionId, outboundText, id, acks, scope) },
     (offset, timeoutMs) => {
       const loadId = nextRpcId();
-      return { id: loadId, frames: liveLoadStream(ctx, sessionId, loadId, offset, timeoutMs) };
+      return { id: loadId, frames: liveLoadStream(ctx, sessionId, loadId, offset, timeoutMs, scope) };
     },
     error => toApiError(error, 'LoadAgentSession').kind === 'transport',
     { onResume: (offset, attempt) => ctx.log?.info({ sessionId, offset, attempt }, 'prompt_stream_resume') },
-  );
+  ); } catch (error) {
+    const api = toApiError(error, 'PromptAgentSession');
+    throw new SdkError(scope.current ? scope.current.withError(api) : api);
+  }
 }
 
 async function* initialPromptFrames(ctx: LiveContext, sessionId: string, outboundText: string,
-  id: string, acks?: string[]): AsyncGenerator<AcpFrame> {
-  const stream = ctx.client.promptAgentSessionWithSSE(
+  id: string, acks: string[] | undefined, scope: StreamTraceScope): AsyncGenerator<AcpFrame> {
+  delete scope.current;
+  const tracked = trackedSse(ctx.client, receiver => receiver.promptAgentSessionWithSSE(
     new PromptAgentSessionRequest({
       id,
       jsonrpc: JSONRPC_VERSION,
@@ -680,13 +708,17 @@ async function* initialPromptFrames(ctx: LiveContext, sessionId: string, outboun
       }),
     }),
     runtimeForSse(),
-  );
+  ));
+  scope.current = tracked;
 
   let unrecognized = 0;
   try {
-    for await (const resp of guardAsyncIterable(stream, 'PromptAgentSession')) {
+    for await (const resp of guardAsyncIterable(tracked.stream, 'PromptAgentSession')) {
+      tracked.observe(resp);
       const body = (resp as { body?: unknown }).body;
       const frame = frameFromSdkBody(body);
+      const requestId = tracked.requestId();
+      if (requestId && !acks?.includes(requestId)) acks?.push(requestId);
       if (frame) {
         yield frame;
         continue;
@@ -700,13 +732,17 @@ async function* initialPromptFrames(ctx: LiveContext, sessionId: string, outboun
        *    注意它**不是 rid**：ACP 帧上的 rid 是 UUID，拿 POP 回执去过滤历史一无所获。
        *  · **真认不出来的形状**：上游改了载荷，或 SDK 的 cast 把字段吃了。这才是要 warn 的。
        */
-      const ack = popAckRequestId(body);
+      const ack = validRequestId(popAckRequestId(body));
       if (ack) {
-        acks?.push(ack);
+        tracked.acknowledgement(ack);
+        const requestId = tracked.requestId()!;
+        if (!acks?.includes(requestId)) acks?.push(requestId);
         continue;
       }
       unrecognized += 1;
     }
+  } catch (error) {
+    throw new SdkError(tracked.withError(toApiError(error, 'PromptAgentSession')));
   } finally {
     /**
      * 放 finally 是因为这条生成器最常见的结束方式不是"迭代完"，而是被外层 `return()` 掉

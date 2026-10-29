@@ -607,3 +607,43 @@ it('retains the own terminal for an owner replacement after an observer consumes
   expect(observer.events.filter(local)).toHaveLength(1);
   assertSingleHttp(f);
 });
+
+it.each([
+  { error: { message: 'upstream denied', requestId: 'POP-http' } },
+  { error: 'upstream denied', requestId: 'POP-http' },
+])('retains requestId on HTTP admission failure: %j', async body => {
+  const f = fixture({ http: () => Response.json({ ...body, token: 'hidden' }, { status: 502 }) });
+  const { client } = f.browser();
+  await expect(client.prompt(sid, question)).rejects.toThrow('upstream denied (requestId=POP-http)');
+  assertSingleHttp(f);
+});
+
+it.each(['upstream denied', 'upstream denied (requestId=POP-stream)'])(
+  'publishes the upstream requestId once in NDJSON errors: %s', async message => {
+    const f = fixture();
+    const { session, subscription } = await opened(f);
+    const accepted = await session.submitPrompt(question);
+    f.http[0]!.line({ type: 'error', rid: 'daemon-rpc', id: 123,
+      error: { message, requestId: 'POP-stream', permissionRequestId: 'daemon-permission' } });
+    const event = await terminal(subscription.events, accepted.promptId);
+    expect(event.data).toMatchObject({ message: 'upstream denied (requestId=POP-stream)' });
+    assertOwn(event, accepted.promptId, 'turn_error');
+  },
+);
+
+it('does not label NDJSON daemon correlation IDs as POP requestId', async () => {
+  const f = fixture();
+  const { client } = f.browser();
+  const result = client.prompt(sid, question);
+  const assertion = expect(result).rejects.toThrow(/^upstream denied$/);
+  await expect.poll(() => f.http.length).toBe(1);
+  f.http[0]!.line({ type: 'error', rid: 'rpc', id: 'event',
+    error: { message: 'upstream denied', permissionRequestId: 'permission' } });
+  await assertion;
+});
+
+it('uses a safe fallback for a non-JSON HTTP error body', async () => {
+  const f = fixture({ http: () => new Response('<html>hidden-response-token</html>', { status: 502 }) });
+  const { client } = f.browser();
+  await expect(client.prompt(sid, question)).rejects.toThrow(/^OpenAPI 请求失败或未返回 NDJSON$/);
+});

@@ -94,3 +94,53 @@ describe('OpenAPI session creation with the actual SDK', () => {
   });
 
 });
+
+it.each([
+  { error: 'upstream denied', requestId: 'POP-create' },
+  { error: { message: 'upstream denied', requestId: 'POP-create' } },
+])('reports upstream creation details to the existing error hook: %j', async body => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(body, { status: 403 })));
+  const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+  const onCreateError = vi.fn();
+  const restore = installOpenApiSessionCreation(client, 'http://localhost/d', undefined, { onCreateError });
+  try {
+    await expect(client.createStandaloneSession()).rejects.toThrow('upstream denied (requestId=POP-create)');
+    expect(onCreateError).toHaveBeenCalledTimes(1);
+    expect(onCreateError.mock.calls[0]![0].message.match(/requestId=POP-create/g)).toHaveLength(1);
+  } finally { restore(); client.dispose(); }
+});
+
+it.each(['loadSession', 'resumeSession', 'loadStandaloneSession', 'resumeStandaloneSession'] as const)(
+  'preserves upstream requestId through actual SDK %s failures', async method => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ error: 'load denied', requestId: 'POP-load', token: 'hidden' }, { status: 403 })));
+    const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+    const restore = installOpenApiSessionCreation(client, 'http://localhost/d');
+    try {
+      await expect(client[method]('session-id')).rejects.toThrow('load denied (requestId=POP-load)');
+    } finally { restore(); client.dispose(); }
+  },
+);
+
+it.each([
+  '<html>hidden-response-token</html>',
+  JSON.stringify({ error: { unexpected: 'hidden-response-token' }, token: 'hidden-response-token' }),
+])('uses a safe creation fallback for malformed error bodies', async body => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 502 })));
+  const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+  const restore = installOpenApiSessionCreation(client, 'http://localhost/d');
+  try {
+    await expect(client.createStandaloneSession()).rejects.toThrow(/^创建 OpenAPI 会话失败$/);
+  } finally { restore(); client.dispose(); }
+});
+
+it.each([
+  { error: { message: 'lookup denied', requestId: 'POP-lookup' } },
+  { error: 'lookup denied', requestId: 'POP-lookup' },
+])('keeps the requestId on Agent-scoped session lookup errors', async body => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(body, { status: 403 })));
+  const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+  const restore = installOpenApiSessionCreation(client, 'http://localhost/d', undefined, { agentName: () => 'agent-a' });
+  try {
+    await expect(client.getStandaloneSession('session-id')).rejects.toThrow('lookup denied (requestId=POP-lookup)');
+  } finally { restore(); client.dispose(); }
+});
