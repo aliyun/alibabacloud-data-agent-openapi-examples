@@ -48,6 +48,8 @@ Windows 使用 `py -3 -m venv server-python/.venv` 和 `server-python\.venv\Scri
 
 准备已开通 DataWorks 的账号、具备所需权限的 RAM AccessKey，以及官方或已发布的自定义 Agent。
 
+**新增 OpenAPI 必须先开启灰度。** 使用真实后端前，请确认调用账号在目标地域已开通 `UpdateAgent`、`GetAgentSessionEvents`、`ArchiveAgentSession` 和 `DeleteAgentSession` 的对应灰度。未开通时，相关调用会报错，包括网页中的实时事件订阅、归档、取消归档和删除。灰度开通与 RAM 授权均需满足。详见[OpenAPI 调用示例](docs/OPENAPI-EXAMPLES.md)。
+
 1. 将根目录 `.env.example` 复制为 `.env`。
 2. 填写 RAM 的 AccessKey ID、AccessKey Secret 和目标地域，设置 `MOCK=0`。先体验官方 Agent 时，保留默认 `dataworks_data_agent`；使用自定义 Agent 时再填已发布名称。
 3. 去掉启动命令的 `--mock`，任选一种语言：

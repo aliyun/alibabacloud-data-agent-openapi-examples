@@ -10,7 +10,7 @@
 
 ## 接口与参数
 
-调用 `UpdateAgent`、`ArchiveAgentSession`、`DeleteAgentSession` 或 `GetAgentSessionEvents` 前，请确认当前账号及目标地域已开启对应灰度。
+调用 `UpdateAgent`、`ArchiveAgentSession`、`DeleteAgentSession` 或 `GetAgentSessionEvents` 前，调用账号必须在目标地域开通对应灰度。未开通时，相关调用会报错。使用下列 SDK 示例或从 Workbench 网页发起调用时，均需满足灰度和 RAM 授权要求。
 
 | POP Action / 字段 | 作用与调用参数 |
 |---|---|

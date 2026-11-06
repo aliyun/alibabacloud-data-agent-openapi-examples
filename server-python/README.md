@@ -35,6 +35,8 @@ bash scripts/dev-server.sh python
 
 ## 会话配置与实时事件
 
+真实调用 `GetAgentSessionEvents`、`ArchiveAgentSession`、`DeleteAgentSession` 和管理示例中的 `UpdateAgent` 前，调用账号必须在目标地域开通对应灰度。未开通时，相关调用会报错。
+
 `DATAAGENT_AGENT_NAME` 指定已存在的 Agent。创建默认值使用 `DATAAGENT_MODEL`、
 `DATAAGENT_MODE`（默认 `yolo`）、`DATAAGENT_REASONING_EFFORT`；
 `DATAAGENT_MODELS` 是逗号分隔的模型 ID 提示列表，不替代服务端模型校验。
@@ -69,7 +71,7 @@ Load 读取远端历史，Prompt 通过独立 HTTP 请求提交新问题；LIVE 
 浏览器 epoch 由 endpoint、region、session 稳定导出，与本地 journal 纪元分离。
 断线由客户端重订阅，后端不会为恢复 Events 重发 Prompt。
 
-归档、删除及 UpdateAgent 使用 SDK 10.0.0 的生成方法，归档仍校验目标状态，删除接受空 Result。生成的 Events SSE 方法使用 POST，workbench 继续通过 `call_sseapi_async` 发送签名 GET，传递 `Last-Event-Id` 并增量读取 SSE。调用新增接口需要在目标账号及地域开启灰度。
+归档、删除及 UpdateAgent 使用 SDK 10.0.0 的生成方法，归档仍校验目标状态，删除接受空 Result。生成的 Events SSE 方法使用 POST，workbench 继续通过 `call_sseapi_async` 发送签名 GET，传递 `Last-Event-Id` 并增量读取 SSE。
 
 ## 独立 Agent 管理示例
 

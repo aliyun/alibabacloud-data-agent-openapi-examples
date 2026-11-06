@@ -33,6 +33,8 @@ Open the address printed in the terminal (normally <http://127.0.0.1:5173>). The
 
 ## Use your own DataAgent
 
+**The new OpenAPI actions require staged rollout access.** Before using LIVE mode, confirm that `UpdateAgent`, `GetAgentSessionEvents`, `ArchiveAgentSession`, and `DeleteAgentSession` are enabled for your calling account in the target region. Calls fail without rollout access, including the UI's live event subscription, archive, restore, and delete actions. You also need the corresponding RAM permissions. See the [OpenAPI examples](docs/OPENAPI-EXAMPLES.md).
+
 You need DataWorks enabled in the target region and a RAM user's AccessKey ID/secret with the necessary permissions. Start with the default official Agent, `dataworks_data_agent`; custom Agents must already be published and accessible. The ACS flow creates or reuses an instance without a resource group or ProjectId.
 
 Copy `.env.example` to `.env` (Windows: `copy .env.example .env`) and set:

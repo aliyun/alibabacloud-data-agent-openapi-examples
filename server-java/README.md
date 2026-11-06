@@ -35,6 +35,8 @@ mvn -f server-java/pom.xml package
 
 ## LIVE 无状态会话代理
 
+真实调用 `GetAgentSessionEvents`、`ArchiveAgentSession`、`DeleteAgentSession` 和管理示例中的 `UpdateAgent` 前，调用账号必须在目标地域开通对应灰度。未开通时，相关调用会报错。详见[OpenAPI 调用示例](../docs/OPENAPI-EXAMPLES.md)。
+
 `GET /d/openapi/session-options` 返回 `{agentName, model?, approvalMode, reasoningEffort?, models, promptTransport}`；LIVE 的 `promptTransport` 为 `http-stream`，MOCK 为 `daemon`。默认值读取 `DATAAGENT_MODEL`、`DATAAGENT_MODE`（默认 `yolo`）、`DATAAGENT_REASONING_EFFORT` 和逗号分隔的 `DATAAGENT_MODELS`。
 
 新建会话接受 `{modelServiceId?, approvalMode?, reasoningEffort?, agentName?}`，通过 POP `Params.Meta.InitialConfigOptions` 传递。支持 `plan/default/auto-edit/auto/yolo`，`data-agent` 占位符不作为真实模型 ID。配置仅在创建时应用，已有会话配置端点返回 409 `requires-new-session`。`/d/standalone/session-options` 的选择器显示创建默认值；Load 不以环境默认值冒充远端模型状态。

@@ -16,6 +16,8 @@
 | DataWorks 产品侧 | Agent 所有权/可见性及引用资源权限；准备企业级 Skill/套件等资源时须满足租户管理员要求。RAM API 授权不会自动授予租户管理员，也不表示所有个人 Agent 操作都必须由租户管理员执行 |
 | 数据源 | Agent 执行 SQL、读取表或调用工具所用身份的实际数据权限；发布 Agent 不会自动授权数据访问 |
 
+调用 `UpdateAgent` 前，管理身份所属账号必须在目标地域开通该接口的灰度。未开通时，更新调用会报错。
+
 以下命令从仓库根执行，使用 Bash/zsh。先执行 `cp .env.example .env.admin`，在本地受保护的 `.env.admin` 中配置管理身份、`MOCK=0`、地域、endpoint 与目标 `DATAAGENT_AGENT_NAME`。不要复制他人的凭证。会话服务仍使用自己的 `.env`；`DAS_ENV=admin` 只为独立管理进程选择配置，不是自动扮演角色。进程已导出的变量优先于文件，运行前确认凭证来源，勿打印完整环境。修改环境文件后重新运行命令；CLI 登录/profile 不会被这些 SDK client 自动读取。
 
 独立管理函数没有 MOCK 回放分支，即使设置 `MOCK=1`，显式调用仍会请求真实 OpenAPI。只读核对使用 Get；Create/Update 只在确认目标身份、地域和名称后执行。
