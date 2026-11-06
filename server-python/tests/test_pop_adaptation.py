@@ -48,12 +48,12 @@ async def test_create_uses_published_fields_and_ui_overrides():
     client = FakePop()
     cfg = config(model="env-model", mode="plan", reasoningEffort="medium")
     result = await _create_session_result(LiveContext(client, cfg), options={
-        "modelServiceId": "selected-model", "approvalMode": "auto-edit", "reasoningEffort": "none"})
+        "modelServiceId": "selected-model", "approvalMode": "auto-edit", "reasoningEffort": "none", "cu": "8"})
     assert result["sessionId"] == "Remote-ID"
     desc, params, runtime = client.calls[0]
     assert (desc.action, desc.method, desc.req_body_type) == ("CreateAgentSession", "POST", "formData")
     assert params["Meta"]["Agent"] == {"AgentName": "configured-agent"}
-    assert params["Meta"]["InitialConfigOptions"] == {"Mode": "auto-edit", "Model": "selected-model", "ReasoningEffort": "none"}
+    assert params["Meta"]["InitialConfigOptions"] == {"Mode": "auto-edit", "Model": "selected-model", "ReasoningEffort": "none", "Cu": "8"}
     assert "RuntimePolicy" not in params["Meta"]
     assert runtime.autoretry is False
 
@@ -100,7 +100,7 @@ def test_routes_defaults_creation_mutations_and_failures(monkeypatch):
     http, pop = live_app(monkeypatch)
     assert http.get("/d/openapi/session-options").json() == {
         "agentName": "configured-agent", "model": "env-model", "approvalMode": "plan",
-        "reasoningEffort": "high", "models": ["env-model", "other"], "promptTransport": "http-stream"}
+        "reasoningEffort": "high", "cu": "4", "models": ["env-model", "other"], "promptTransport": "http-stream"}
     body = {"modelServiceId": "selected", "approvalMode": "auto", "reasoningEffort": "none"}
     assert http.post("/d/standalone/sessions", json=body).status_code == 200
     first_params = pop.calls[-1][1]
@@ -387,6 +387,7 @@ def test_model_sentinel_uses_environment_or_omits_on_both_create_routes(monkeypa
         assert http.post(route, json=body).status_code == 200
         initial = client.calls[-1][1]["Meta"]["InitialConfigOptions"]
         assert initial["Mode"] == "plan" and initial["ReasoningEffort"] == "medium"
+        assert initial["Cu"] == "4"
         assert initial.get("Model") == default
         assert ("Model" in initial) == (default is not None)
 

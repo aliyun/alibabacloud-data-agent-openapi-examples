@@ -110,7 +110,7 @@ export async function registerRestRoutes(
    * 停下等人（人卡，配下面的 /reply）；`yolo` = 全部自动放行。前端 UI 传 default
    * 对齐 Web Shell 的行为；自检与无人值守路径保持 yolo。
    */
-  app.post<{ Body: { title?: unknown; agentName?: unknown; mode?: unknown; approvalMode?: unknown; modelServiceId?: unknown; reasoningEffort?: unknown } }>('/api/sessions', async (request, reply) => {
+  app.post<{ Body: { title?: unknown; agentName?: unknown; mode?: unknown; approvalMode?: unknown; modelServiceId?: unknown; reasoningEffort?: unknown; cu?: unknown } }>('/api/sessions', async (request, reply) => {
     let options;
     try { options = sessionOptions(cfg, request.body ?? {}); }
     catch (error) {

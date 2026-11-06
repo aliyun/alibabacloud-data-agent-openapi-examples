@@ -1,6 +1,7 @@
 import type { OpenApiCreateOptions, SessionDefaults } from './session-client';
 
 const modes = new Set(['default', 'yolo', 'plan', 'auto-edit', 'auto']);
+export const SESSION_CU_VALUES = ['2', '4', '8', '12'] as readonly string[];
 const reasoning = new Set(['none', 'default', 'low', 'medium', 'high', 'xhigh', 'max']);
 const key = (baseUrl: string, agentName: string) => `workbench.session-options.v1:${baseUrl}:${agentName}`;
 
@@ -19,6 +20,7 @@ export function sanitizePreferences(raw: unknown): OpenApiCreateOptions {
   return {
     ...(model && model.length <= 512 && model !== 'data-agent' ? { modelServiceId: model } : {}),
     ...(typeof input.approvalMode === 'string' && modes.has(input.approvalMode) ? { approvalMode: input.approvalMode } : {}),
+    ...(typeof input.cu === 'string' && SESSION_CU_VALUES.includes(input.cu) ? { cu: input.cu } : {}),
     ...(typeof input.reasoningEffort === 'string' && reasoning.has(input.reasoningEffort) ? { reasoningEffort: input.reasoningEffort } : {}),
   };
 }
@@ -68,7 +70,8 @@ export function effectiveDefaults(defaults: SessionDefaults, preferences: OpenAp
   const saved = sanitizePreferences(preferences);
   return { ...defaults, ...(saved.modelServiceId ? { model: saved.modelServiceId } : {}),
     ...(saved.approvalMode ? { approvalMode: saved.approvalMode } : {}),
-    ...(saved.reasoningEffort ? { reasoningEffort: saved.reasoningEffort } : {}) };
+    ...(saved.reasoningEffort ? { reasoningEffort: saved.reasoningEffort } : {}),
+    ...(saved.cu ? { cu: saved.cu } : {}) };
 }
 
 /** Explicit SDK arguments > user overrides > freshly fetched environment. */
@@ -78,10 +81,12 @@ export function resolveCreationOptions(defaults: SessionDefaults, preferences: O
   const selectedModel = initial.modelServiceId?.trim();
   const model = selectedModel && selectedModel !== 'data-agent' ? selectedModel : saved.model;
   const effort = initial.reasoningEffort ?? saved.reasoningEffort;
+  const cu = initial.cu ?? saved.cu;
   return {
     ...(model ? { modelServiceId: model } : {}),
     approvalMode: initial.approvalMode ?? saved.approvalMode,
     ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+    ...(cu !== undefined ? { cu } : {}),
   };
 }
 

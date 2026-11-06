@@ -308,7 +308,7 @@ public final class LiveClient implements AutoCloseable {
     /** Build the generated request with the workbench's initial options. */
     CreateAgentSessionRequest buildCreateSessionRequest(SessionOptions options) {
         var initial = CreateAgentSessionRequest.InitialConfigOptions.builder()
-            .mode(options.approvalMode()).model(options.model()).reasoningEffort(options.reasoningEffort())
+            .mode(options.approvalMode()).model(options.model()).reasoningEffort(options.reasoningEffort()).cu(options.cu())
             .resourceGroupId(cfg.resourceGroupId()).projectId(cfg.projectId()).build();
         var meta = CreateAgentSessionRequest.Meta.builder()
             .agent(CreateAgentSessionRequest.Agent.builder().agentName(options.agentName() != null ? options.agentName() : cfg.agentName()).build())

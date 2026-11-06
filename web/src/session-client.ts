@@ -61,8 +61,8 @@ function installRestoreCursorCompatibility(): () => void {
  * so adapt only creation; load, prompt, SSE and permissions retain the SDK flow.
  * Do not retry an ambiguous POST: OpenAPI creation is not idempotent.
  */
-export interface OpenApiCreateOptions { agentName?: string; modelServiceId?: string; approvalMode?: string; reasoningEffort?: string }
-export interface SessionDefaults { agentName: string; model?: string; approvalMode: string; reasoningEffort?: string; models: string[]; promptTransport?: PromptTransport }
+export interface OpenApiCreateOptions { agentName?: string; modelServiceId?: string; approvalMode?: string; reasoningEffort?: string; cu?: string }
+export interface SessionDefaults { agentName: string; model?: string; approvalMode: string; reasoningEffort?: string; cu?: string; models: string[]; promptTransport?: PromptTransport }
 
 export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: string,
   configure?: (options: OpenApiCreateOptions) => Promise<OpenApiCreateOptions>,
@@ -151,11 +151,11 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
   };
   client.createStandaloneSession = async (options = {}) => {
     try {
-      const { agentName, modelServiceId, approvalMode, reasoningEffort } = configure ? await configure(options) : options as OpenApiCreateOptions;
+      const { agentName, modelServiceId, approvalMode, reasoningEffort, cu } = configure ? await configure(options) : options as OpenApiCreateOptions;
       const response = await fetch(`${baseUrl}/standalone/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentName, modelServiceId, approvalMode, reasoningEffort }),
+        body: JSON.stringify({ agentName, modelServiceId, approvalMode, reasoningEffort, cu }),
         signal: AbortSignal.timeout(120_000),
       });
       const body: unknown = await response.json().catch(() => undefined);
@@ -163,7 +163,7 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
         throw apiHttpError(response.status, body, '创建 OpenAPI 会话失败');
       }
       if (!isStandaloneSession(body)) throw new Error('创建会话返回了无效的 OpenAPI session');
-      hooks?.onCreated?.({ agentName, modelServiceId, approvalMode, reasoningEffort }, body);
+      hooks?.onCreated?.({ agentName, modelServiceId, approvalMode, reasoningEffort, cu }, body);
       return body;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error('创建会话请求失败');

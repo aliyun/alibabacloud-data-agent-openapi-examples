@@ -24,7 +24,7 @@ function sanitizeConfiguration(raw: unknown): SessionConfiguration {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const input = raw as Record<string, unknown>;
   const selected: SessionConfiguration = {};
-  for (const field of ['agentName', 'modelServiceId', 'approvalMode', 'reasoningEffort'] as const) {
+  for (const field of ['agentName', 'modelServiceId', 'approvalMode', 'reasoningEffort', 'cu'] as const) {
     const value = input[field];
     if (typeof value !== 'string') continue;
     const trimmed = value.trim();

@@ -42,7 +42,8 @@ public record AppConfig(
     String reasoningEffort,
     List<String> models,
     /** Optional STS token paired with this config's access key. */
-    String securityToken
+    String securityToken,
+    String cu
 ) {
     /** Preserve callers that explicitly supply long-lived credentials. */
     public AppConfig(boolean mock, boolean mockRealtime, double mockSpeed, int port,
@@ -52,7 +53,7 @@ public record AppConfig(
         String model, String approvalMode, String reasoningEffort, List<String> models) {
         this(mock, mockRealtime, mockSpeed, port, corsOrigin, regionId, endpoint, agentName,
             sessionSource, resourceGroupId, projectId, accessKeyId, accessKeySecret, serverHost,
-            webDist, repoRoot, model, approvalMode, reasoningEffort, models, null);
+            webDist, repoRoot, model, approvalMode, reasoningEffort, models, null, null);
     }
     private static final Set<String> TRUTHY = Set.of("1", "true", "yes", "on");
 
@@ -158,7 +159,8 @@ public record AppConfig(
             nonEmpty(env("DATAAGENT_MODE")) != null ? nonEmpty(env("DATAAGENT_MODE")) : "yolo",
             nonEmpty(env("DATAAGENT_REASONING_EFFORT")),
             parseModels(env("DATAAGENT_MODELS"), nonEmpty(env("DATAAGENT_MODEL"))),
-            nonEmpty(env("ALIBABA_CLOUD_SECURITY_TOKEN"))
+            nonEmpty(env("ALIBABA_CLOUD_SECURITY_TOKEN")),
+            nonEmpty(env("DATAAGENT_CU"))
         );
 
         if (!cfg.mock && (cfg.accessKeyId == null || cfg.accessKeySecret == null)) {

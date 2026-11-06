@@ -25,7 +25,7 @@ interface WireMap {
     Meta?: {
       Agent?: { AgentName?: string };
       Config?: { SessionSource?: string; SessionTags?: Array<{ SessionTagCode?: string }> };
-      InitialConfigOptions?: { ResourceGroupId?: string };
+      InitialConfigOptions?: { ResourceGroupId?: string; Cu?: string };
     };
     [stray: string]: unknown;
   };
@@ -75,6 +75,10 @@ describe('buildCreateSessionRequest — wire 序列化（防 Params:{} 回归）
       Params?: { Meta?: { InitialConfigOptions?: { Mode?: string } } };
     };
     expect(map.Params?.Meta?.InitialConfigOptions?.Mode).toBe('yolo');
+    expect(map.Params?.Meta?.InitialConfigOptions?.Cu).toBe('4');
+    const overridden = buildCreateSessionRequest(cfg({ cu: '2' }), { cu: '8' }).toMap() as WireMap;
+    expect(overridden.Params?.Meta?.InitialConfigOptions?.Cu).toBe('8');
+    expect(() => buildCreateSessionRequest(cfg(), { cu: '3' })).toThrow('cu');
   });
 
   it('Mode=default 落在 Meta.InitialConfigOptions.Mode：人卡路径的唯一开关', () => {

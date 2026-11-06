@@ -181,7 +181,7 @@ class PopAdapterTest {
             assertEquals("created", client.createSessionWithOptions(new SessionOptions("model(openai)", "plan", "high")).get("sessionId"));
             JsonNode meta = JSON.readTree(request().get("Params")).path("Meta");
             assertEquals("custom-agent", meta.path("Agent").path("AgentName").asText());
-            assertEquals(JSON.readTree("{\"Model\":\"model(openai)\",\"Mode\":\"plan\",\"ReasoningEffort\":\"high\"}"), meta.path("InitialConfigOptions"));
+            assertEquals(JSON.readTree("{\"Model\":\"model(openai)\",\"Mode\":\"plan\",\"ReasoningEffort\":\"high\",\"Cu\":\"4\"}"), meta.path("InitialConfigOptions"));
         }
     }
 

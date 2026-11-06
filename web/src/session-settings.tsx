@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { useConnection } from '@qwen-code/web-shell';
 import type { OpenApiCreateOptions, SessionDefaults } from './session-client';
-import { validAgentName, type PreferenceState } from './session-preferences';
+import { SESSION_CU_VALUES, validAgentName, type PreferenceState } from './session-preferences';
 import { readSessionConfiguration } from './session-configuration';
 
 export interface SessionSettingsValue {
@@ -57,7 +57,7 @@ export function SessionConfiguration({ sessionId }: { sessionId?: string }) {
   const { baseUrl, defaults, configured, setOpen } = useSettings();
   const snapshot = sessionId && defaults ? readSessionConfiguration(baseUrl, defaults.agentName, sessionId) : undefined;
   const selected = sessionId ? snapshot : configured ? { modelServiceId: configured.model,
-    approvalMode: configured.approvalMode, reasoningEffort: configured.reasoningEffort } : undefined;
+    approvalMode: configured.approvalMode, reasoningEffort: configured.reasoningEffort, cu: configured.cu } : undefined;
   return <div className="session-configuration" aria-label={sessionId ? '当前会话配置' : '新会话默认配置'}>
     {selected ? <span className="session-configuration-values" title={sessionId
       ? '本浏览器记录的创建时配置，不代表实时运行状态；已有会话不能修改配置。'
@@ -65,6 +65,7 @@ export function SessionConfiguration({ sessionId }: { sessionId?: string }) {
       <span className="session-config-model">{selected.modelServiceId ?? '默认模型'}</span>
       <span>{selected.approvalMode ?? 'Agent 默认模式'}</span>
       <span>思考：{selected.reasoningEffort === 'none' ? '关闭' : selected.reasoningEffort ?? 'Agent 默认'}</span>
+      {selected.cu && <span>{selected.cu} CU</span>}
       <span className="session-config-source">{sessionId ? '创建时' : '默认'}</span>
     </span> : <span className="session-config-source" title={sessionId ? '未记录此会话的创建配置，上游历史也未返回权威配置。' : '等待读取后端默认值。'}>
       {sessionId ? '会话配置未记录' : '正在读取配置'}
@@ -125,6 +126,10 @@ export function SessionSettingsDialog() {
               <option value="medium">中</option><option value="high">高</option><option value="xhigh">更高</option><option value="max">最高</option>
             </select></label>
           </div>
+          {defaults.cu && <label>实例算力<select aria-label="新会话 CU" value={preferences.options.cu ?? ''} onChange={event => update({ cu: event.target.value })}>
+            <option value="">沿用环境默认（{defaults.cu} CU）</option>
+            {SESSION_CU_VALUES.map(cu => <option key={cu} value={cu}>{cu} CU</option>)}
+          </select></label>}
           <p className="session-settings-note">{preferences.persistence === 'memory' ? '浏览器存储不可用，设置仅在当前页面保留。' : '已自动保存到本浏览器，按后端地址和 Agent 隔离。'}模型与思考深度须由目标模型支持。</p>
         </> : <p role="status">{configError ?? '正在读取配置…'}</p>}
       </section>

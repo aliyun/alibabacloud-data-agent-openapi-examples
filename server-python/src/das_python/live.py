@@ -499,7 +499,8 @@ async def _create_session_result(ctx: LiveContext, mode: str | None = None, *, o
     selected = creation_options(ctx.cfg, options if options is not None else ({"mode": mode} if mode else {}))
     initial = sdk_models.CreateAgentSessionRequestParamsMetaInitialConfigOptions(
         mode=selected["mode"], model=selected.get("model"),
-        reasoning_effort=selected.get("reasoningEffort"), resource_group_id=ctx.cfg.resourceGroupId or None,
+        reasoning_effort=selected.get("reasoningEffort"), cu=selected["cu"],
+        resource_group_id=ctx.cfg.resourceGroupId or None,
     ).to_map()
     response = await rpc(ctx, "CreateAgentSession", {"Meta": {
         "Agent": {"AgentName": selected["agentName"]},

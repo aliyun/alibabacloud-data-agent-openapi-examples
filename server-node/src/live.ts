@@ -205,6 +205,7 @@ export function buildCreateSessionRequest(cfg: AppConfig, mode: SessionMode | Se
           mode: options.approvalMode,
           model: options.modelServiceId,
           reasoningEffort: options.reasoningEffort,
+          cu: options.cu,
         }),
       }),
     }),

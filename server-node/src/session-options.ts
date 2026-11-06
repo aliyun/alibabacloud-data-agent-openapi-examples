@@ -5,7 +5,10 @@ export interface SessionCreationOptions {
   modelServiceId?: string;
   approvalMode?: string;
   reasoningEffort?: string;
+  cu?: string;
 }
+
+const SESSION_CU_VALUES = new Set(['2', '4', '8', '12']);
 
 export const APPROVAL_MODES = ['default', 'yolo', 'plan', 'auto-edit', 'auto'] as const;
 
@@ -33,7 +36,11 @@ export function sessionOptions(cfg: AppConfig, body: unknown = {}): SessionCreat
   const approvalMode = ((raw.approvalMode ?? raw.mode) as string | undefined)?.trim() ?? cfg.mode ?? 'yolo';
   const reasoningEffort = (raw.reasoningEffort as string | undefined)?.trim() ?? cfg.reasoningEffort;
   if (!(APPROVAL_MODES as readonly string[]).includes(approvalMode)) throw new Error('不支持的审批模式');
-  return { agentName, modelServiceId, approvalMode, reasoningEffort };
+  const rawCu = raw.cu === undefined ? cfg.cu ?? '4' : raw.cu;
+  if (typeof rawCu !== 'string' || !SESSION_CU_VALUES.has(rawCu.trim())) {
+    throw new Error('cu 必须为字符串 2、4、8 或 12');
+  }
+  return { agentName, modelServiceId, approvalMode, reasoningEffort, cu: rawCu.trim() };
 }
 
 export function publicSessionOptions(cfg: AppConfig) {
@@ -43,6 +50,7 @@ export function publicSessionOptions(cfg: AppConfig) {
     model: defaults.modelServiceId,
     approvalMode: defaults.approvalMode,
     reasoningEffort: defaults.reasoningEffort,
+    cu: defaults.cu,
     models: [...new Set([cfg.model, ...(cfg.models ?? [])].filter((v): v is string => !!v))],
   };
 }

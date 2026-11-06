@@ -4,6 +4,7 @@ from typing import Any
 
 from .config import AppConfig
 
+SESSION_CU_VALUES = ("2", "4", "8", "12")
 MODES = ("plan", "default", "auto-edit", "auto", "yolo")
 
 
@@ -22,6 +23,7 @@ def creation_options(cfg: AppConfig, body: dict[str, Any]) -> dict[str, str]:
         ("mode", ("approvalMode", "mode"), cfg.mode),
         ("model", ("modelServiceId", "model"), cfg.model),
         ("reasoningEffort", ("reasoningEffort",), cfg.reasoningEffort),
+        ("cu", ("cu",), cfg.cu),
     ):
         value = next((body[a] for a in aliases if a in body), default)
         if value is None and not any(alias in body for alias in aliases):
@@ -35,6 +37,8 @@ def creation_options(cfg: AppConfig, body: dict[str, Any]) -> dict[str, str]:
                 continue
         if key == "mode" and value not in MODES:
             raise ValueError(f"approvalMode must be one of {', '.join(MODES)}")
+        if key == "cu" and value not in SESSION_CU_VALUES:
+            raise ValueError(f"cu must be one of {', '.join(SESSION_CU_VALUES)}")
         out[key] = value
     return out
 
@@ -42,6 +46,6 @@ def creation_options(cfg: AppConfig, body: dict[str, Any]) -> dict[str, str]:
 def public_options(cfg: AppConfig) -> dict[str, Any]:
     options = creation_options(cfg, {})
     models = list(dict.fromkeys((*cfg.models, *([cfg.model] if cfg.model else []))))
-    return {"agentName": cfg.agentName, "approvalMode": options["mode"], "models": models,
+    return {"agentName": cfg.agentName, "approvalMode": options["mode"], "cu": options["cu"], "models": models,
             **({"model": options["model"]} if "model" in options else {}),
             **({"reasoningEffort": options["reasoningEffort"]} if "reasoningEffort" in options else {})}

@@ -17,7 +17,7 @@
 | `CreateAgent` | 顶层 `Name`、`SystemPrompt`、`Skills`、`ExpertSuites`；显式 `PublishImmediately=true` 才请求立即发布 |
 | `GetAgent` | 顶层 `Name`；可选 `AgentVersion`，省略读取当前定义 |
 | `UpdateAgent` | 顶层 `Name`、刚回读的 `ExpectedVersion`、要修改的字段；可选 `PublishImmediately`。未修改的引用列表应省略；当前新后端对 `Tools`/`Skills`/`CallableAgents` 的空数组保留引用，`ExpertSuites=[]` 清空套件引用；发布失败后先回读 |
-| `CreateAgentSession` | `Params.Meta.Agent.AgentName` 指定已发布 Agent；`Params.Meta.InitialConfigOptions` 下的 `Model`、`Mode`、`ReasoningEffort` 设置新会话配置 |
+| `CreateAgentSession` | `Params.Meta.Agent.AgentName` 指定已发布 Agent；`Params.Meta.InitialConfigOptions` 下的 `Model`、`Mode`、`ReasoningEffort` 和 `Cu` 设置新会话配置 |
 | `UpdateAgentSessionTitle` | `Params={SessionId, Title}`，修改会话标题 |
 | `ArchiveAgentSession` | `Params={SessionId, Archived:true}` 归档；`false` 取消归档；列表使用 `ListAgentSessions.Params.Archived` 选择范围，不能恢复已删除会话 |
 | `DeleteAgentSession` | `Params={SessionId}`；删除前确认目标，不能把测试清理代码直接用于用户会话 |
@@ -35,13 +35,16 @@
     "InitialConfigOptions": {
       "Model": "替换为账号已授权的完整模型标识",
       "Mode": "yolo",
-      "ReasoningEffort": "none"
+      "ReasoningEffort": "none",
+      "Cu": "4"
     }
   }
 }
 ```
 
 模型留空时**省略 Model 字段**，沿用 Agent 配置；`none` 关闭思考，仍须由模型支持。`Mode` 支持 `default/yolo/plan/auto-edit/auto`。这些参数只在创建时应用，不能用它们修改已有会话。YOLO 不会自动回答 `ask_user_question`。ACS 不需要资源组或 ProjectId。
+
+`Cu` 是字符串，可传 `"2"`、`"4"`、`"8"` 或 `"12"`。Workbench 默认传 `"4"`，可用 `DATAAGENT_CU` 或网页会话设置指定。共享模式下，传入 CU 后只复用同规格实例，没有匹配实例时新建。直接调用 OpenAPI 时可省略 `Cu`，共享实例复用不受 CU 限制。
 
 ## 会话接口的三语言示例
 
@@ -89,7 +92,7 @@ from das_python.pop import rpc
 async def example():
     cfg = load_config()
     ctx = LiveContext(create_sdk_client(cfg), cfg)
-    initial = {"Mode": "yolo", "ReasoningEffort": "none"}
+    initial = {"Mode": "yolo", "ReasoningEffort": "none", "Cu": cfg.cu}
     if cfg.model:
         initial["Model"] = cfg.model
     created = await rpc(ctx, "CreateAgentSession", {"Meta": {

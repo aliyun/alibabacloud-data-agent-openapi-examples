@@ -38,6 +38,7 @@ class AppConfig:
     reasoningEffort: str | None = None  # noqa: N815
     models: tuple[str, ...] = ()
     securityToken: str | None = None  # noqa: N815 — externally supplied temporary credentials
+    cu: str = "4"
 
 
 def _bool(raw: str | None) -> bool:
@@ -102,6 +103,7 @@ def load_config() -> AppConfig:
         model=_non_empty(os.environ.get("DATAAGENT_MODEL")),
         mode=_non_empty(os.environ.get("DATAAGENT_MODE")) or "yolo",
         reasoningEffort=_non_empty(os.environ.get("DATAAGENT_REASONING_EFFORT")),
+        cu=_non_empty(os.environ.get("DATAAGENT_CU")) or "4",
         models=tuple(dict.fromkeys(s.strip() for s in os.environ.get("DATAAGENT_MODELS", "").split(",") if s.strip())),
         mock=_bool(os.environ.get("MOCK")),
         mockRealtime=_bool(os.environ.get("MOCK_REALTIME")),  # noqa: N815

@@ -45,6 +45,7 @@ Copy `.env.example` to `.env` (Windows: `copy .env.example .env`) and set:
 | `ALIBABA_CLOUD_ACCESS_KEY_ID` | RAM user AccessKey ID |
 | `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | AccessKey secret; never commit it |
 | `DATAAGENT_REGION_ID` | Region containing your resources, e.g. `cn-hangzhou` |
+| `DATAAGENT_CU` | Compute units for new sessions. Defaults to 4. Supported values are 2, 4, 8, and 12. |
 | `RESOURCE_GROUP_ID` | Leave empty for ACS; used only by the legacy resource-group flow |
 | `DATAAGENT_AGENT_NAME` | Backend fallback, normally `dataworks_data_agent`; the web UI can override it |
 | `END_POINT` | Optional hostname override, without protocol/path; otherwise leave empty |
@@ -56,7 +57,7 @@ Run `npm start -- java`, `npm start -- python`, or `npm start -- node`. The back
 
 The UI uses the actual `sessionId` returned by OpenAPI. Creating a session and sending a prompt updates the URL to `/session/{sessionId}` without a hash. Reloading, sharing, and browser back/forward restore the selected session. Permission and question cards send replies upstream to continue the task.
 
-Use Session Settings in the sidebar for browser-persisted defaults for new sessions. The composer shows the locally recorded creation options for each session; unknown historic configurations are not inferred from new defaults. Existing session options are read-only.
+Use Session Settings in the sidebar to save defaults for new sessions, including the instance CU. The composer shows the locally recorded creation options for each session; unknown historic configurations are not inferred from new defaults. Existing session options are read-only.
 
 Cloud history is reloaded when opening a session. In LIVE mode, renaming, archiving/restoring, and deleting sessions call the corresponding OpenAPI Actions; the target region must provide and authorize them. The backend does not keep a session registry or local history journal. Some UI and usage features require additional upstream capabilities. Save important results separately.
 

@@ -38,6 +38,9 @@ class SessionOptionsTest {
         AppConfig cfg = mock(AppConfig.class);
         when(cfg.agentName()).thenReturn("agent");
         assertEquals("yolo", SessionOptions.resolve(cfg, null).approvalMode());
+        assertEquals("4", SessionOptions.resolve(cfg, null).cu());
+        assertEquals("8", SessionOptions.resolve(cfg, Map.of("cu", "8")).cu());
+        assertThrows(IllegalArgumentException.class, () -> SessionOptions.resolve(cfg, Map.of("cu", "3")));
         assertFalse(SessionOptions.describe(cfg).containsKey("model"));
         assertFalse(SessionOptions.describe(cfg).containsKey("reasoningEffort"));
         for (String mode : List.of("plan", "default", "auto-edit", "auto", "yolo"))

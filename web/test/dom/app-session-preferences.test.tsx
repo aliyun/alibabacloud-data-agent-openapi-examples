@@ -165,15 +165,20 @@ describe('App new-session settings', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
   it('records final options only after successful creation and keeps old session display when defaults change', async () => {
+    environment = { ...environment, cu: '4' };
     await mount();
+    expect(screen.getByLabelText('新会话 CU').textContent).toContain('4 CU');
+    fireEvent.change(screen.getByLabelText('新会话 CU'), { target: { value: '8' } });
     fireEvent.change(screen.getByLabelText('新会话模型'), { target: { value: 'created-model' } });
     fireEvent.change(screen.getByLabelText('新会话审批模式'), { target: { value: 'yolo' } });
     fireEvent.change(screen.getByLabelText('新会话思考深度'), { target: { value: 'none' } });
     await act(() => harness.actions.createSession());
-    expect(readSessionConfiguration(base, 'a', 'server-id')).toEqual({ agentName: 'a', modelServiceId: 'created-model', approvalMode: 'yolo', reasoningEffort: 'none' });
+    expect(readSessionConfiguration(base, 'a', 'server-id')).toEqual({ agentName: 'a', modelServiceId: 'created-model', approvalMode: 'yolo', reasoningEffort: 'none', cu: '8' });
+    expect(creates[0]).toMatchObject({ cu: '8' });
     fireEvent.click(screen.getByRole('button', { name: '完成' }));
     expect(screen.getByLabelText('当前会话配置').textContent).toContain('created-model');
     expect(screen.getByLabelText('当前会话配置').textContent).toContain('关闭');
+    expect(screen.getByLabelText('当前会话配置').textContent).toContain('8 CU');
     fireEvent.click(screen.getByRole('button', { name: '会话设置' }));
     fireEvent.change(screen.getByLabelText('新会话模型'), { target: { value: 'future-model' } });
     fireEvent.change(screen.getByLabelText('新会话思考深度'), { target: { value: 'high' } });

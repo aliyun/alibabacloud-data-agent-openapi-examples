@@ -34,6 +34,7 @@ export interface AppConfig {
   models?: string[];
   mode?: string;
   reasoningEffort?: string;
+  cu?: string;
   accessKeyId: string | undefined;
   accessKeySecret: string | undefined;
   /** Optional token for externally supplied temporary AK/SK credentials. */
@@ -94,6 +95,7 @@ export function loadConfig(): AppConfig {
     models: nonEmpty(process.env.DATAAGENT_MODELS)?.split(',').map(v => v.trim()).filter(Boolean),
     mode: nonEmpty(process.env.DATAAGENT_MODE) ?? 'yolo',
     reasoningEffort: nonEmpty(process.env.DATAAGENT_REASONING_EFFORT),
+    cu: nonEmpty(process.env.DATAAGENT_CU),
     accessKeyId,
     accessKeySecret,
     securityToken: nonEmpty(process.env.ALIBABA_CLOUD_SECURITY_TOKEN),
