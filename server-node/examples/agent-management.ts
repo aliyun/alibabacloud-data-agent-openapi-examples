@@ -1,5 +1,7 @@
 /** Administrator-only examples. Never imported or executed by server startup. */
 import { $OpenApiUtil } from '@alicloud/openapi-core';
+import { UpdateAgentRequest } from '@alicloud/dataworks-public20240518';
+import { cast } from '@darabonba/typescript';
 import type { SdkClient } from '../src/sdk.js';
 import { runtimeFor } from '../src/sdk.js';
 import { headerRequestId } from '../src/normalize.js';
@@ -30,9 +32,15 @@ export function createAgent(client: SdkClient, definition: {
   return agentCall(client, 'CreateAgent', definition);
 }
 
-export function updateAgent(client: SdkClient, definition: {
+export async function updateAgent(client: SdkClient, definition: {
   Name: string; ExpectedVersion: number; SystemPrompt?: string;
   Skills?: Record<string, unknown>[]; ExpertSuites?: Record<string, unknown>[]; PublishImmediately?: boolean;
 }) {
-  return agentCall(client, 'UpdateAgent', definition);
+  const request = cast(definition, new UpdateAgentRequest({}));
+  const response = await client.updateAgentWithOptions(request, runtimeFor());
+  if (!response.body?.agent) {
+    const requestId = validRequestId(response.body?.requestId) ?? headerRequestId(response.headers);
+    throw Object.assign(new Error('UpdateAgent 未返回有效 Agent；先查询结果，不能盲目重复写入'), requestId ? { requestId } : {});
+  }
+  return response.body.toMap() as Record<string, unknown>;
 }

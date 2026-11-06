@@ -49,9 +49,10 @@ describe('new OpenAPI wire and event adaptation', () => {
   });
 
   it('performs rename/archive/delete upstream and does not mutate locally on denial', async () => {
-    const callApi = vi.fn().mockResolvedValue({ body: { JsonRpcResponse: { Result: {} } } });
+    const client = createSdkClient(cfg);
+    const callApi = vi.spyOn(client, 'callApi').mockResolvedValue({ body: { JsonRpcResponse: { Result: {} } } });
     const app = Fastify();
-    await registerDaemonRoutes(app, cfg, { callApi } as unknown as SdkClient);
+    await registerDaemonRoutes(app, cfg, client);
     try {
       expect((await app.inject({ method: 'PATCH', url: '/d/standalone/sessions/sid/metadata', payload: { displayName: 'new title' } })).statusCode).toBe(200);
       expect(JSON.parse(callApi.mock.calls[0]![1].body.Params)).toEqual({ SessionId: 'sid', Title: 'new title' });

@@ -1,9 +1,13 @@
 package com.das.java.live;
 
+import com.aliyun.sdk.service.dataworks_public20240518.AsyncClient;
 import com.aliyun.sdk.service.dataworks_public20240518.models.CreateAgentRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.UpdateAgentRequest;
 import com.das.java.config.AppConfig;
 import com.das.java.core.ApiError;
+import darabonba.core.TeaModel;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,9 +23,15 @@ public final class AgentManagementExample implements AutoCloseable {
     private static final Set<String> FIELDS = Set.of("DisplayName", "Description", "Model", "SystemPrompt",
         "Tools", "Skills", "ExpertSuites", "CallableAgents", "PublishImmediately", "Metadata", "Visibility", "VisibilityScope");
     private final PopAdapter client;
+    private final AsyncClient sdk;
 
-    public AgentManagementExample(AppConfig administratorConfig) { this(PopAdapter.create(administratorConfig)); }
-    AgentManagementExample(PopAdapter client) { this.client = client; }
+    public AgentManagementExample(AppConfig administratorConfig) {
+        this(PopAdapter.create(administratorConfig), LiveClient.buildClient(administratorConfig, Duration.ofMinutes(10)));
+    }
+    AgentManagementExample(PopAdapter client, AsyncClient sdk) {
+        this.client = client;
+        this.sdk = sdk;
+    }
 
     /** PublishImmediately defaults to false; pass true explicitly to publish the new definition. */
     public Map<String, Object> createAgent(String name, Map<String, Object> definition) throws Exception {
@@ -127,13 +137,26 @@ public final class AgentManagementExample implements AutoCloseable {
         return result;
     }
 
+    private static UpdateAgentRequest updateRequest(Map<String, Object> fields) {
+        var model = TeaModel.build(fields, UpdateAgentRequest.create());
+        // Generated setters populate the SDK's form parameters as well as the model fields.
+        return UpdateAgentRequest.builder().name(model.getName()).expectedVersion(model.getExpectedVersion())
+            .displayName(model.getDisplayName()).description(model.getDescription()).systemPrompt(model.getSystemPrompt())
+            .publishImmediately(model.getPublishImmediately()).visibility(model.getVisibility())
+            .model(model.getModel()).metadata(model.getMetadata()).visibilityScope(model.getVisibilityScope())
+            .tools(model.getTools()).skills(model.getSkills()).expertSuites(model.getExpertSuites())
+            .callableAgents(model.getCallableAgents()).build();
+    }
+
     private Map<String, Object> call(String action, Map<String, Object> fields) throws Exception {
         try {
             var pending = switch (action) {
                 case "CreateAgent" -> client.callRequest(action, createRequest(fields));
                 case "GetAgent" -> client.callRequest(action, GetAgentRequest.builder().name((String) fields.get("Name"))
                     .agentVersion((Integer) fields.get("AgentVersion")).build());
-                default -> client.callForm(action, fields); // 9.0.17 has no UpdateAgent request/API.
+                case "UpdateAgent" -> sdk.updateAgent(updateRequest(fields))
+                    .thenApply(response -> LiveClient.sdkOutput(response.getStatusCode(), response.getBody(), response.getHeaders()));
+                default -> throw new IllegalArgumentException("Unsupported management action: " + action);
             };
             var response = pending.join();
             Map<String, Object> body = response.body;
@@ -148,5 +171,11 @@ public final class AgentManagementExample implements AutoCloseable {
         }
     }
 
-    @Override public void close() { client.close(); }
+    @Override public void close() {
+        try {
+            client.close();
+        } finally {
+            sdk.close();
+        }
+    }
 }

@@ -105,7 +105,7 @@ class PopAdapterTest {
 
     @Test void managementHelpersUseTopLevelFormsAndPinnedReferencesOnlyWhenInvoked() throws Exception {
         reply = "{\"RequestId\":\"req\",\"Agent\":{\"Name\":\"custom\",\"AgentVersion\":3}}";
-        try (var management = new AgentManagementExample(adapter)) {
+        try (var management = new AgentManagementExample(adapter, sdkClient())) {
             assertTrue(requests.isEmpty(), "Construction must not run management calls");
             var skill = Map.of("Source", "DB", "Name", "business-skill", "Version", 2);
             var suite = Map.of("Source", "DB", "SuiteId", "suite-example", "Version", 3);
@@ -135,12 +135,16 @@ class PopAdapterTest {
             assertEquals("UpdateAgent", update.get("action"));
             assertEquals("3", update.get("ExpectedVersion"));
             assertEquals("true", update.get("PublishImmediately"));
+            var updatedSkill = JSON.readTree(update.get("Skills")).get(0);
+            assertEquals("business-skill", updatedSkill.path("Name").asText());
+            assertEquals(2, updatedSkill.path("Version").asInt());
+            assertFalse(update.containsKey("ExpertSuites"));
             assertFalse(update.containsKey("Params"));
         }
     }
 
     @Test void managementRejectsUnsupportedFieldsAndBusinessErrorsWithoutRetry() throws Exception {
-        try (var management = new AgentManagementExample(adapter)) {
+        try (var management = new AgentManagementExample(adapter, sdkClient())) {
             assertThrows(IllegalArgumentException.class, () -> management.createAgent("custom", Map.of("RuntimePolicy", Map.of())));
             assertThrows(IllegalArgumentException.class, () -> management.updateAgent("custom", 0, Map.of()));
             assertThrows(IllegalArgumentException.class, () -> management.getAgent("custom", -1));
@@ -401,7 +405,7 @@ class PopAdapterTest {
 
     @Test void generatedManagementRequestsPreservePublishAndRawErrorVersionFields() throws Exception {
         reply = "{\"RequestId\":\"publish-request\",\"Agent\":{\"Name\":\"custom\",\"AgentVersion\":7}}";
-        try (var management = new AgentManagementExample(adapter)) {
+        try (var management = new AgentManagementExample(adapter, sdkClient())) {
             management.createAgent("custom", Map.of("PublishImmediately", true, "Metadata", Map.of("owner", "example"),
                 "VisibilityScope", Map.of("UserIds", List.of("user"), "ProjectIds", List.of("project"))));
             var create = request();

@@ -7,7 +7,9 @@ import com.aliyun.sdk.gateway.pop.auth.SignatureAlgorithm;
 import com.aliyun.sdk.gateway.pop.auth.SignatureVersion;
 import com.aliyun.sdk.service.dataworks_public20240518.AsyncClient;
 import com.aliyun.sdk.service.dataworks_public20240518.DefaultAsyncClientBuilder;
+import com.aliyun.sdk.service.dataworks_public20240518.models.ArchiveAgentSessionRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.CreateAgentSessionRequest;
+import com.aliyun.sdk.service.dataworks_public20240518.models.DeleteAgentSessionRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentSessionTokenUsageRequest;
 import com.aliyun.sdk.service.dataworks_public20240518.models.GetAgentSessionTokenUsageResponse;
 import com.aliyun.sdk.service.dataworks_public20240518.models.ListAgentSessionArtifactsRequest;
@@ -46,8 +48,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * 路由只负责"mock 还是 live"的分派与 HTTP 语义。
  * 与 Node 实现的 server-node/live.ts、Python 实现的 live.py 同源同语义。
  *
- * Official SDK transport and signing. PopAdapter supplies explicit wire fields for
- * lifecycle actions and response fields still missing from SDK 9.0.17. GetAgentSessionEvents
+ * Official SDK transport and signing. PopAdapter preserves the full wire response for
+ * lifecycle actions. GetAgentSessionEvents
  * uses a signed GET and raw reactive byte transport; prompt/load keep generated SSE methods.
  *
  * 重试语义：SDK 默认不装配 RetryPolicy ⇒ 只发一次，与旧 runtimeFor 的
@@ -98,7 +100,7 @@ public final class LiveClient implements AutoCloseable {
      * 会在签名组装处 NPE(9.0.9 实测,PopV1Signer.getContent()=null)。
      * V3 对非流式接口同样合法,没必要为它拆两条配置。
      */
-    private static AsyncClient buildClient(AppConfig cfg, Duration responseTimeout) {
+    static AsyncClient buildClient(AppConfig cfg, Duration responseTimeout) {
         ClientOverrideConfiguration override = ClientOverrideConfiguration.create()
             .setConnectTimeout(CONNECT_TIMEOUT);
         if (responseTimeout != null) {
@@ -226,11 +228,17 @@ public final class LiveClient implements AutoCloseable {
     }
 
     public Map<String, Object> archiveSession(String id, boolean archived) throws Exception {
-        return callPop("ArchiveAgentSession", Map.of("SessionId", id, "Archived", archived));
+        return callResponse("ArchiveAgentSession", rest.archiveAgentSession(ArchiveAgentSessionRequest.builder()
+            .id(nextRpcId()).jsonrpc(JSONRPC_VERSION)
+            .params(ArchiveAgentSessionRequest.Params.builder().sessionId(id).archived(archived).build()).build())
+            .thenApply(response -> sdkOutput(response.getStatusCode(), response.getBody(), response.getHeaders())));
     }
 
     public Map<String, Object> deleteSession(String id) throws Exception {
-        return callPop("DeleteAgentSession", Map.of("SessionId", id));
+        // Keep the raw envelope because the generated response drops error metadata used by the workbench.
+        return callResponse("DeleteAgentSession", pop.callRequest("DeleteAgentSession", DeleteAgentSessionRequest.builder()
+            .id(nextRpcId()).jsonrpc(JSONRPC_VERSION)
+            .params(DeleteAgentSessionRequest.Params.builder().sessionId(id).build()).build()));
     }
 
     public RemoteEventStream events(String id, String cursor) { return pop.events(id, cursor); }
@@ -240,7 +248,7 @@ public final class LiveClient implements AutoCloseable {
         return id != null ? id : Normalize.headerRequestId(headers);
     }
 
-    private static PopAdapter.Output sdkOutput(Integer status, TeaModel body, Map<String, String> headers) {
+    static PopAdapter.Output sdkOutput(Integer status, TeaModel body, Map<String, String> headers) {
         PopAdapter.Output output = new PopAdapter.Output();
         output.statusCode = status;
         output.headers = headers;
@@ -297,7 +305,7 @@ public final class LiveClient implements AutoCloseable {
         return message;
     }
 
-    /** 9.0.17 models all initial options used by the workbench. */
+    /** Build the generated request with the workbench's initial options. */
     CreateAgentSessionRequest buildCreateSessionRequest(SessionOptions options) {
         var initial = CreateAgentSessionRequest.InitialConfigOptions.builder()
             .mode(options.approvalMode()).model(options.model()).reasoningEffort(options.reasoningEffort())

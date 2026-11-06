@@ -25,7 +25,7 @@
 1. 在控制台准备并发布依赖 Skill/套件，取得 ID、来源及发布版本；按公开契约填写引用，不混用目录 ID、数据库 ID 和包版本。
 2. 先选定唯一名称；已有同名 Agent 时使用 Get/Update，不重复创建。调用 `CreateAgent`，提供 `Name`、`SystemPrompt`，按需传 `Skills`、`ExpertSuites`。立即使用时显式传 `PublishImmediately=true`，省略/false 保存草稿。
 3. 调用 `GetAgent` 核对保存的定义、引用和发布版本。保存与发布可能不是原子操作；失败先回读，不盲目重试 Create。
-4. 更新时读取当前 `Agent.AgentVersion`，传入 `UpdateAgent.ExpectedVersion`，按需传 `PublishImmediately=true`。冲突后重新读取并决定修改，不自动覆盖。省略引用列表表示不修改；不要为了补齐参数把 `Skills`/`ExpertSuites` 写成空数组，空数组会请求清空引用。
+4. 更新时读取当前 `Agent.AgentVersion`，传入 `UpdateAgent.ExpectedVersion`，按需传 `PublishImmediately=true`。冲突后重新读取并决定修改，不自动覆盖。不需要修改的引用列表应省略；当前新后端对 `Tools`、`Skills`、`CallableAgents` 的空数组保留已有引用，只有 `ExpertSuites=[]` 表示清空专家套件引用。不要使用通用的空数组清空规则。保存与发布不是原子操作，更新发布失败后也应先回读，避免重复生成版本。
 5. 将已发布名称写入会话服务环境配置，启动任一语言后端：
 
 ```dotenv
@@ -36,6 +36,10 @@ DATAAGENT_REASONING_EFFORT=none
 ```
 
 模型与思考值需由目标模型支持；`none` 关闭思考，留空沿用 Agent 配置。`DATAAGENT_MODE` 默认 `yolo`，模型默认不代表审批模式默认。修改配置后重启会话后端，再在网页会话设置填入目标 Agent 名称并按需调整选项，创建新会话验证；不会修改已有会话。ACS 无需 ProjectId 或资源组。目标地域需部署对应接口，依赖须已发布且可见，HTTP 200 不等于发布成功。
+
+## Agent 时间字段
+
+`CreateAgent`、`GetAgent`、`UpdateAgent` 和 `ListCustomAgents` 的接口模型将 `GmtCreateTime` 与 `GmtModifiedTime` 定义为 JSON 整数（`int64` Unix 毫秒）。页面按展示时区格式化即可。创建时间记录首次创建时刻，修改时间可随更新或发布推进。核对时请比较原始时间戳，避免把客户端格式化后的时区差异误判为数据差异。
 
 ## Node.js：先只读核对
 
@@ -144,6 +148,6 @@ try (var manager = new com.das.java.live.AgentManagementExample(
 
 三语言示例支持的更新字段不完全相同，以各函数签名为准。管理接口为 DataWorks `2024-05-18`，使用顶层 form 参数，返回 `{Agent, RequestId}`；会话接口使用 JSON-RPC `Params`，不可混用包装。
 
-Node/Python SDK 9.11.0 已生成 `Model`、`ReasoningEffort` 创建参数及 `UpdateAgentSessionTitle` 方法，但仍未生成 `GetAgentSessionEvents`、`ArchiveAgentSession`、`DeleteAgentSession`、`UpdateAgent` 方法。本仓为这些缺口保留限定 Action/参数包装的适配器，复用官方 SDK 签名和传输；升级 SDK 不表示全部接口均已有生成方法。Node/Python 创建会话均使用正式字段模型构造并序列化，再通过统一 RPC 保留完整业务错误；Java 使用生成式创建方法。管理函数的调用方式不因此改变。
+三个后端使用 SDK 10.0.0 的生成式 `UpdateAgent` 方法，管理示例返回 SDK 响应模型序列化后的 `Agent` 和 `RequestId`。需要完整定义时调用 `GetAgent`。Python 示例显式省略未指定的引用列表，避免 SDK 将其序列化为空数组。
 
 AssumeRole 仅见[独立接入指南](ASSUME-ROLE.md)。当前示例不自动获取 STS，也未透传 SecurityToken；不要把 STS 临时 AK/SK 当作长期 AK/SK 直接使用。管理凭证不进入前端、localStorage、导出配置或日志。

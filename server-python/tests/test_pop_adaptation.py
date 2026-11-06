@@ -3,6 +3,7 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 import pytest
+from alibabacloud_dataworks_public20240518.client import Client
 from fastapi.testclient import TestClient
 from das_python import main
 from das_python.config import AppConfig
@@ -21,7 +22,7 @@ def config(**overrides):
         accessKeySecret=None, serverHost="127.0.0.1", webDist=None), **overrides)
 
 
-class FakePop:
+class FakePop(Client):
     def __init__(self):
         self.calls = []
         self.error = None
@@ -244,19 +245,20 @@ async def test_agent_management_examples_use_top_level_forms_and_version():
     spec.loader.exec_module(examples)
     calls = []
 
-    class AdminClient:
+    class AdminClient(Client):
         async def call_api_async(self, descriptor, request, runtime):
             calls.append((descriptor.action, request.body))
-            return {"body": {"Agent": {"AgentVersion": 3, "Name": "a"}}}
+            return {"body": {"Agent": {"AgentVersion": 4 if descriptor.action == "UpdateAgent" else 3, "Name": "a"}}}
 
-    client = AdminClient()
+    client = AdminClient.__new__(AdminClient)
     await examples.create_agent(client, "a", system_prompt="helper", skills=[{"Source": "OFFICIAL", "SkillId": "catalog-id"}],
                                 expert_suites=[{"SuiteId": "db-suite", "Version": 1}], publish_immediately=True)
     assert calls[-1][1]["PublishImmediately"] == "true"
     assert json.loads(calls[-1][1]["Skills"]) == [{"Source": "OFFICIAL", "SkillId": "catalog-id"}]
     current = await examples.get_agent(client, "a")
-    await examples.update_agent(client, "a", expected_version=current["Agent"]["AgentVersion"], display_name="changed")
-    assert calls[-1] == ("UpdateAgent", {"Name": "a", "ExpectedVersion": 3, "DisplayName": "changed", "PublishImmediately": "false"})
+    updated = await examples.update_agent(client, "a", expected_version=current["Agent"]["AgentVersion"], display_name="changed")
+    assert updated["Agent"]["AgentVersion"] == 4
+    assert calls[-1] == ("UpdateAgent", {"Name": "a", "ExpectedVersion": 3, "DisplayName": "changed", "PublishImmediately": False})
     assert "Skills" not in calls[-1][1] and "Params" not in calls[-1][1]
 
 

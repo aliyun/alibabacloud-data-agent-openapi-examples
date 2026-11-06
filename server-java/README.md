@@ -65,21 +65,22 @@ Cancel 保留兼容：现代响应明确 Delivered/Noop 为 true，或旧响应�
 
 ## SDK 覆盖与本地验证
 
-使用官方异步 SDK `com.aliyun:alibabacloud-dataworks_public20240518:9.0.17`。创建会话、改名、列表使用生成式 `AsyncClient` 方法；Prompt/Load 保留生成式 SSE 方法。Agent Create/Get 和 Cancel 使用正式请求模型及 SDK core 原始响应，避免生成式响应丢失业务错误或兼容字段。未建模的操作通过官方 `BaseClientBuilder` / `TeaAsyncHandler` 扩展接口调用，原始 Events GET 使用 SDK 签名及字节流传输；没有自写签名、应用反射或运行时 AssumeRole。
+使用官方异步 SDK `com.aliyun:alibabacloud-dataworks_public20240518:10.0.0`。创建会话、改名、列表使用生成式 `AsyncClient` 方法，Prompt/Load 使用生成式 SSE 方法。需要保留原始响应的操作通过官方 `BaseClientBuilder` / `TeaAsyncHandler` 扩展接口调用。Events GET 使用 SDK 签名及字节流传输。
 
-按 9.0.17 的实际 JAR/source 核对（不是按 Node/Python SDK 推断）：
+按 Java 异步 SDK 10.0.0 的 JAR 核对：
 
 | 能力 | 正式 SDK 模型与本示例调用方式 |
 | --- | --- |
 | 会话创建配置 | `CreateAgentSessionRequest.InitialConfigOptions` 包含 `Model/Mode/ReasoningEffort/ProjectId/ResourceGroupId`，使用生成式 `createAgentSession`，未设置选项不发送。 |
 | 改名 / 归档列表 | `UpdateAgentSessionTitleRequest` 和 `ListAgentSessionsRequest.Params.Archived` 已覆盖，使用生成式方法。 |
-| 原始 Events | JAR 没有 `GetAgentSessionEventsRequest` 或同名 AsyncClient 方法；保留签名 GET，`SessionCode` query、`Last-Event-Id` header 和原始 SSE。 |
-| 归档 / 删除会话 | JAR 没有 `ArchiveAgentSessionRequest` / `DeleteAgentSessionRequest`，保留通用 SDK POST 与原始 JSON-RPC 业务错误检查。 |
+| 原始 Events | SDK 请求模型包含 `Last-Event-Id`，但生成式 SSE 方法发送 POST。workbench 保留签名 GET、`SessionCode` query、`Last-Event-Id` header 和原始 SSE。 |
+| 归档 / 删除会话 | 归档使用生成式 `archiveAgentSession`。删除使用生成式 `DeleteAgentSessionRequest` 和 SDK core，以保留原始 JSON-RPC 错误与 RequestId。 |
 | Agent 创建 / 发布 | `CreateAgentRequest` 有顶层 `PublishImmediately`、Model、Skills、ExpertSuites 等；使用正式请求模型。`CreateAgentResponseBody.Agent` 缺 `AgentVersion`，保留原始响应；没有独立 `PublishAgentRequest`。 |
-| Agent Get / Update | `GetAgentRequest.AgentVersion` 已覆盖；生成式 Get 响应没有顶层 Error，保留原始响应校验。JAR 没有 `UpdateAgentRequest`，Update 保留通用 POST、`ExpectedVersion` 和 `PublishImmediately`。 |
+| Agent Get / Update | Get 保留原始响应。Update 使用 SDK 生成式 `updateAgent` 传递 `ExpectedVersion` 和 `PublishImmediately`，返回 SDK 模型中的 `Agent` 和 `RequestId`。 |
+| Agent 时间戳 | `CreateAgent`、`GetAgent` 和 `ListCustomAgents` 的生成式创建时间和修改时间字段为 `Long`，单位为 Unix 毫秒。 |
 | Cancel | `CancelAgentSessionRequest.Params.SessionId` 已覆盖；响应 `Result` 只有 SessionId，缺 Delivered/Noop，且 JSON-RPC 响应缺 Error。使用正式请求、原始响应，保留本文末尾的 legacy ACK 与显式 false/false 语义。 |
 
-验证命令（JDK 17+，本轮使用 JDK 21）：
+验证命令（JDK 17+）：
 
 ```bash
 mvn -f server-java/pom.xml clean package

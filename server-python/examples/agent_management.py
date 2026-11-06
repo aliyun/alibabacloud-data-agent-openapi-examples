@@ -10,8 +10,20 @@ import json
 from typing import Any
 
 from alibabacloud_tea_openapi.utils_models import OpenApiRequest
+from alibabacloud_dataworks_public20240518.models import UpdateAgentRequest
 from das_python.live import runtime_for
 from das_python.pop import descriptor
+
+
+class _UpdateAgentPatch(UpdateAgentRequest):
+    def to_map(self):
+        fields = super().to_map()
+        # The SDK serializer emits empty arrays for omitted reference lists.
+        for key, value in (("CallableAgents", self.callable_agents), ("ExpertSuites", self.expert_suites),
+                           ("Skills", self.skills), ("Tools", self.tools)):
+            if value is None:
+                fields.pop(key, None)
+        return fields
 
 
 async def _call(client: Any, action: str, fields: dict[str, Any]) -> dict[str, Any]:
@@ -54,5 +66,10 @@ async def update_agent(client: Any, name: str, *, expected_version: int,
     """
     if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
         raise ValueError("expected_version must be a positive AgentVersion")
-    return await _call(client, "UpdateAgent", {"Name": name, "ExpectedVersion": expected_version,
-        "DisplayName": display_name, "PublishImmediately": publish_immediately})
+    response = await client.update_agent_with_options_async(_UpdateAgentPatch(
+        name=name, expected_version=expected_version, display_name=display_name,
+        publish_immediately=publish_immediately,
+    ), runtime_for())
+    if response.body is None or response.body.agent is None:
+        raise ValueError("UpdateAgent did not return Agent; inspect the upstream failure before retrying")
+    return response.body.to_map()

@@ -5,7 +5,7 @@ import type { AppConfig } from '../src/config.js';
 import { SessionRegistry } from '../src/daemon/registry.js';
 import { registerDaemonRoutes } from '../src/daemon/routes.js';
 import { registerPromptRoutes } from '../src/routes/prompt.js';
-import type { SdkClient } from '../src/sdk.js';
+import { createSdkClient, type SdkClient } from '../src/sdk.js';
 
 const cfg: AppConfig = {
   mock: false, mockRealtime: false, mockSpeed: 4, port: 0, corsOrigin: [], regionId: 'cn-beijing',
@@ -35,7 +35,7 @@ function fakeClient() {
   });
   return { callApi, replyAgentSessionWithOptions, promptAgentSessionWithSSE, loadAgentSessionWithSSE };
 }
-function clientOf(fake: ReturnType<typeof fakeClient>) { return fake as unknown as SdkClient; }
+function clientOf(fake: ReturnType<typeof fakeClient>) { return Object.assign(createSdkClient(cfg), fake); }
 function poisonRegistry() {
   for (const name of ['resolve', 'ensure', 'remove', 'listSummaries', 'allRecords', 'archivedSummaries', 'stats', 'summaryFor'] as const) {
     vi.spyOn(SessionRegistry.prototype, name).mockImplementation(() => { throw new Error(`LIVE must not access SessionRegistry.${name}`); });

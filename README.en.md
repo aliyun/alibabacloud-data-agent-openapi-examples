@@ -105,7 +105,7 @@ Set `MOCK=1` before launching the backend for demo mode. In PowerShell set varia
 
 ## Development and support
 
-SDKs are pinned to Java `9.0.17`, Node.js `9.11.0`, and Python `9.11.0`; language packages have independent version numbers. See [development and validation](docs/DEVELOPMENT.md), [Node.js](server-node/README.md), [Python](server-python/README.md), and [Java](server-java/README.md) for details.
+The Java async, Node.js, and Python backends use DataWorks SDK `10.0.0`. See [development and validation](docs/DEVELOPMENT.md), [Node.js](server-node/README.md), [Python](server-python/README.md), and [Java](server-java/README.md) for details.
 
 Public CI builds the frontend, runs Node/frontend tests, Python and Java tests, and all three MOCK HTTP contract checks. MOCK tests do not verify your cloud account permissions or all upstream behaviors.
 

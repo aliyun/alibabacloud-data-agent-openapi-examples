@@ -32,7 +32,7 @@ npm run check
 
 `DATAAGENT_AGENT_NAME` 指定默认已发布 Agent；创建请求可用 `agentName` 覆盖（去除首尾空格后1–128字符，不能包含控制字符）。LIVE 的 `/d/standalone/sessions` 列表及 `/d/standalone/sessions/:id` lookup 可通过 `?agentName=...` 选择 Agent；每个请求独立生效，不修改全局默认或旧会话，Prompt/load 仍只按 sessionId 路由。通过 `DATAAGENT_MODEL`、`DATAAGENT_MODE`、`DATAAGENT_REASONING_EFFORT` 设置新会话默认值；页面偏好保存在本地，下次创建复用，不弹框，不修改旧会话。
 
-LIVE 改名、归档、删除调用真实 POP；订阅走 `GetAgentSessionEvents`，历史走 `LoadAgentSession`。固定 SDK 缺失的接口由窄适配器复用官方 SDK 签名；Events 直接读取 binary 流以保留游标和增量传输。目标地域需已发布相应接口。
+LIVE 改名、归档、删除调用真实 POP，订阅走 `GetAgentSessionEvents`，历史走 `LoadAgentSession`。归档和删除使用官方 SDK 10.0.0 的生成方法。生成的 Events SSE 方法使用 POST，workbench 继续用 SDK 签名的 GET 读取原始流，保留 `Last-Event-Id` 和增量传输。调用新增接口需要在目标账号及地域开启灰度。
 
 独立管理示例见 [Agent 管理指南](../docs/AGENT-MANAGEMENT.md)及 [examples/agent-management.ts](examples/agent-management.ts)，不属于启动流程。可选角色启动脚本与凭证接入见 [AssumeRole 指南](../docs/ASSUME-ROLE.md)。
 
