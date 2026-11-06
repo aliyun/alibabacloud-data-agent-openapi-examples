@@ -6,9 +6,9 @@
 
 | 目录 | 内容 | DataWorks SDK |
 |---|---|---|
-| `server-node/` | Fastify 后端 | Node.js `9.11.0` |
-| `server-python/` | FastAPI 后端 | Python `9.11.0` |
-| `server-java/` | Spring Boot 后端 | Java `9.0.17` |
+| `server-node/` | Fastify 后端 | Node.js SDK `10.0.0` |
+| `server-python/` | FastAPI 后端 | Python SDK `10.0.0` |
+| `server-java/` | Spring Boot 后端 | Java 异步 SDK `10.0.0` |
 | `web/` | 统一网页 | — |
 | `shared/` | TypeScript 协议与解析 | — |
 | `scripts/` | 启动、测试与公开导出工具 | — |

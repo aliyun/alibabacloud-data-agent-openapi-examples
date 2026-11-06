@@ -74,10 +74,11 @@ it('keeps ordinary HTTP-200 RPC errors on REST and daemon create responses witho
 });
 
 it('forwards IDs for daemon management, reply, and cancellation rejections', async () => {
-  const client = {
-    callApi: vi.fn(async () => ({ statusCode: 200, body: { RequestId: 'pop-rpc-denied', JsonRpcResponse: { Error: { Code: 403, Message: 'denied' } } } })),
-    replyAgentSessionWithOptions: vi.fn(async () => ({ statusCode: 200, body: { requestId: 'pop-reply-denied', jsonRpcResponse: { error: { code: 403, message: 'denied' } } } })),
-  } as unknown as SdkClient;
+  const client = createSdkClient(cfg);
+  vi.spyOn(client, 'callApi').mockImplementation(async params => ({ statusCode: 200, body: {
+    RequestId: params.action === 'ReplyAgentSession' ? 'pop-reply-denied' : 'pop-rpc-denied',
+    JsonRpcResponse: { Error: { Code: 403, Message: 'denied' } },
+  } }));
   const app = await appFor(client);
   for (const request of [
     { method: 'GET' as const, url: '/d/standalone/sessions' },

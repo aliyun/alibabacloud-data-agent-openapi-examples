@@ -10,16 +10,18 @@
 
 ## 接口与参数
 
+调用 `UpdateAgent`、`ArchiveAgentSession`、`DeleteAgentSession` 或 `GetAgentSessionEvents` 前，请确认当前账号及目标地域已开启对应灰度。
+
 | POP Action / 字段 | 作用与调用参数 |
 |---|---|
 | `CreateAgent` | 顶层 `Name`、`SystemPrompt`、`Skills`、`ExpertSuites`；显式 `PublishImmediately=true` 才请求立即发布 |
 | `GetAgent` | 顶层 `Name`；可选 `AgentVersion`，省略读取当前定义 |
-| `UpdateAgent` | 顶层 `Name`、刚回读的 `ExpectedVersion`、要修改的字段；可选 `PublishImmediately`。引用列表省略为保留，空数组为清空 |
+| `UpdateAgent` | 顶层 `Name`、刚回读的 `ExpectedVersion`、要修改的字段；可选 `PublishImmediately`。未修改的引用列表应省略；当前新后端对 `Tools`/`Skills`/`CallableAgents` 的空数组保留引用，`ExpertSuites=[]` 清空套件引用；发布失败后先回读 |
 | `CreateAgentSession` | `Params.Meta.Agent.AgentName` 指定已发布 Agent；`Params.Meta.InitialConfigOptions` 下的 `Model`、`Mode`、`ReasoningEffort` 设置新会话配置 |
 | `UpdateAgentSessionTitle` | `Params={SessionId, Title}`，修改会话标题 |
-| `ArchiveAgentSession` | `Params={SessionId, Archived:true}` 归档；`false` 恢复；列表使用 `ListAgentSessions.Params.Archived` 选择范围 |
+| `ArchiveAgentSession` | `Params={SessionId, Archived:true}` 归档；`false` 取消归档；列表使用 `ListAgentSessions.Params.Archived` 选择范围，不能恢复已删除会话 |
 | `DeleteAgentSession` | `Params={SessionId}`；删除前确认目标，不能把测试清理代码直接用于用户会话 |
-| `GetAgentSessionEvents` | **GET**，query 为 `SessionCode=sessionId`，可选 header `Last-Event-Id`；返回独立实时 SSE |
+| `GetAgentSessionEvents` | **GET**，query 为 `SessionCode=sessionId`，可选 header `Last-Event-Id` 与配套 query `EventEpoch`；使用同一远端事件流的游标及代次，返回独立实时 SSE |
 
 除管理接口和 GET Events 外，这里的会话调用使用 POST form：`Id` 为本次调用唯一字符串、`Jsonrpc=2.0`、`Params` 为 JSON 编码字符串。管理接口直接使用顶层 form 字段，不能把定义塞进会话的 `Params`。引用对象/数组由管理示例编码为 JSON。
 
@@ -138,12 +140,12 @@ Java 创建和改名使用生成式方法，缺少生成方法的接口通过[Po
 
 ## 订阅、发送与续接
 
-1. 创建成功后保存返回的真实 sessionId。
-2. 独立订阅 `GetAgentSessionEvents`，再并行发送 `PromptAgentSession`。不能先等待 SSE 循环结束才发 Prompt。
-3. `PromptAgentSession.Params={SessionId, Prompt:[{Type:"text", Text:"本轮问题"}]}`；第二轮只发送新问题，历史由远端会话维护。
-4. 人卡问题使用 `ReplyAgentSession`：requestId、选项 ID、答案结构从实际事件取得，不能用页面生成 ID 替代。[三语言实现索引见下表](#实现索引)。
-5. 断开后只重新订阅 Events，传最后已消费的**远端游标**；首次没有游标就不传，显式 `0` 应保留。不得使用本地日志序号替代，也不要重发 Prompt。
-6. `LoadAgentSession` 读取历史，不能替代独立 Events；当前没有已核实的 Load/Events 原子快照水位，在途断线不承诺无缝恢复。
+**灰度长任务推荐使用两条流。** 当前账号和目标地域需开启 `GetAgentSessionEvents` 灰度。创建会话后，保存返回的 `SessionId`，用它作为 Events 的 `SessionCode`。先建立 Events 订阅，再发送 `PromptAgentSession`，同时读取两条流，无需等待订阅结束。Workbench LIVE 用 Events 渲染进度和内容，用 Prompt 流处理本轮结果和业务错误。同一内容只渲染一次。直调 POP 时也可以仅消费 Prompt 自带的 SSE。
+
+- `PromptAgentSession.Params={SessionId, Prompt:[{Type:"text", Text:"本轮问题"}]}`。第二轮只发送新问题，历史由远端会话维护。人卡问题通过 `ReplyAgentSession` 回复，requestId、选项 ID 和答案结构取自实际事件。
+- Prompt 在收到业务终态前超时或断流，本轮结果未知。保持 Events 订阅以观察后续进度，避免自动重发 Prompt。HTTP 200、心跳和连接关闭都不能用来判定本轮成功。
+- Events 断流后，用同一远端事件流最后已消费的 `Last-Event-Id` 和对应的 `EventEpoch` 尝试续接。省略游标只接收实时事件，显式 `0` 只尝试回放有界缓存。下表的 Demo 辅助方法目前只接收游标，需要同时传代次时可直接调用 POP。
+- 页面刷新、重开会话、游标失效或收到 `state_resync_required` 时，用 `LoadAgentSession` 恢复或核对历史，再按需重建订阅。历史回放结束只表示本次读取完成。Load 与 Events 之间没有已验证的共同水位，恢复时可能需要重新同步界面状态。
 
 | 语言 | Events 入口 | 流处理与游标校验示例 |
 |---|---|---|

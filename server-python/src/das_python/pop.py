@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from alibabacloud_tea_openapi.utils_models import OpenApiRequest, Params
+from alibabacloud_dataworks_public20240518 import models
 
 from .errors import api_error, initial_config_error_message, redact_api_error, safe_request_id
 from .normalize import SdkError, lower_first_keys, remote_request_id, to_api_error, with_request_id
@@ -23,9 +24,21 @@ def descriptor(action: str, method: str = "POST") -> Params:
 
 async def rpc(ctx: Any, action: str, params: dict[str, Any]) -> dict[str, Any]:
     from .live import _next_rpc_id, runtime_for
-    request = OpenApiRequest(body={"Id": _next_rpc_id(), "Jsonrpc": "2.0",
-                                   "Params": json.dumps(params, ensure_ascii=False, separators=(",", ":"))})
-    response = await ctx.client.call_api_async(descriptor(action), request, runtime_for())
+    request_id = _next_rpc_id()
+    if action == "ArchiveAgentSession":
+        response = (await ctx.client.archive_agent_session_with_options_async(models.ArchiveAgentSessionRequest(
+            id=request_id, jsonrpc="2.0", params=models.ArchiveAgentSessionRequestParams(
+                session_id=params["SessionId"], archived=params["Archived"],
+            ),
+        ), runtime_for())).to_map()
+    elif action == "DeleteAgentSession":
+        response = (await ctx.client.delete_agent_session_with_options_async(models.DeleteAgentSessionRequest(
+            id=request_id, jsonrpc="2.0", params=models.DeleteAgentSessionRequestParams(session_id=params["SessionId"]),
+        ), runtime_for())).to_map()
+    else:
+        request = OpenApiRequest(body={"Id": request_id, "Jsonrpc": "2.0",
+                                       "Params": json.dumps(params, ensure_ascii=False, separators=(",", ":"))})
+        response = await ctx.client.call_api_async(descriptor(action), request, runtime_for())
     body = response.get("body") if isinstance(response, dict) else None
     if not isinstance(body, dict):
         raise SdkError(api_error("rpc_error", f"{action}: missing response body", requestId=remote_request_id(response)))

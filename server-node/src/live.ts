@@ -1,4 +1,6 @@
 import {
+  ArchiveAgentSessionRequest,
+  ArchiveAgentSessionRequestParams,
   CreateAgentSessionRequest,
   CreateAgentSessionRequestParams,
   CreateAgentSessionRequestParamsMeta,
@@ -6,6 +8,8 @@ import {
   CreateAgentSessionRequestParamsMetaConfig,
   CreateAgentSessionRequestParamsMetaConfigSessionTags,
   CreateAgentSessionRequestParamsMetaInitialConfigOptions,
+  DeleteAgentSessionRequest,
+  DeleteAgentSessionRequestParams,
   GetAgentSessionTokenUsageRequest,
   GetAgentSessionTokenUsageRequestParams,
   ListAgentSessionArtifactsRequest,
@@ -76,7 +80,22 @@ export interface LiveContext {
 export async function liveSessionMutation(ctx: LiveContext, action: 'UpdateAgentSessionTitle' | 'ArchiveAgentSession' | 'DeleteAgentSession',
   sessionId: string, values: Record<string, unknown> = {}): Promise<ApiResult<Record<string, unknown>>> {
   try {
-    const response = await callOpenApi(ctx.client, action, { SessionId: sessionId, ...values });
+    let response;
+    switch (action) {
+      case 'ArchiveAgentSession':
+        response = await ctx.client.archiveAgentSessionWithOptions(new ArchiveAgentSessionRequest({
+          id: nextRpcId(), jsonrpc: JSONRPC_VERSION,
+          params: new ArchiveAgentSessionRequestParams({ sessionId, archived: values.Archived as boolean }),
+        }), runtimeFor());
+        break;
+      case 'DeleteAgentSession':
+        response = await ctx.client.deleteAgentSessionWithOptions(new DeleteAgentSessionRequest({
+          id: nextRpcId(), jsonrpc: JSONRPC_VERSION, params: new DeleteAgentSessionRequestParams({ sessionId }),
+        }), runtimeFor());
+        break;
+      default:
+        response = await callOpenApi(ctx.client, action, { SessionId: sessionId, ...values });
+    }
     const body = readNonStreamBody(response);
     if (!body.result) return { ok: false, error: missingResultError(action, body) };
     return { ok: true, result: body.result };

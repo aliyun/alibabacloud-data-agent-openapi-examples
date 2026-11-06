@@ -69,10 +69,7 @@ Load 读取远端历史，Prompt 通过独立 HTTP 请求提交新问题；LIVE 
 浏览器 epoch 由 endpoint、region、session 稳定导出，与本地 journal 纪元分离。
 断线由客户端重订阅，后端不会为恢复 Events 重发 Prompt。
 
-产品 SDK 9.11.0 已包含模型、思考深度和重命名；尚未包含 Events、归档、删除及 UpdateAgent，故窄适配器复用 SDK 的签名、endpoint、
-禁用重试配置。Events 使用底层 `call_sseapi_async` 读取原始 SSE；
-普通异步 `call_api_async` 的 binary 模式仍会 buffer，因此不用于 Events。
-未来升级 SDK 时，仍需验证无缓冲、字段保留和空 Result 的删除成功语义。
+归档、删除及 UpdateAgent 使用 SDK 10.0.0 的生成方法，归档仍校验目标状态，删除接受空 Result。生成的 Events SSE 方法使用 POST，workbench 继续通过 `call_sseapi_async` 发送签名 GET，传递 `Last-Event-Id` 并增量读取 SSE。调用新增接口需要在目标账号及地域开启灰度。
 
 ## 独立 Agent 管理示例
 
