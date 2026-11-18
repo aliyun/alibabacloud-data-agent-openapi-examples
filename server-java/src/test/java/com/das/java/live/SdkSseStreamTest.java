@@ -24,6 +24,29 @@ import org.junit.jupiter.api.Test;
 class SdkSseStreamTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    @Test
+    void nativeCursorSurvivesRealSdkDecodeAndStreamAdaptation() throws Exception {
+        var cursor = Map.of("SessionId", "session-A", "EventEpoch", "native-epoch-A",
+            "EventId", "9007199254740991", "PromptId", "native-prompt-A", "EventType", "session_update");
+        for (var payload : List.of(
+            Map.<String, Object>of("Method", "session/update", "Params", Map.of("sessionId", "session-A")),
+            Map.<String, Object>of("Id", "rpc-A", "Result", Map.of("stopReason", "end_turn")),
+            Map.<String, Object>of("Id", "rpc-A", "Error", Map.of("code", 500, "message", "fixture failure")))) {
+            var wire = new java.util.LinkedHashMap<String, Object>(payload);
+            wire.put("Jsonrpc", "2.0");
+            wire.put("Meta", Map.of("EventCursor", cursor));
+            var model = TeaModel.build(wire, PromptAgentSessionResponseBody.create());
+            try (var stream = new SdkSseStream("PromptAgentSession", List.of(model).iterator(), () -> 200)) {
+                var parsed = MAPPER.readValue(stream.next(2000), Map.class);
+                var adapted = com.das.java.core.Frames.frameFromSdkBody(parsed);
+                assertEquals(Map.of("EventCursor", cursor), adapted.get("Meta"));
+                if (payload.containsKey("Result")) assertEquals(payload.get("Result"), adapted.get("Result"));
+                if (payload.containsKey("Error")) assertEquals(payload.get("Error"), adapted.get("Error"));
+                assertNull(stream.next(2000));
+            }
+        }
+    }
+
     private static PromptAgentSessionResponseBody frame(String method, String text, String requestId, long timestamp) {
         Map<String, Object> update = text == null
             ? Map.of("_meta", Map.of("offset", 1))

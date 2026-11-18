@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import inspect
+import asyncio
 from copy import copy
 import time
 from collections.abc import AsyncGenerator
@@ -28,7 +29,7 @@ from .normalize import (SdkError, lower_first_keys, missing_result_error, read_n
                         remote_request_id, to_api_error, with_request_id)
 from .rid import count_frames_for_rid
 from .turn import reduce_history
-from .pop import rpc
+from .pop import rpc, prompt_events, session_events
 from .session_options import creation_options, validate_agent_name
 from .prompt_recovery import recover_prompt_frames
 from .load_recovery import read_load_snapshot
@@ -36,6 +37,7 @@ from .load_recovery import read_load_snapshot
 JSONRPC_VERSION = "2.0"
 MAX_PAGES = 10  # 列表分页的硬上限。上游没承诺页数收敛，不设上限等于把死循环留给线上。
 PAGE_SIZE = 100
+SESSION_PAGE_SIZE = 10
 
 _rpc_id_counter = 0
 
@@ -194,7 +196,7 @@ async def _list_sessions_result(ctx: LiveContext, archived: bool = False, *, age
     for page in range(MAX_PAGES):
         response = await rpc(ctx, api, {
             "AgentName": selected_agent, "SessionSourceList": [ctx.cfg.sessionSource],
-            "MaxResults": PAGE_SIZE, "Archived": archived,
+            "MaxResults": SESSION_PAGE_SIZE, "Archived": archived,
             **({"NextToken": next_token} if next_token else {}),
         })
         body = response
@@ -254,6 +256,8 @@ def _to_session_summary(row: Any) -> dict[str, Any] | None:
 
 
 def _model_to_map(model: Any) -> dict[str, Any] | None:
+    if isinstance(model, dict):
+        return model
     to_map = getattr(model, "to_map", None)
     mapped = to_map() if callable(to_map) else None
     return mapped if isinstance(mapped, dict) else None
@@ -534,12 +538,11 @@ async def _prompt_frames(
 ) -> AsyncGenerator[dict[str, Any], None]:
     rpc_id = _next_rpc_id()
 
-    def load(offset: int, timeout_ms: int):
-        load_id = _next_rpc_id()
-        return load_id, _load_stream(ctx, session_id, load_id, offset, timeout_ms, acks)
+    def events(cursor, timeout_ms):
+        return _resumed_prompt_frames(ctx, session_id, rpc_id, cursor, timeout_ms, acks)
 
     recovering = recover_prompt_frames(
-        rpc_id, _initial_prompt_frames(ctx, session_id, outbound_text, rpc_id, acks), load
+        rpc_id, _initial_prompt_frames(ctx, session_id, outbound_text, rpc_id, acks), events, session_id=session_id
     )
     try:
         async for frame in recovering:
@@ -548,29 +551,74 @@ async def _prompt_frames(
         await recovering.aclose()
 
 
+async def _resumed_prompt_frames(ctx, session_id, rpc_id, cursor, timeout_ms, acks):
+    if acks is not None:
+        acks.clear()
+    receipt, held = False, None
+    source = session_events(ctx, session_id, cursor["eventId"], event_epoch=cursor["eventEpoch"], expose_headers=True)
+    try:
+        async for envelope in source:
+            if "responseHeaders" in envelope:
+                if acks is not None:
+                    acks.clear()
+                    request_id = safe_request_id(envelope["responseHeaders"].get("x-acs-request-id"))
+                    if request_id:
+                        acks.append(request_id)
+                continue
+            if envelope.get("heartbeat"):
+                continue
+            event = envelope["data"]
+            kind, data = event["type"], event["data"]
+            if kind == "replay_complete":
+                receipt = True
+                if held is not None:
+                    yield held
+                    return
+                continue
+            if kind in ("stream_open", "slow_client_warning"):
+                continue
+            if event.get("promptId", data.get("promptId")) != cursor["promptId"]:
+                continue
+            if held is not None:
+                if kind != "pending_prompt_completed":
+                    raise SdkError(api_error("stream_break", "原生终态后出现同轮业务内容"))
+                continue
+            frame = {"Jsonrpc": JSONRPC_VERSION, "_meta": {**event.get("_meta", {}), "eventCursor": {
+                "sessionId": session_id, "eventEpoch": cursor["eventEpoch"], "eventId": str(event["id"]),
+                "promptId": cursor["promptId"], "eventType": kind}}}
+            if kind == "turn_complete":
+                frame.update(Id=rpc_id, Result=data)
+            elif kind == "turn_error":
+                frame.update(Id=rpc_id, Error={"code": -32000, "errorCode": data.get("code", "NATIVE_TURN_FAILED"),
+                                              "message": data.get("message", "原生执行失败"), "data": data})
+            else:
+                frame.update(Method="session/update" if kind == "session_update" else "_qwen/notify",
+                             Params=data if kind == "session_update" else {"kind": kind, "data": data})
+            if kind in ("turn_complete", "turn_error"):
+                if not receipt:
+                    held = frame
+                else:
+                    yield frame
+                    return
+            else:
+                yield frame
+    finally:
+        await source.aclose()
+
+
 async def _initial_prompt_frames(ctx: LiveContext, session_id: str, outbound_text: str,
                                  rpc_id: str, acks: list[str] | None = None) -> AsyncGenerator[dict[str, Any], None]:
     """发一轮 prompt，返回**线格式帧**的异步流。
 
     三件事在这里定死（与 Node 版 live.ts 相同）：
-      1. 必须走 prompt_agent_session_with_sse（普通变体会整体 buffer，长轮必然超时）；
+      1. 走 SDK core SSE，保留生成模型尚未声明的原生游标；
       2. 每帧过 frame_from_sdk_body（SDK 的 cast 键名与线格式不同名，不归一化下游全瞎）；
       3. 抛出的异常不在这里吞，交给流管道归一化。
     """
     if acks is not None:
         acks.clear()
     header_ids: list[str] = []
-    stream = _sse_client(ctx, header_ids, acks).prompt_agent_session_with_sse_async(
-        sdk_models.PromptAgentSessionRequest(
-            id=rpc_id,
-            jsonrpc=JSONRPC_VERSION,
-            params=sdk_models.PromptAgentSessionRequestParams(
-                session_id=session_id,
-                prompt=[sdk_models.PromptAgentSessionRequestParamsPrompt(type="text", text=outbound_text)],
-            ),
-        ),
-        runtime_for(),
-    )
+    stream = prompt_events(_sse_client(ctx, header_ids, acks), session_id, outbound_text, rpc_id, runtime_for())
     stream = await stream if hasattr(stream, "__await__") else stream
 
     unrecognized = 0

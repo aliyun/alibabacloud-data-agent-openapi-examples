@@ -10,7 +10,7 @@ from das_python import main
 from das_python.errors import ApiError, api_error, classify_error, redact_api_error, with_api_name
 from das_python.live import create_sdk_client
 from das_python.normalize import SdkError, to_api_error, missing_result_error, read_non_stream_body
-from test_pop_adaptation import config
+from test_pop_adaptation import config, opening
 
 
 @pytest.mark.parametrize("request_id", [None, "", " ", "x\n", "x\r", "x\x00", "x\x7f", "x\x85", "x\u202e", "中文", "x y", "x\t", "x" * 257, {}, [], 42])
@@ -229,7 +229,7 @@ async def test_daemon_load_sse_failure(wire, failure, source):
 async def test_events_header_forwarded_and_precommit_failure_json(wire):
     client, state = wire
     state.update(headers={"X-ACS-Request-ID": "events-pop", "Authorization": "DO-NOT-EXPOSE"},
-                 sse=sse({"type": "permission_request", "data": {"sessionId": "s", "requestId": "card-id"}}))
+                 sse=opening("s")+sse({"id": 1, "type": "permission_request", "data": {"sessionId": "s", "requestId": "card-id"}}))
     response = await client.get("/d/session/s/events")
     assert response.headers["x-acs-request-id"] == "events-pop"
     assert "authorization" not in response.headers
@@ -263,8 +263,8 @@ async def test_prompt_header_survives_sdk_decode_or_socket_failure(wire, fault):
 @pytest.mark.asyncio
 async def test_events_after_commit_keeps_header_and_never_fabricates_terminal(wire):
     _, state = wire
-    state.update(headers={"x-acs-request-id": "events-pop"}, sse=sse(
-        {"type": "session_update", "data": {"sessionId": "s", "update": {}}}) + "data: broken-json\n\n")
+    state.update(headers={"x-acs-request-id": "events-pop"}, sse=opening("s")+sse(
+        {"id": 1, "type": "session_update", "data": {"sessionId": "s", "update": {}}}) + "data: broken-json\n\n")
     # ASGI records the committed response even when the upstream stream fails.
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=state["app"], raise_app_exceptions=False), base_url="http://asgi") as client:
         response = await client.get("/d/session/s/events")
@@ -312,7 +312,7 @@ async def test_load_socket_failure_retains_pop_id_and_retry_count(wire):
 async def test_events_never_forward_card_id_or_invalid_header(wire, request_id):
     client, state = wire
     state["headers"] = {} if request_id is None else {"x-acs-request-id": request_id}
-    state["sse"] = sse({"type": "permission_request", "data": {"sessionId": "s", "requestId": "card-id"}})
+    state["sse"] = opening("s")+sse({"id": 1, "type": "permission_request", "data": {"sessionId": "s", "requestId": "card-id"}})
     response = await client.get("/d/session/s/events")
     assert response.status_code == 200 and "x-acs-request-id" not in response.headers
     assert "card-id" in response.text
@@ -351,7 +351,7 @@ def test_header_safe_id_validation(value, expected):
 @pytest.mark.asyncio
 async def test_events_header_is_trimmed_before_response_construction(wire):
     client, state = wire
-    state.update(headers={"x-acs-request-id": "  header-pop  "}, sse=sse({"RequestId": "different-ack"}))
+    state.update(headers={"x-acs-request-id": "  header-pop  "}, sse=opening("s")+sse({"RequestId": "different-ack"}))
     response = await client.get("/d/session/s/events")
     assert response.headers["x-acs-request-id"] == "header-pop"
 
@@ -363,11 +363,17 @@ async def test_sse_header_wins_over_later_sdk_exception_id():
 
     class Client:
         async def prompt_agent_session_with_sse_async(self, *args):
-            yield SimpleNamespace(headers={"x-acs-request-id": "header-pop"},
-                body=SimpleNamespace(to_map=lambda: {"RequestId": "different-ack"}))
+            yield SimpleNamespace(headers={"x-acs-request-id": "header-pop"}, status_code=200,
+                event=SimpleNamespace(data=json.dumps({"RequestId": "different-ack"})))
             raise ClientException(status_code=403, message="denied", request_id="exception-pop")
 
-        load_agent_session_with_sse_async = prompt_agent_session_with_sse_async
+        async def call_sseapi_async(self, *args):
+            async for response in self.prompt_agent_session_with_sse_async(*args):
+                yield response
+        async def load_agent_session_with_sse_async(self, *args):
+            from types import SimpleNamespace
+            async for response in self.prompt_agent_session_with_sse_async(*args):
+                yield SimpleNamespace(headers=response.headers, body=json.loads(response.event.data))
 
     ctx = LiveContext(Client(), config())
     for stream in (_initial_prompt_frames(ctx, "s", "text", "rpc-id", []),
@@ -386,9 +392,15 @@ async def test_later_pop_ack_cannot_override_observed_sse_header():
         async def prompt_agent_session_with_sse_async(self, *args):
             for headers, body in [({"x-acs-request-id": "header-pop"}, {"RequestId": "ack-one"}),
                                   ({}, {"RequestId": "ack-two"})]:
-                yield SimpleNamespace(headers=headers, body=SimpleNamespace(to_map=lambda body=body: body))
+                yield SimpleNamespace(headers=headers, status_code=200, event=SimpleNamespace(data=json.dumps(body)))
 
-        load_agent_session_with_sse_async = prompt_agent_session_with_sse_async
+        async def call_sseapi_async(self, *args):
+            async for response in self.prompt_agent_session_with_sse_async(*args):
+                yield response
+        async def load_agent_session_with_sse_async(self, *args):
+            from types import SimpleNamespace
+            async for response in self.prompt_agent_session_with_sse_async(*args):
+                yield SimpleNamespace(headers=response.headers, body=json.loads(response.event.data))
 
     ctx = LiveContext(Client(), config())
     for load in (False, True):
@@ -446,19 +458,19 @@ async def test_normal_rpc_top_level_id_does_not_disqualify_pop_request_id(wire):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("load1_source", ["header", "ack"])
-@pytest.mark.parametrize("load2_id", [None, "load2-pop"])
-async def test_prompt_recovery_ndjson_does_not_reuse_load1_id_for_load2_403(wire, load1_source, load2_id):
+@pytest.mark.parametrize("first_source", ["header", "ack"])
+@pytest.mark.parametrize("second_id", [None, "events2-pop"])
+async def test_native_recovery_does_not_reuse_first_events_id_for_second_403(wire, first_source, second_id):
     client, state = wire
-    chunk = {"Jsonrpc": "2.0", "RequestId": "original-turn", "Method": "session/update",
-             "Params": {"sessionId": "s", "_meta": {"offset": 7},
-                        "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "synthetic"}}}}
+    chunk = {"Jsonrpc": "2.0", "Method": "session/update", "Params": {"sessionId": "s", "update": {}},
+             "_meta": {"eventCursor": {"sessionId": "s", "eventEpoch": "epoch", "eventId": "7", "promptId": "p", "eventType": "session_update"}}}
     state["responses"] = [
         {"headers": {"x-acs-request-id": "prompt-pop"}, "sse": sse(chunk)},
-        {"headers": {"x-acs-request-id": "load1-header"} if load1_source == "header" else {},
-         "sse": sse({"RequestId": "load1-ack"})},
-        {"status": 403, "body": {"Code": "Forbidden", "Message": "synthetic Load2 denied",
-                                 **({"RequestId": load2_id} if load2_id else {})}},
+        {"headers": {"x-acs-request-id": "events1-header"} if first_source == "header" else {},
+         "sse": (sse({"RequestId": "events1-ack"}) if first_source == "ack" else "")+opening("s")
+                +sse({"type": "replay_complete", "data": {"replayedCount": 0}})},
+        {"status": 403, "body": {"Code": "Forbidden", "Message": "synthetic Events2 denied",
+                                 **({"RequestId": second_id} if second_id else {})}},
     ]
     response = await client.post("/api/sessions/s/prompt", json={"text": "synthetic"})
     events = [json.loads(line) for line in response.text.splitlines()]
@@ -466,64 +478,57 @@ async def test_prompt_recovery_ndjson_does_not_reuse_load1_id_for_load2_403(wire
     assert [event["body"] for event in events if event["type"] == "frame"] == [chunk]
     assert [event["type"] for event in events if event["type"] in ("done", "error")] == ["error"]
     assert error["upstreamStatus"] == 403 and error["retryable"] is False
-    if load2_id:
-        assert error["requestId"] == load2_id
-    else:
-        assert "requestId" not in error
-    assert [action for action, _ in state["requests"]] == ["PromptAgentSession", "LoadAgentSession", "LoadAgentSession"]
-    for _, form in state["requests"][1:]:
-        assert json.loads(form["Params"])["Meta"]["BeginLogOffset"] == 7
+    assert error.get("requestId") == second_id
+    assert [action for action, _ in state["requests"]] == ["PromptAgentSession", "GetAgentSessionEvents", "GetAgentSessionEvents"]
     assert state["responses"] == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["exception", "frame", "load-control"])
-async def test_prompt_recovery_closes_previous_rpc_before_resetting_current_diagnostic_ids(failure):
+@pytest.mark.parametrize("failure", ["exception", "global-error", "bad-receipt"])
+async def test_native_recovery_closes_previous_reader_before_resetting_diagnostic_ids(failure):
     from types import SimpleNamespace
     from das_python.live import LiveContext, _prompt_frames
     from das_python.pipeline import PipelineInput, to_wire_events
 
     ids = ["stale-before-prompt"]
     closed = []
-    loads = 0
-
+    reads = 0
     def response(body, header=None):
-        return SimpleNamespace(headers={"x-acs-request-id": header} if header else {},
-                               body=SimpleNamespace(to_map=lambda: body))
-
+        return SimpleNamespace(status_code=200, headers={"content-type": "text/event-stream", **({"x-acs-request-id": header} if header else {})},
+            event=SimpleNamespace(data=json.dumps(body), id=None, event=body.get("type")))
     class Client:
-        async def prompt_agent_session_with_sse_async(self, *args):
+        async def call_sseapi_async(self, descriptor, request, runtime):
+            nonlocal reads
             assert ids == []
-            try:
-                yield response({"Jsonrpc": "2.0", "RequestId": "original-turn", "Params": {
-                    "sessionId": "s", "_meta": {"offset": 7}}}, "prompt-header")
-            finally:
-                ids.append("prompt-close-id")
-                closed.append("prompt")
-
-        async def load_agent_session_with_sse_async(self, request, *args):
-            nonlocal loads
-            loads += 1
-            assert ids == []
-            if loads == 1:
-                assert closed == ["prompt"]
+            if descriptor.action == "PromptAgentSession":
                 try:
-                    yield response({"RequestId": "load1-ack"}, "load1-header")
+                    yield response({"Jsonrpc": "2.0", "Params": {"sessionId": "s"}, "_meta": {"eventCursor": {
+                        "sessionId": "s", "eventEpoch": "epoch", "eventId": "7", "promptId": "p", "eventType": "session_update"}}}, "prompt-header")
                 finally:
-                    ids.append("load1-close-id")
-                    closed.append("load1")
+                    ids.append("prompt-close-id")
+                    closed.append("prompt")
             else:
-                assert loads == 2 and closed == ["prompt", "load1"]
-                if failure == "exception":
-                    raise ClientException(status_code=403, message="synthetic Load2 denied")
-                yield response({"Jsonrpc": "2.0", **({"Id": request.id} if failure == "load-control" else {"RequestId": "original-turn"}),
-                                "Error": {"code": 403, "message": "synthetic Load2 denied"}})
-
-    ctx = LiveContext(Client(), config())
+                reads += 1
+                assert request.query == {"SessionCode": "s", "EventEpoch": "epoch"}
+                assert request.headers["Last-Event-Id"] == "7"
+                if reads == 1:
+                    assert closed == ["prompt"]
+                    try:
+                        yield response({"type": "stream_open", "data": {"sessionId": "s", "nativeSessionId": "native", "eventEpoch": "epoch"}}, "events1-header")
+                        yield response({"type": "replay_complete", "data": {"replayedCount": 0}}, "events1-header")
+                    finally:
+                        ids.append("events1-close-id")
+                        closed.append("events1")
+                else:
+                    assert reads == 2 and closed == ["prompt", "events1"]
+                    if failure == "exception":
+                        raise ClientException(status_code=403, message="denied")
+                    yield response({"type": "stream_open", "data": {"sessionId": "s", "nativeSessionId": "native", "eventEpoch": "epoch"}})
+                    yield response({"type": "stream_error", "data": {}} if failure == "global-error"
+                        else {"type": "replay_complete", "data": {"replayedCount": 1, "lastEventId": 8}})
     events = [event async for event in to_wire_events(PipelineInput(
-        _prompt_frames(ctx, "s", "synthetic", ids), sessionId="s", mock=False, startedAt=0,
+        _prompt_frames(LiveContext(Client(), config()), "s", "synthetic", ids), sessionId="s", mock=False, startedAt=0,
         apiName="PromptAgentSession", popRequestIds=ids))]
-    assert events[-1]["type"] == "error"
-    assert "requestId" not in events[-1]["error"]
+    assert events[-1]["type"] == "error" and "requestId" not in events[-1]["error"]
     assert not any(event["type"] == "done" for event in events)
-    assert closed == ["prompt", "load1"] and loads == 2 and ids == []
+    assert closed == ["prompt", "events1"] and reads == 2 and ids == []

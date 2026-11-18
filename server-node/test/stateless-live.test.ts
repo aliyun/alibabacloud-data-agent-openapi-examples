@@ -20,20 +20,23 @@ async function appFor(client?: SdkClient) {
   return app;
 }
 function fakeClient() {
-  const callApi = vi.fn(async (params: { action: string }) => ({ body: { JsonRpcResponse: { Result:
+  const callApi = vi.fn(async (params: { action: string }, _request?: { body?: { Params?: string } }): Promise<{ body: { JsonRpcResponse: { Result: Record<string, unknown> } } }> => ({ body: { JsonRpcResponse: { Result:
     params.action === 'ListAgentSessions' ? { AgentSessions: [{ SessionId: 'sid', SessionTitle: 'remote title',
       SessionCreatedAt: 1, SessionUpdatedAt: 2, Meta: { SessionSource: cfg.sessionSource } }], TotalCount: 1 }
       : params.action === 'CancelAgentSession' ? { Delivered: true, Noop: false }
         : params.action === 'CreateAgentSession' ? { SessionId: 'sid' } : {},
   } } }));
   const replyAgentSessionWithOptions = vi.fn(async () => ({ body: { jsonRpcResponse: { result: { accepted: true } } } }));
-  const promptAgentSessionWithSSE = vi.fn(async function* () {
+  const promptAgentSessionWithSSE = vi.fn(async function* (): AsyncGenerator<{ body: Record<string, unknown> }> {
     yield { body: { RequestId: 'own-rid', Jsonrpc: '2.0', Result: { stopReason: 'end_turn' } } };
   });
   const loadAgentSessionWithSSE = vi.fn(async function* (request: { id: string }) {
     yield { body: { Id: request.id, RequestId: 'history-rid', Jsonrpc: '2.0', Result: { stopReason: 'end_turn' } } };
   });
-  return { callApi, replyAgentSessionWithOptions, promptAgentSessionWithSSE, loadAgentSessionWithSSE };
+  const callSSEApi = vi.fn(async function* () {
+    for await (const response of promptAgentSessionWithSSE()) yield { event: { data: JSON.stringify(response.body) } };
+  });
+  return { callApi, callSSEApi, replyAgentSessionWithOptions, promptAgentSessionWithSSE, loadAgentSessionWithSSE };
 }
 function clientOf(fake: ReturnType<typeof fakeClient>) { return Object.assign(createSdkClient(cfg), fake); }
 function poisonRegistry() {
@@ -82,6 +85,38 @@ describe('LIVE stateless HTTP prompt and remote daemon projection', () => {
       for (const field of ['hasActivePrompt', 'isWaitingForPermission', 'clientCount']) expect(summary).not.toHaveProperty(field);
     }
     expect(fake.callApi.mock.calls.map(([params]) => params.action)).toEqual(['ListAgentSessions', 'ListAgentSessions']);
+  });
+
+  it('returns one upstream page and forwards its cursor without scanning the rest', async () => {
+    const fake = fakeClient();
+    fake.callApi.mockResolvedValueOnce({ body: { JsonRpcResponse: { Result: {
+      AgentSessions: [{ SessionId: 'page-one', SessionTitle: 'first', SessionCreatedAt: 1, SessionUpdatedAt: 2,
+        Meta: { SessionSource: cfg.sessionSource } }], NextToken: 'opaque+/=2', TotalCount: 169,
+    } } } });
+    const app = await appFor(clientOf(fake));
+    const first = await app.inject('/d/standalone/sessions?size=10&archiveState=archived&agentName=other-agent');
+    expect(first.statusCode).toBe(200);
+    expect(first.json().nextCursor).toBe('opaque+/=2');
+    expect(first.json().sessions.map((row: { sessionId: string }) => row.sessionId)).toEqual(['page-one']);
+    expect(fake.callApi).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fake.callApi.mock.calls[0]![1]!.body!.Params!)).toMatchObject({
+      AgentName: 'other-agent', SessionSourceList: [cfg.sessionSource], Archived: true, MaxResults: 10,
+    });
+    const next = await app.inject('/d/standalone/sessions?size=10&cursor=opaque%2B%2F%3D2');
+    expect(next.statusCode).toBe(200);
+    expect(next.json()).not.toHaveProperty('nextCursor');
+    expect(JSON.parse(fake.callApi.mock.calls[1]![1]!.body!.Params!)).toMatchObject({ NextToken: 'opaque+/=2', MaxResults: 10 });
+  });
+
+  it('bounds each upstream page and rejects invalid pagination before dispatch', async () => {
+    const fake = fakeClient(); const app = await appFor(clientOf(fake));
+    expect((await app.inject('/d/standalone/sessions?size=100')).statusCode).toBe(200);
+    expect(JSON.parse(fake.callApi.mock.calls[0]![1]!.body!.Params!).MaxResults).toBe(10);
+    fake.callApi.mockClear();
+    for (const query of ['size=0', 'size=-1', 'size=1.5', 'size=abc', 'cursor=%0A']) {
+      expect((await app.inject(`/d/standalone/sessions?${query}`)).statusCode).toBe(400);
+    }
+    expect(fake.callApi).not.toHaveBeenCalled();
   });
 
   it('returns the upstream creation ID without registering creation options', async () => {
@@ -140,16 +175,18 @@ describe('LIVE stateless HTTP prompt and remote daemon projection', () => {
   });
 
   it.each([undefined, '0', '42'])('forwards only this request cursor (%s) and preserves a remote terminal without own controls', async lastEventId => {
-    const event = { v: 1, id: 43, type: 'turn_complete', data: { sessionId: 'sid', stopReason: 'end_turn' } };
+    const id = lastEventId === undefined ? 43 : Number(lastEventId)+1;
+    const event = { v: 1, id, type: 'turn_complete', promptId: 'p', data: { sessionId: 'sid', stopReason: 'end_turn' } };
+    const opener = { type: 'stream_open', data: { sessionId: 'sid', nativeSessionId: 'native', eventEpoch: 'epoch' } };
     const callApi = vi.fn(async () => ({ statusCode: 200, headers: { 'content-type': 'text/event-stream' },
-      body: Readable.from([`id: 43\nevent: turn_complete\ndata: ${JSON.stringify(event)}\n\n`]),
+      body: Readable.from([`data: ${JSON.stringify(opener)}\n\n`, `id: ${id}\nevent: turn_complete\ndata: ${JSON.stringify(event)}\n\n`, ...(lastEventId === undefined ? [] : [`data: ${JSON.stringify({ type: 'replay_complete', data: { replayedCount: 1, lastEventId: id } })}\n\n`])]),
     }));
     const app = await appFor({ callApi } as unknown as SdkClient);
     const response = await app.inject({ method: 'GET', url: '/d/session/sid/events',
       headers: lastEventId === undefined ? {} : { 'last-event-id': lastEventId },
     });
     expect(response.statusCode).toBe(200);
-    const line = response.body.split('\n').find(line => line.startsWith('data: '));
+    const line = response.body.split('\n').find(line => line.startsWith('data: ') && JSON.parse(line.slice(6)).type === 'turn_complete');
     expect(JSON.parse(line!.slice(6))).toEqual(event);
     expect(response.body).not.toContain('workbench_prompt_result');
     expect(callApi).toHaveBeenCalledTimes(1);
@@ -160,7 +197,7 @@ describe('LIVE stateless HTTP prompt and remote daemon projection', () => {
 
   it('does not reuse a previous subscriber cursor on the next request', async () => {
     const callApi = vi.fn(async () => ({ statusCode: 200, headers: { 'content-type': 'text/event-stream' },
-      body: Readable.from(['data: {"v":1,"id":99,"type":"stream_open","data":{"sessionId":"sid"}}\n\n']),
+      body: Readable.from(['data: {"type":"stream_open","data":{"sessionId":"sid","nativeSessionId":"native","eventEpoch":"epoch"}}\n\n', 'data: {"type":"replay_complete","data":{"replayedCount":0}}\n\n']),
     }));
     const app = await appFor({ callApi } as unknown as SdkClient);
     expect((await app.inject({ url: '/d/session/sid/events', headers: { 'last-event-id': '7' } })).statusCode).toBe(200);
@@ -223,7 +260,8 @@ describe('LIVE stateless HTTP prompt and remote daemon projection', () => {
       yield { body: { Jsonrpc: '2.0', RequestId: 'own-rid', Params: { sessionId: 'sid',
         update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } } } };
     });
-    const app = await appFor({ ...fake, promptAgentSessionWithSSE } as unknown as SdkClient);
+    fake.promptAgentSessionWithSSE.mockImplementation(promptAgentSessionWithSSE);
+    const app = await appFor(clientOf(fake));
     const response = await app.inject({ method: 'POST', url: '/api/sessions/sid/prompt', payload: { text: 'question' } });
     const events = response.body.trim().split('\n').map(line => JSON.parse(line));
     expect(events.filter(event => event.type === 'done')).toEqual([]);
@@ -245,7 +283,8 @@ describe('LIVE stateless HTTP prompt and remote daemon projection', () => {
       await gate;
       yield { body: { Jsonrpc: '2.0', RequestId: `own-${index}`, Result: { stopReason: index === 1 ? 'end_turn' : 'cancelled' } } };
     });
-    const app = await appFor({ promptAgentSessionWithSSE } as unknown as SdkClient);
+    const fake = fakeClient(); fake.promptAgentSessionWithSSE.mockImplementation(promptAgentSessionWithSSE);
+    const app = await appFor(clientOf(fake));
     const first = app.inject({ method: 'POST', url: '/api/sessions/sid/prompt', payload: { text: 'first' } }).then(response => response);
     const second = app.inject({ method: 'POST', url: '/api/sessions/sid/prompt', payload: { text: 'second' } }).then(response => response);
     let timer: ReturnType<typeof setTimeout> | undefined;

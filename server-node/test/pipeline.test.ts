@@ -42,12 +42,12 @@ const contentFrame = (rid: string): AcpFrame => ({
 
 describe('toWireEvents：零帧收尾', () => {
   it('一帧都没收到 ⇒ prompt_not_dispatched，并把 POP RequestId 带进 message', async () => {
-    const events = await collect([], { popRequestIds: ['0dd3b146c75bf132a65efa7a3080e7cd'] });
+    const events = await collect([], { popRequestIds: ['0123456789abcdef0123456789abcdef'] });
 
     expect(events.map((e) => e.type)).toEqual(['error']);
     const error = events[0] as Extract<WireEvent, { type: 'error' }>;
     expect(error.error.kind).toBe('prompt_not_dispatched');
-    expect(error.error.message).toContain('0dd3b146c75bf132a65efa7a3080e7cd');
+    expect(error.error.message).toContain('0123456789abcdef0123456789abcdef');
     expect(error.error.retryable).toBe(false);
     expect(error.error.fatalForSession).toBe(false);
   });

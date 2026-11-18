@@ -32,6 +32,8 @@ DAS_ENV=demo node scripts/assume-role.mjs -- npm start -- java
 
 ## 哪些权限需要配置
 
+完整的运行角色、管理服务账号权限 JSON，以及包含 RAM 主体和 DataWorks 服务的角色信任策略，见[身份分工与权限配置](RAM-PERMISSIONS.md)。
+
 | 环节 | 所需配置 |
 |---|---|
 | STS | 调用方允许对目标角色执行 `sts:AssumeRole`，目标角色信任策略允许该调用方。调用者使用 RAM 用户或角色，不能使用主账号 |

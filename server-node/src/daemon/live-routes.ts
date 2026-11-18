@@ -2,10 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { stripMarkerInstruction, type SessionSummary } from '@das/shared';
 import type { AppConfig } from '../config.js';
-import { liveCancel, liveCreateSession, liveListSessions, liveLoadFrames, liveReply, liveSessionMutation, type LiveContext } from '../live.js';
+import { liveCancel, liveCreateSession, liveListSessionPage, liveListSessions, liveLoadFrames, liveReply, liveSessionMutation, type LiveContext } from '../live.js';
 import { toApiError } from '../normalize.js';
 import { optionalAgentName, publicSessionOptions, sessionOptions } from '../session-options.js';
 import type { SdkClient } from '../sdk.js';
+import { attachmentMaxBytes, registerAttachmentRoutes } from './attachments.js';
 import { OPENAPI_ANSWERS_OPTION } from './events.js';
 import { streamRemoteEvents } from './remote-events.js';
 import { historyFramesToEvents } from './translate.js';
@@ -30,8 +31,12 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
   const live: LiveContext = { client, cfg, log: app.log };
   const forAgent = (value: unknown): LiveContext => ({ ...live, cfg: { ...cfg, agentName: optionalAgentName(value) ?? cfg.agentName } });
   await app.register(async d => {
+    if (cfg.sessionAttachmentUpload) await registerAttachmentRoutes(d, client, cfg.sessionAttachmentOssOrigin);
     d.get('/health', async () => ({ status: 'ok' }));
-    d.get('/openapi/session-options', async () => ({ ...publicSessionOptions(cfg), promptTransport: 'http-stream' }));
+    d.get('/openapi/session-options', async () => ({
+      ...publicSessionOptions(cfg), promptTransport: 'http-stream',
+      ...(cfg.sessionAttachmentUpload ? { attachmentMaxBytes: attachmentMaxBytes() } : {}),
+    }));
     d.get('/capabilities', async () => ({ v: 1, mode: 'standalone',
       features: ['standalone_sessions_v1', 'standalone_session_options_v1', 'session_permission_vote'],
       modelServices: ['data-agent'], workspaces: [], policy: {}, sessionLiveStatePollIntervalMs: 30_000 }));
@@ -45,13 +50,18 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
           isCurrent: modelId === (cfg.model ?? 'data-agent'), isRuntime: false,
         })) }], errors: [] }));
 
-    d.get<{ Querystring: { archiveState?: string; agentName?: unknown } }>('/standalone/sessions', async (request, reply) => {
+    d.get<{ Querystring: { archiveState?: string; agentName?: unknown; size?: string; cursor?: string } }>('/standalone/sessions', async (request, reply) => {
       let context: LiveContext;
       try { context = forAgent(request.query?.agentName); }
       catch (error) { return reply.code(400).send({ error: (error as Error).message, code: 'invalid_agent_name' }); }
-      const result = await liveListSessions(context, request.query?.archiveState === 'archived');
+      const size = request.query.size === undefined ? 10 : Number(request.query.size);
+      const cursor = request.query.cursor;
+      if (!Number.isSafeInteger(size) || size < 1 || (cursor !== undefined && (typeof cursor !== 'string' || cursor.length > 4096 || /[\x00-\x1f\x7f]/.test(cursor)))) {
+        return reply.code(400).send({ error: '无效的会话分页参数', code: 'invalid_pagination' });
+      }
+      const result = await liveListSessionPage(context, request.query?.archiveState === 'archived', Math.min(size, 10), cursor);
       if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'list_failed' });
-      return { sessions: result.result.sessions.map(summary), truncated: result.result.truncated === true };
+      return { sessions: result.result.sessions.map(summary), ...(result.result.nextCursor ? { nextCursor: result.result.nextCursor } : {}) };
     });
     d.post<{ Body: Record<string, unknown> }>('/standalone/sessions', async (request, reply) => {
       let options;
@@ -67,7 +77,7 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
       catch (error) { return reply.code(400).send({ error: (error as Error).message, code: 'invalid_agent_name' }); }
       let truncated = false;
       for (const archived of [false, true]) {
-        const result = await liveListSessions(context, archived);
+        const result = await liveListSessions(context, archived, request.params.id);
         if (!result.ok) return reply.code(502).send({ error: result.error.message, requestId: result.error.requestId, code: 'lookup_failed' });
         const row = result.result.sessions.find(row => row.sessionId === request.params.id);
         if (row) return summary(row);
@@ -80,8 +90,7 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
       try {
         const frames = await liveLoadFrames(live, id);
         return { ...sessionBody(id), state: { models: { currentModelId: null, availableModels: [] }, modes: {}, configOptions: null },
-          compactedReplay: historyFramesToEvents(frames, id), liveJournal: [], historyHasMore: false,
-          eventEpoch: `openapi:${cfg.regionId}:${id}` };
+          compactedReplay: historyFramesToEvents(frames, id), liveJournal: [], historyHasMore: false };
       } catch (error) {
         const api = toApiError(error, 'LoadAgentSession');
         return reply.code(api.kind === 'transport' ? 502 : 404).send({ error: api.message, requestId: api.requestId, code: 'load_failed' });
@@ -134,15 +143,24 @@ export async function registerLiveDaemonRoutes(app: FastifyInstance, cfg: AppCon
     for (const path of ['/session/:id/prompt', '/session/:id/openapi-prompt/:promptId/receipt']) {
       d.post(path, async (_request, reply) => reply.code(410).send({ error: '请使用 /api/sessions/:id/prompt 的请求流终态', code: 'http_stream_required' }));
     }
-    d.get<{ Params: { id: string } }>('/session/:id/events', async (request, reply) => {
+    d.get<{ Params: { id: string }; Querystring: { epoch?: string } }>('/session/:id/events', async (request, reply) => {
       const header = request.headers['last-event-id'];
       const cursor = Array.isArray(header) ? header[0] : header;
       if (cursor !== undefined && (!/^\d+$/.test(cursor) || !Number.isSafeInteger(Number(cursor)))) {
         return reply.code(400).send({ error: '无效的事件游标', code: 'invalid_cursor' });
       }
-      try { await streamRemoteEvents(reply, live, request.params.id, cursor); }
+      const epochHeader = request.headers['x-qwen-event-epoch'];
+      const epoch = (Array.isArray(epochHeader) ? epochHeader[0] : epochHeader) ?? request.query?.epoch;
+      if (epoch !== undefined && (!/^[A-Za-z0-9_-]{1,64}$/.test(epoch) || cursor === undefined)) {
+        return reply.code(400).send({ error: 'epoch 必须与事件游标配对', code: 'invalid_cursor' });
+      }
+      try { await streamRemoteEvents(reply, live, request.params.id, cursor, epoch); }
       catch (error) {
-        if (!reply.sent) return reply.code(502).send({ error: toApiError(error, 'GetAgentSessionEvents').message, requestId: toApiError(error, 'GetAgentSessionEvents').requestId, code: 'events_upstream_failed' });
+        if (!reply.sent) {
+          const api = toApiError(error, 'GetAgentSessionEvents');
+          if (api.requestId) reply.header('x-acs-request-id', api.requestId);
+          return reply.code(502).send({ error: api.message, requestId: api.requestId, code: 'events_upstream_failed' });
+        }
         app.log.warn({ sessionId: request.params.id, requestId: toApiError(error, 'GetAgentSessionEvents').requestId }, '远端 Events 流结束；不重发 Prompt');
       }
       return reply;

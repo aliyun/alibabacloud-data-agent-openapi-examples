@@ -132,12 +132,13 @@ def test_live_answers_ui_sentinel_never_reaches_pop(live_app, monkeypatch):
 def test_live_events_cursor_is_only_from_this_request_header(live_app, header, cursor):
     app, pop = live_app
     event = {"v": 1, "type": "permission_request", "data": {"sessionId": "Mixed-ID", "requestId": "p"}}
-    remote = FakeEvents([("42", "permission_request", event)])
+    event_id = "42" if cursor is None else str(int(cursor)+1)
+    remote = FakeEvents([(event_id, "permission_request", event)])
     pop.call_sseapi_async = remote.call_sseapi_async
     http = TestClient(app)
     response = http.get("/d/session/Mixed-ID/events?lastEventId=999&snapshot=true", headers={} if header is None else {"Last-Event-ID": header})
     assert response.status_code == 200
-    assert "id: 42\n" in response.text
+    assert f"id: {event_id}\n" in response.text
     assert "workbench_prompt_result" not in response.text
     assert "session_snapshot" not in response.text
     assert remote.requests[0][1].query == {"SessionCode": "Mixed-ID"}

@@ -9,6 +9,7 @@
 export * from './constants.js';
 export * from './errors.js';
 export * from './frames.js';
+export * from './event-cursor.js';
 export * from './marker.js';
 export * from './protocol.js';
 export * from './rest.js';

@@ -2,6 +2,7 @@ package com.das.java.live;
 
 import com.das.java.config.AppConfig;
 import com.das.java.config.SessionOptions;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -24,6 +25,8 @@ class CreateSessionProjectIdTest {
                 assertEquals(projectId, options.getProjectId());
                 assertEquals("default", options.getMode());
                 assertEquals("test-resource-group", options.getResourceGroupId());
+                var serialized = new ObjectMapper().valueToTree(request.getParams());
+                if (projectId != null) assertEquals(projectId, serialized.path("meta").path("initialConfigOptions").path("projectId").asText());
             }
         }
     }

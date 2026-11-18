@@ -21,6 +21,11 @@ SERVER_PID=""
 cleanup() {
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
     kill "${SERVER_PID}" 2>/dev/null
+    for _ in $(seq 1 20); do
+      if ! kill -0 "${SERVER_PID}" 2>/dev/null; then break; fi
+      sleep 0.25
+    done
+    if kill -0 "${SERVER_PID}" 2>/dev/null; then kill -KILL "${SERVER_PID}" 2>/dev/null; fi
     wait "${SERVER_PID}" 2>/dev/null
   fi
 }
@@ -29,8 +34,10 @@ trap cleanup EXIT
 wait_healthy() {
   local base="$1" tries=60
   for _ in $(seq 1 "$tries"); do
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then return 1; fi
     if curl -sf -m 2 "$base/api/health" >/dev/null 2>&1; then
-      return 0
+      kill -0 "${SERVER_PID}" 2>/dev/null
+      return $?
     fi
     sleep 0.5
   done
@@ -38,6 +45,20 @@ wait_healthy() {
 }
 
 echo "== 契约测试：${IMPL} 实现（MOCK 模式，端口 ${PORT}）=="
+
+# Refuse occupied ports; a healthy unrelated server must never satisfy this test.
+if ! node --input-type=module - "$PORT" <<'JS'
+import net from 'node:net';
+const port = Number(process.argv[2]);
+if (!Number.isInteger(port) || port < 1 || port > 65535) process.exit(1);
+const server = net.createServer();
+server.once('error', () => process.exit(1));
+server.listen(port, '127.0.0.1', () => server.close());
+JS
+then
+  echo "✗ 端口 ${PORT} 已占用或无效；不会复用或停止该端口上的进程"
+  exit 1
+fi
 
 # 剥离本机 shell 导出的 demo 环境变量（2026-09-18 实测：login shell 会导出整套
 # demo env，污染 region/sessionSource/凭证判断，让契约断言不可复现）。
@@ -48,14 +69,14 @@ case "${IMPL}" in
   node)
     # 直接跑 tsx（非 watch 模式）：npm run dev:server 是 watch 态且派生子进程，
     # cleanup 杀 npm 进程杀不掉 tsx 子进程，端口会残留。
-    (cd "$ROOT/server-node" && MOCK=1 PORT="${PORT}" "$ROOT/node_modules/.bin/tsx" src/index.ts >/tmp/contract-node.log 2>&1) &
+    (cd "$ROOT/server-node" && exec env MOCK=1 PORT="${PORT}" node --import "$ROOT/node_modules/tsx/dist/loader.mjs" src/index.ts >/tmp/contract-node.log 2>&1) &
     SERVER_PID=$!
     ;;
   python)
     # 优先用仓库内 venv；没有就退回系统 python（要求已 pip install -e）
     PY="$ROOT/server-python/.venv/bin/python"
     if [[ ! -x "$PY" ]]; then PY=python3; fi
-    (cd "$ROOT/server-python" && MOCK=1 PORT="${PORT}" "$PY" -m das_python.main >/tmp/contract-python.log 2>&1) &
+    (cd "$ROOT/server-python" && exec env MOCK=1 PORT="${PORT}" "$PY" -m das_python.main >/tmp/contract-python.log 2>&1) &
     SERVER_PID=$!
     ;;
   java)
@@ -74,7 +95,7 @@ case "${IMPL}" in
         exit 1
       fi
     fi
-    (cd "$ROOT/server-java" && MOCK=1 PORT="${PORT}" java -jar "${JAR}" >/tmp/contract-java.log 2>&1) &
+    (cd "$ROOT/server-java" && exec env MOCK=1 PORT="${PORT}" java -jar "${JAR}" >/tmp/contract-java.log 2>&1) &
     SERVER_PID=$!
     ;;
   *)

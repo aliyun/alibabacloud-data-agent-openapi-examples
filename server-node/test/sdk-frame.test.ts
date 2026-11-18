@@ -39,6 +39,26 @@ function throughSdkCast(frame: AcpFrame): unknown {
 const ALL_STREAM_FIXTURES = Object.values(FIXTURES);
 
 describe('SDK 响应体 → 线格式帧', () => {
+  it.each([
+    { Method: 'session/update', Params: { sessionId: 'session-A' } },
+    { Id: 'rpc-A', Result: { stopReason: 'end_turn' } },
+    { Id: 'rpc-A', Error: { code: 500, message: 'fixture failure' } },
+  ])('preserves native continuation metadata through the real SDK cast: %j', payload => {
+    const cursor = {
+      SessionId: 'session-A', EventEpoch: 'native-epoch-A',
+      EventId: '9007199254740991', PromptId: 'native-prompt-A', EventType: 'session_update',
+    };
+    const frame = { Jsonrpc: '2.0', ...payload, Meta: { EventCursor: cursor } } as AcpFrame;
+    const adapted = frameFromSdkBody(throughSdkCast(frame));
+    expect(adapted?.meta).toMatchObject({ eventCursor: {
+      sessionId: cursor.SessionId, eventEpoch: cursor.EventEpoch,
+      eventId: cursor.EventId, promptId: cursor.PromptId, eventType: cursor.EventType,
+    } });
+    expect(typeof (adapted?.meta as { eventCursor: { eventId: unknown } }).eventCursor.eventId).toBe('string');
+    if ('Result' in payload) expect(adapted?.Result).toEqual(payload.Result);
+    if ('Error' in payload) expect(adapted?.Error).toEqual(payload.Error);
+  });
+
   it('cast 之后顶层键确实变成了 camelCase（前提成立，否则这条测试测了个空气）', () => {
     const firstFrame = loadFixture(FIXTURES.promptShort)[0];
     if (!firstFrame) throw new Error(`${FIXTURES.promptShort} 是空的，这条前提断言无法进行`);
@@ -121,14 +141,14 @@ describe('适配器的边界行为', () => {
     // 2026-09-15 真实链路实测：prompt 被上游 200 收下，SSE 只回这一个事件就关流。
     // 早先它被当成"帧"透传，还被 requestIdOf 当成本轮 rid——拿这个 32 位十六进制的
     // POP RequestId 去过滤历史（ACP 帧上是 UUID）必然一无所获。
-    expect(frameFromSdkBody({ RequestId: '0dd3b146c75bf132a65efa7a3080e7cd' })).toBeUndefined();
-    expect(frameFromSdkBody({ data: { RequestId: '0dd3b146c75bf132a65efa7a3080e7cd' } })).toBeUndefined();
+    expect(frameFromSdkBody({ RequestId: '0123456789abcdef0123456789abcdef' })).toBeUndefined();
+    expect(frameFromSdkBody({ data: { RequestId: '0123456789abcdef0123456789abcdef' } })).toBeUndefined();
     // SDK cast 之后是 camelCase，同样不能认成帧
-    expect(frameFromSdkBody({ requestId: '0dd3b146c75bf132a65efa7a3080e7cd' })).toBeUndefined();
+    expect(frameFromSdkBody({ requestId: '0123456789abcdef0123456789abcdef' })).toBeUndefined();
     // 再加上 Timestamp / Id 也不够：录制件里 100% 的帧都带 Jsonrpc
     expect(frameFromSdkBody({ RequestId: 'r', Timestamp: 1789483174719, Id: 'null' })).toBeUndefined();
 
-    expect(popAckRequestId({ requestId: '0dd3b146c75bf132a65efa7a3080e7cd' })).toBe('0dd3b146c75bf132a65efa7a3080e7cd');
+    expect(popAckRequestId({ requestId: '0123456789abcdef0123456789abcdef' })).toBe('0123456789abcdef0123456789abcdef');
     expect(popAckRequestId({ data: { RequestId: 'abc' } })).toBe('abc');
     expect(popAckRequestId({ Jsonrpc: '2.0' })).toBeUndefined();
   });

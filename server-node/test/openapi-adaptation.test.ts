@@ -44,8 +44,19 @@ describe('new OpenAPI wire and event adaptation', () => {
     const result = remoteEvent({ data: JSON.stringify({ Id: '42', Event: JSON.stringify(event) }) }, 'sid')!;
     expect(result.id).toBe(42);
     expect(result.data.options).toEqual([expect.objectContaining({ optionId: '__openapi_answers__' })]);
-    expect(() => remoteEvent({ data: JSON.stringify({ type: 'session_update', data: { sessionId: 'other' } }) }, 'sid')).toThrow('其他会话');
-    expect(() => remoteEvent({ data: JSON.stringify({ Event: 42 }) }, 'sid')).toThrow('无效事件载荷');
+    expect(() => remoteEvent({ data: JSON.stringify({ type: 'session_update', data: { sessionId: 'other' } }) }, 'sid')).toThrow('原生事件续传契约校验失败');
+    expect(() => remoteEvent({ data: JSON.stringify({ Event: 42 }) }, 'sid')).toThrow('原生事件续传契约校验失败');
+  });
+
+  it('ignores a POP heartbeat with empty data and still parses the following event', async () => {
+    const wire = ':heartbeat\nevent:message\nid:\nretry:3000\ndata:\n\n'
+      + 'id:42\ndata:{"type":"turn_complete","promptId":"native-prompt","data":{"stopReason":"end_turn"}}\n\n';
+    const events = [];
+    for await (const frame of parseSse(Readable.from([Buffer.from(wire)]))) {
+      const event = remoteEvent(frame, 'sid');
+      if (event) events.push(event);
+    }
+    expect(events).toEqual([{ v: 1, id: 42, type: 'turn_complete', promptId: 'native-prompt', data: { stopReason: 'end_turn' } }]);
   });
 
   it('performs rename/archive/delete upstream and does not mutate locally on denial', async () => {
@@ -110,10 +121,10 @@ describe('new OpenAPI wire and event adaptation', () => {
     finally { await app.close(); }
   });
 
-  it('official SDK binary GET remains incremental and keeps SessionCode and cursor on the wire', async () => {
-    let observedUrl = ''; let cursor: string | undefined;
+  it.each(['7', '0', undefined])('official SDK binary GET remains incremental and preserves cursor %s', async requestedCursor => {
+    let observedUrl = ''; let cursor: string | undefined; let method: string | undefined;
     const server = createServer((req, res) => {
-      observedUrl = req.url ?? ''; cursor = req.headers['last-event-id'] as string;
+      observedUrl = req.url ?? ''; cursor = req.headers['last-event-id'] as string; method = req.method;
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.write('id: 8\nevent: stream_open\ndata: {"type":"stream_open","data":{}}\n\n');
       // Keep HTTP open: buffering the whole response would make the first read time out.
@@ -125,11 +136,12 @@ describe('new OpenAPI wire and event adaptation', () => {
     (client as unknown as { _protocol: string })._protocol = 'HTTP';
     let stream: Readable | undefined;
     try {
-      const response = await openSessionEvents(client, 'sid', '7'); stream = response.body;
+      const response = await openSessionEvents(client, 'sid', requestedCursor); stream = response.body;
       const frame = await parseSse(stream).next();
       expect(frame.value?.id).toBe('8');
       expect(new URL(observedUrl, 'http://localhost').searchParams.get('SessionCode')).toBe('sid');
-      expect(cursor).toBe('7');
+      expect(method).toBe('GET');
+      expect(cursor).toBe(requestedCursor);
     } finally {
       stream?.destroy(); server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));

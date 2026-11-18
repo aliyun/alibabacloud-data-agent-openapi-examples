@@ -68,7 +68,8 @@ async def test_credentials_reach_all_transports(raw_token):
         requests.append((request.method, request.raw_path, request.headers, body))
         action = request.headers["x-acs-action"]
         if action == "GetAgentSessionEvents":
-            return web.Response(content_type="text/event-stream", text='data: {"type":"turn_complete","data":{"sessionId":"synthetic-session","stopReason":"end_turn"}}\n\n')
+            from test_pop_adaptation import opening
+            return web.Response(content_type="text/event-stream", text=opening("synthetic-session")+'data: {"id":1,"type":"turn_complete","promptId":"p","data":{"sessionId":"synthetic-session","stopReason":"end_turn"}}\n\n')
         if action in ("PromptAgentSession", "LoadAgentSession"):
             return web.Response(content_type="text/event-stream", text='data: {"JsonRpcResponse":{"Result":{"stopReason":"end_turn"}}}\n\n')
         return web.json_response({"RequestId": "loopback", "JsonRpcResponse": {"Result": {"Agents": [], "AgentSessions": []}}})
@@ -98,7 +99,7 @@ async def test_credentials_reach_all_transports(raw_token):
         ctx = LiveContext(client, cfg)
         await rpc(ctx, "ListAgentSessions", {"AgentName": "synthetic-agent"})
         events = [event async for event in session_events(ctx, "synthetic-session", None)]
-        assert len(events) == 1
+        assert len(events) == 2
         assert [headers["x-acs-action"] for _, _, headers, _ in requests] == [
             "ListAgents", "PromptAgentSession", "LoadAgentSession", "ListAgentSessions", "GetAgentSessionEvents",
         ]

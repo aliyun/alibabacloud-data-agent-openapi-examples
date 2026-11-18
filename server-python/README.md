@@ -60,15 +60,15 @@ LIVE 改名、归档/取消归档和删除分别调用 `UpdateAgentSessionTitle`
 的 `Archived` 过滤器；没有本地摘要、归档或删除缓存，批量操作逐项报告远端结果。
 
 LIVE `GET /d/session/:id/events` 使用 `GetAgentSessionEvents`，GET query 为
-`SessionCode`，续传通过 `Last-Event-Id` header。兼容 POP `Id/Event/Data`
+`SessionCode`，续传通过 `Last-Event-Id` header 与 `EventEpoch` query。兼容 POP `Id/Event/Data`
 包装及裸 daemon 帧，Event 可为对象或包含整帧的 JSON 字符串，Data 可为整帧或具名事件载荷。
 扁平 `{sessionId,update}` / `{sessionId,stopReason}`（可附 promptId）会分别规范化为
 `session_update` / `turn_complete`，不丢弃更新内容。
 仅含 RequestId 的确认帧跳过。校验安全整数游标并优先保留外层 SSE 游标；同一远端游标同时写入 SSE id 行和
 规范化 daemon JSON 的数值 id，供 SDK/harness 持久化续传，不生成本地序号。拒绝携带其他
-sessionId 的事件，不会将其改写成本会话。显式 `Last-Event-Id: 0` 原样发送，保留从起点回放的语义；没有 header 时不附加游标。
+sessionId 的事件；只按可信 stream_open 将原生会话信封映射到业务会话，工具内容和 originator 不变。显式 `Last-Event-Id: 0` 原样发送；没有 header 时不附加游标。
 Load 读取远端历史，Prompt 通过独立 HTTP 请求提交新问题；LIVE 不创建 Registry、journal、pending 权限表或完成回执缓存。
-浏览器 epoch 由 endpoint、region、session 稳定导出，与本地 journal 纪元分离。
+浏览器 epoch 来自可信 stream_open，不按 endpoint、region 或 session 生成。
 断线由客户端重订阅，后端不会为恢复 Events 重发 Prompt。
 
 归档、删除及 UpdateAgent 使用 SDK 10.0.0 的生成方法，归档仍校验目标状态，删除接受空 Result。生成的 Events SSE 方法使用 POST，workbench 继续通过 `call_sseapi_async` 发送签名 GET，传递 `Last-Event-Id` 并增量读取 SSE。
@@ -105,7 +105,7 @@ Content-Type: application/json
 
 本流保留官方 own 请求结果及归一化错误。WebShell 的内容来自独立 Events 订阅，浏览器消费 own NDJSON 来完成本次发送，不重复渲染其中内容。前端需有严格大小上限的 UTF-8/逐行解析，不得把无限 NDJSON 缓存在内存。
 
-LIVE 不拿进程级 inflight 锁，同一 sid 的并发由上游判定；rid、offset、去重和有界 Load 恢复预算只属于本连接。恢复只读取原轮次的 Load，不重发 Prompt。客户端断开时关闭本请求的上游迭代器，不自动调用 Cancel；云端任务可能仍在执行，应由用户读取历史或显式取消。
+LIVE 不拿进程级 inflight 锁，同一 sid 的并发由上游判定。Prompt 断流仅凭完整已消费帧的 `_meta.eventCursor` 只读续接 Events，验证 epoch、排他连续编号、promptId 与 replay_complete 后才接受原轮次终态；缺证明或协议损坏明确失败。不拼接 Load、不重发 Prompt。客户端断开释放本请求读取，不自动 Cancel。
 
 旧 LIVE `POST /d/session/{sid}/prompt` 和
 `POST /d/session/{sid}/openapi-prompt/{promptId}/receipt` 均返回 **410**，不创建后台任务、admission 或本地完成回执；不存在第二条 LIVE Prompt 执行路径。MOCK 仍使用原有 daemon 202、Registry、journal 和本地在途锁。
@@ -119,7 +119,7 @@ LIVE 不拿进程级 inflight 锁，同一 sid 的并发由上游判定；rid、
 - `/d/session/{sid}/status` 和 `/d/daemon/status` 缺少远端权威运行态，返回 404 降级；目录中未知的活动状态不伪造为 false。404 不是重发 Prompt 的依据。
 - `/d/session/{sid}/heartbeat` 返回 204 空响应，不创建会话状态，也不调用上游；前端须接受空返回。
 
-LIVE Events 是纯远端代理：仅从当前请求的 `Last-Event-ID` header 读取游标，忽略 query 中的游标和 snapshot，不记住前一连接的最大 ID。保留 POP 解包、sessionId 校验、SSE id 与数值 data.id 映射；远端 EOF 立即结束，失败输出明确错误后结束，不等本地 receipt、不合并本地控制事件。
+LIVE Events 从当前请求读取 Last-Event-ID 和 epoch，不记住其他连接水位。验证原生开流身份、SSE id、业务事件编号及回放 receipt；回放终态验证 receipt 后才发出，首次无游标的实时终态立即发出。没有本地 receipt 或伪造终态。UI 不插入乐观用户副本，两端完整原生 echo 各显示一次。
 
 Load 没有已核实的历史快照水位，故省略 `lastEventId`。Load 与随后 Events 订阅不是原子操作，不能宣称消除了历史/订阅间隙。跨后端实例或进程重启后，历史、权限和会话元数据仍由远端读取；此改动不等于已验证前端恢复、网关长连接或生产多副本部署。
 

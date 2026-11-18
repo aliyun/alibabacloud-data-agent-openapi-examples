@@ -93,9 +93,16 @@ export async function registerRestRoutes(
    * 不提供 `q` 参数：上游的 `SessionTitle` 过滤器实测被**静默忽略**（传了也不生效，
    * 返回全量），做成后端搜索等于给用户一个看起来能用其实没用的输入框。搜索一律前端做。
    */
-  app.get('/api/sessions', async (_request, reply) => {
-    if (live) return send(reply, await liveListSessions(live));
-    return send<SessionsResult>(reply, { ok: true, result: mockSessions(cfg) });
+  app.get<{ Querystring: { sessionId?: string; archived?: string } }>('/api/sessions', async (request, reply) => {
+    const { sessionId, archived } = request.query;
+    if (sessionId !== undefined && (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))) {
+      return reply.code(400).send({ ok: false, error: apiError('rpc_error', '无效的会话 ID') });
+    }
+    if (live) return send(reply, await liveListSessions(live, archived === 'true', sessionId));
+    const result = mockSessions(cfg);
+    if (sessionId === undefined) return send<SessionsResult>(reply, { ok: true, result });
+    const sessions = archived === 'true' ? [] : result.sessions.filter(row => row.sessionId === sessionId);
+    return send<SessionsResult>(reply, { ok: true, result: { sessions, total: sessions.length, filteredOut: 0, truncated: false } });
   });
 
   /**

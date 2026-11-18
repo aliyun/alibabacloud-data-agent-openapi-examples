@@ -31,7 +31,7 @@ it('keeps bounded upstream IDs through classification, redaction, and API naming
   const error = classifyError({ code: 500, message: 'denied', requestId: 'pop-id' });
   expect(toApiError(new SdkError(error), 'CreateAgentSession')).toMatchObject({ requestId: 'pop-id', kind: 'rpc_error' });
   expect(withRequestId(error, 'fallback-id').requestId).toBe('pop-id');
-  for (const requestId of [undefined, '', '\r\ninvalid', 'x'.repeat(257), { rid: 'not-an-id' }]) {
+  for (const requestId of [undefined, '', 'undefined', 'null', '\r\ninvalid', 'x'.repeat(257), { rid: 'not-an-id' }]) {
     expect(validRequestId(requestId)).toBeUndefined();
     expect(JSON.parse(JSON.stringify(withRequestId(apiError('transport', 'local'), requestId)))).not.toHaveProperty('requestId');
   }
@@ -122,8 +122,8 @@ it.each([true, false])('Events exposes the actual upstream header even when its 
   const app = await appFor(client);
   const result = await app.inject('/d/session/sid/events');
   expect(result.headers['x-acs-request-id']).toBe('pop-events');
-  if (streaming) expect(result.statusCode).toBe(200);
-  else expect(result.json()).toMatchObject({ code: 'events_upstream_failed', requestId: 'pop-events' });
+  expect(result.statusCode).toBe(502);
+  expect(result.json()).toMatchObject({ code: 'events_upstream_failed', requestId: 'pop-events' });
 });
 
 it('keeps IDs for acknowledged but rejected cancellation and reply outcomes', async () => {
@@ -139,9 +139,9 @@ it('keeps IDs for acknowledged but rejected cancellation and reply outcomes', as
 });
 
 it.each([true, false])('NDJSON error carries only the actual POP header ID (header available: %s)', async hasHeader => {
-  const client = { promptAgentSessionWithSSE: vi.fn(async function* () {
+  const client = { callSSEApi: vi.fn(async function* () {
     yield { ...(hasHeader ? { headers: { 'x-acs-request-id': 'pop-prompt-denied' } } : {}),
-      body: { Jsonrpc: '2.0', RequestId: 'turn-rid', Error: { code: 500, message: 'prompt failed' } } };
+      event: { data: JSON.stringify({ Jsonrpc: '2.0', RequestId: 'turn-rid', Error: { code: 500, message: 'prompt failed' } }) } };
   }) } as unknown as SdkClient;
   const app = await appFor(client);
   const result = await app.inject({ method: 'POST', url: '/api/sessions/sid/prompt', payload: { text: 'synthetic prompt' } });
@@ -195,7 +195,7 @@ it.each(['Prompt', 'Load'] as const)('real SDK %s retains the HTTP ID when its f
     if (action === 'Prompt') {
       const scope: StreamTraceScope = {};
       await expect(collectRequestIdFrames(livePromptFrames({ client, cfg }, 'sid', 'synthetic', [], scope)))
-        .rejects.toMatchObject({ apiError: { requestId: headerId, kind: 'transport' } });
+        .rejects.toMatchObject({ apiError: { requestId: headerId, kind: 'stream_break' } });
       expect(scope.current?.requestId()).toBe(headerId);
       expect(calls).toHaveLength(1);
     } else {
@@ -207,54 +207,49 @@ it.each(['Prompt', 'Load'] as const)('real SDK %s retains the HTTP ID when its f
   });
 });
 
-it('real SDK Load replay ignores another turn error without Id and reaches the original Prompt terminal', async () => {
-  let promptId = '';
-  const terminal = { Jsonrpc: '2.0', RequestId: 'original-turn', Id: '', Result: { stopReason: 'end_turn' } };
+const nativeCursorChunk = () => ({ ...resumeChunk(), _meta: { eventCursor: {
+  sessionId: 'sid', eventEpoch: 'epoch', eventId: '4', promptId: 'native-p', eventType: 'session_update' } } });
+const openNative = () => sseData({ type: 'stream_open', data: { sessionId: 'sid', nativeSessionId: 'native', eventEpoch: 'epoch' } });
+it('real SDK Events verifies another prompt globally but emits only the original prompt terminal', async () => {
   await withLoopbackSdk((call, res) => {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-acs-request-id': `header-${call.action}` });
-    if (call.action === 'PromptAgentSession') {
-      promptId = call.id;
-      res.end(sseData(resumeChunk()));
-    } else {
-      terminal.Id = promptId;
-      res.end(sseData({ Jsonrpc: '2.0', RequestId: 'historical-other-turn',
-        Error: { code: 500, message: 'synthetic historical failure' } }) + sseData(terminal));
-    }
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-acs-request-id': 'header-'+call.action });
+    if (call.action === 'PromptAgentSession') res.end(sseData(nativeCursorChunk()));
+    else res.end(openNative()
+      + sseData({ id: 5, type: 'turn_error', promptId: 'other', data: { sessionId: 'native', code: 'OTHER_FAILED' } })
+      + sseData({ id: 6, type: 'turn_complete', promptId: 'native-p', data: { sessionId: 'native', stopReason: 'end_turn' } })
+      + sseData({ type: 'replay_complete', data: { replayedCount: 2, lastEventId: 6 } }));
   }, async (client, calls) => {
     const frames = await collectRequestIdFrames(livePromptFrames({ client, cfg }, 'sid', 'synthetic'));
-    expect(frames).toEqual([resumeChunk(), terminal]);
-    expect(calls.map(call => call.action)).toEqual(['PromptAgentSession', 'LoadAgentSession']);
-    expect(calls[1]?.params).toMatchObject({ Meta: { IsReload: true, BeginLogOffset: 7 } });
+    expect(frames).toHaveLength(2); expect(frames[0]).toEqual(nativeCursorChunk());
+    expect(frames[1]?.Result?.stopReason).toBe('end_turn');
+    expect(frames[1]?._meta).toMatchObject({ eventCursor: { eventId: '6', promptId: 'native-p' } });
+    expect(calls.map(call => call.action)).toEqual(['PromptAgentSession', 'GetAgentSessionEvents']);
   });
 });
 
-it('real SDK recovery replaces Load1 header trace before Load2 fails with no ID', async () => {
-  let loads = 0;
+it('real SDK recovery clears the previous Events trace before another GET fails without an ID', async () => {
+  let reads = 0;
   await withLoopbackSdk((call, res) => {
     if (call.action === 'PromptAgentSession') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'x-acs-request-id': 'prompt-header' });
-      res.end(sseData(resumeChunk()));
-    } else if (++loads === 1) {
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'x-acs-request-id': 'load1-header' });
-      res.end(sseData({ RequestId: 'load1-ack' }));
+      res.end(sseData(nativeCursorChunk()));
+    } else if (++reads === 1) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'x-acs-request-id': 'events1-header' });
+      res.end(openNative()+sseData({ type: 'replay_complete', data: { replayedCount: 0 } }));
     } else {
       res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ Code: 'Forbidden', Message: 'synthetic Load2 denied' }));
+      res.end(JSON.stringify({ Code: 'Forbidden', Message: 'synthetic Events2 denied' }));
     }
   }, async (client, calls) => {
     const scope: StreamTraceScope = {};
-    const acks: string[] = [];
     let caught: unknown;
-    try { await collectRequestIdFrames(livePromptFrames({ client, cfg }, 'sid', 'synthetic', acks, scope)); }
+    try { await collectRequestIdFrames(livePromptFrames({ client, cfg }, 'sid', 'synthetic', [], scope)); }
     catch (error) { caught = error; }
     expect(caught).toBeInstanceOf(SdkError);
-    const error = toApiError(caught, 'LoadAgentSession');
-    expect(error).toMatchObject({ upstreamStatus: 403 });
-    expect(error).not.toHaveProperty('requestId');
-    expect(scope.current).toBeDefined();
-    expect(scope.current?.requestId()).toBeUndefined();
-    expect(loads).toBe(2);
-    expect(calls.map(call => call.action)).toEqual(['PromptAgentSession', 'LoadAgentSession', 'LoadAgentSession']);
+    expect(toApiError(caught, 'GetAgentSessionEvents')).toMatchObject({ upstreamStatus: 403 });
+    expect(toApiError(caught, 'GetAgentSessionEvents')).not.toHaveProperty('requestId');
+    expect(scope.current).toBeUndefined(); expect(reads).toBe(2);
+    expect(calls.map(call => call.action)).toEqual(['PromptAgentSession', 'GetAgentSessionEvents', 'GetAgentSessionEvents']);
   });
 });
 
@@ -302,7 +297,7 @@ it('real SDK concurrent ParseErrors on the same client retain distinct per-strea
       expect(result.status).toBe('rejected');
       if (result.status !== 'rejected') throw new Error('Expected the generated SDK JSON parser to reject');
       const expectedId = `parse-session-${index === 0 ? 'A' : 'B'}`;
-      expect(toApiError(result.reason, 'PromptAgentSession')).toMatchObject({ requestId: expectedId, kind: 'transport' });
+      expect(toApiError(result.reason, 'PromptAgentSession')).toMatchObject({ requestId: expectedId, kind: 'stream_break' });
       expect(scopes[index]?.current?.requestId()).toBe(expectedId);
     }
     expect(calls).toHaveLength(2);

@@ -71,13 +71,19 @@ public final class RemoteEventStream implements HttpResponseHandler, AutoCloseab
     }
 
     public Metadata metadata() throws Exception { return metadata.get(30, TimeUnit.SECONDS); }
+    public Metadata metadata(long timeoutMs) throws Exception { return metadata.get(Math.max(1, timeoutMs), TimeUnit.MILLISECONDS); }
 
     public byte[] next() throws IOException {
+        return next(600_000);
+    }
+
+    public byte[] next(long timeoutMs) throws IOException {
         if (closed || readFinished) return null;
         if (requestNext && subscription != null) subscription.request(1);
         requestNext = true;
         try {
-            Object value = chunks.take();
+            Object value = chunks.poll(Math.max(1, timeoutMs), TimeUnit.MILLISECONDS);
+            if (value == null) throw new IOException("Event stream read deadline exceeded");
             if (value == END) { readFinished = true; return null; }
             if (value instanceof Throwable error) {
                 readFinished = true;

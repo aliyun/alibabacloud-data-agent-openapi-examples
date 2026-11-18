@@ -49,7 +49,7 @@ class CoreTest {
     void popAckHandledPerPath() {
         // 实测：上游以 HTTP 200 收下 prompt，SSE 只回一个 {"RequestId":…} 的 POP 回执就关流。
         // 契约：parseRecordedLine（fixture 回放路径）宽松照收；frameFromSdkBody（live 路径）拒收。
-        String line = "{\"RequestId\":\"0dd3b146c75bf132a65efa7a3080e7cd\"}";
+        String line = "{\"RequestId\":\"0123456789abcdef0123456789abcdef\"}";
         Map<String, Object> lenient = Frames.parseRecordedLine(line);
         assertTrue(lenient != null && lenient.containsKey("RequestId"), "回放路径宽松照收");
         assertNull(Frames.frameFromSdkBody(line), "live 路径拒收 POP-only 载荷");

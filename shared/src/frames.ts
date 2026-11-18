@@ -157,6 +157,9 @@ export function frameFromSdkBody(body: unknown): AcpFrame | undefined {
   // 两种都必须显式失败，不能当成"这一轮没有内容"。
   if (acpKeys === 0) return undefined;
 
+  const meta = inner._meta ?? inner.Meta ?? inner.meta;
+  if (isObject(meta)) frame._meta = meta;
+
   for (const [key, value] of Object.entries(inner)) {
     if (WIRE_KEYS.has(key) || SDK_KEYS.has(key) || key in frame) continue;
     frame[key] = value;

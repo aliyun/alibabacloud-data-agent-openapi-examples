@@ -4,8 +4,6 @@
 
 选择 Java、Python 或 Node.js 中的一个后端，使用同一套网页。Agent 管理由独立的后端示例完成；网页可指定已发布的 Agent，默认 `dataworks_data_agent`。
 
-![Data Agent 页面预览](docs/images/data-agent-demo.png)
-
 ## 一键体验
 
 所有语言都需要 Node.js 22.x（至少 22.12）或 24.x 和 npm 10+ 来运行网页。先在项目根目录安装依赖：

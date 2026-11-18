@@ -70,7 +70,7 @@ describe('Load snapshot completeness', () => {
   });
 });
 
-it('real SDK: Prompt EOF → Load EOF → Load success preserves offsets and submits Prompt once', async () => {
+it.each([false, true])('real SDK: legacy offsets cannot recover Prompt; attachments enabled=%s', async (sessionAttachmentUpload) => {
   const { createServer } = await import('node:http');
   const { createSdkClient } = await import('../src/sdk.js');
   const { livePromptFrames } = await import('../src/live.js');
@@ -101,11 +101,17 @@ it('real SDK: Prompt EOF → Load EOF → Load success preserves offsets and sub
   (client as unknown as { _protocol: string })._protocol = 'http';
   try {
     const result: AcpFrame[] = [];
-    for await (const frame of livePromptFrames({ client } as never, 's', 'local fixture')) result.push(frame);
-    expect(calls.map(c => c.action)).toEqual(['PromptAgentSession', 'LoadAgentSession', 'LoadAgentSession']);
-    expect(calls.slice(1).map(c => c.params.Meta.BeginLogOffset)).toEqual([1, 2]);
-    expect(result.filter(f => f.Params).map(f => f.Params!._meta!.offset)).toEqual([1, 2, 3]);
-    expect(result.at(-1)?.Result?.stopReason).toBe('end_turn');
+    const path = `upload/s_${'a'.repeat(32)}.csv`;
+    const text = `local fixture @${path} @${path} @upload/other_${'b'.repeat(32)}.csv`;
+    for await (const frame of livePromptFrames({ client, cfg: { sessionAttachmentUpload } } as never, 's', text)) result.push(frame);
+    expect(calls.map(c => c.action)).toEqual(['PromptAgentSession']);
+    expect(calls[0]!.params.Prompt).toEqual([
+      { Type: 'text', Text: text },
+      ...(sessionAttachmentUpload ? [{ Type: 'resource_link', Name: path.slice('upload/'.length), Uri: `dataagent-attachment:${path}` }] : []),
+    ]);
+    expect(calls.slice(1)).toEqual([]);
+    expect(result.filter(f => f.Params).map(f => f.Params!._meta!.offset)).toEqual([1]);
+    expect(result.some(f => f.Result?.stopReason)).toBe(false);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 

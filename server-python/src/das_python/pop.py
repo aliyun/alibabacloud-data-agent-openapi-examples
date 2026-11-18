@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
+from types import SimpleNamespace
 from typing import Any
 
 from alibabacloud_tea_openapi.utils_models import OpenApiRequest, Params
@@ -15,11 +17,32 @@ from alibabacloud_dataworks_public20240518 import models
 from .errors import api_error, initial_config_error_message, redact_api_error, safe_request_id
 from .normalize import SdkError, lower_first_keys, remote_request_id, to_api_error, with_request_id
 from .frames import pop_ack_request_id
+from .event_cursor import ReplayState
 
 
 def descriptor(action: str, method: str = "POST") -> Params:
     return Params(action=action, version="2024-05-18", protocol="HTTPS", pathname="/",
                   method=method, auth_type="AK", style="RPC", req_body_type="formData", body_type="json")
+
+
+async def prompt_events(client: Any, session_id: str, text: str, rpc_id: str, runtime: Any):
+    request = OpenApiRequest(body={"Id": rpc_id, "Jsonrpc": "2.0", "Params": json.dumps({
+        "SessionId": session_id, "Prompt": [{"Type": "text", "Text": text}]}, ensure_ascii=False)})
+    stream = client.call_sseapi_async(descriptor("PromptAgentSession"), request, runtime)
+    stream = await stream if inspect.isawaitable(stream) else stream
+    try:
+        async for response in stream:
+            if response.event is not None and response.event.data:
+                try:
+                    payload = json.loads(response.event.data)
+                except (ValueError, TypeError) as invalid:
+                    raise SdkError(api_error("stream_break", "PromptAgentSession 返回无效 JSON 事件")) from invalid
+                yield SimpleNamespace(body=payload, headers=response.headers,
+                                      status_code=response.status_code)
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def rpc(ctx: Any, action: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -97,7 +120,8 @@ def _canonical_event(value: Any, name: str | None = None) -> dict[str, Any] | No
             **({"id": flat["id"]} if "id" in flat else {})}
 
 
-def _parse_event(payload: Any, outer_id: Any, outer_event: str | None, session_id: str) -> dict[str, Any] | None:
+def _parse_event(payload: Any, outer_id: Any, outer_event: str | None, session_id: str,
+                 native_session_id: str | None = None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         raise ValueError("invalid Events envelope")
     body = {key[:1].lower() + key[1:]: value for key, value in payload.items()}
@@ -112,47 +136,98 @@ def _parse_event(payload: Any, outer_id: Any, outer_event: str | None, session_i
     if data is None:
         raise ValueError("missing daemon event type")
     details = data.get("data")
-    if isinstance(details, dict) and "sessionId" in details and details["sessionId"] != session_id:
-        raise ValueError("Events payload belongs to another session")
-    cursor = _safe_cursor(outer_id if outer_id not in (None, "") else
-                          body.get("id") if body.get("id") not in (None, "") else data.get("id"))
+    if not isinstance(details, dict):
+        raise ValueError("Events data must be an object")
+    for subject in (details.get("sessionId"), data.get("sessionId")):
+        if subject is not None and subject not in (session_id, native_session_id):
+            raise ValueError("Events payload belongs to another session")
+    for prompt in (data.get("promptId"), details.get("promptId")):
+        if prompt is not None and (not isinstance(prompt, str) or not prompt):
+            raise ValueError("invalid native prompt identity")
+    if data.get("promptId") is not None and details.get("promptId") is not None and data["promptId"] != details["promptId"]:
+        raise ValueError("conflicting native prompt identities")
+    if data.get("promptId") is None and isinstance(details.get("promptId"), str):
+        data = {**data, "promptId": details["promptId"]}
     kind = name or (outer_event if outer_event not in (None, "message") else None) or data["type"]
     if not isinstance(kind, str) or not kind or "\n" in kind or "\r" in kind:
         raise ValueError("invalid Events event name")
+    if kind != data["type"]:
+        raise ValueError("SSE and native JSON event type mismatch")
+    if kind in ("turn_complete", "turn_error") and not (data.get("promptId") or details.get("promptId")):
+        raise ValueError("terminal lacks native prompt identity")
+    control = kind in ("stream_open", "replay_complete", "slow_client_warning")
+    transport = _safe_cursor(outer_id if outer_id not in (None, "") else body.get("id"))
+    if control and "id" in data:
+        raise ValueError("control event cannot issue a native cursor")
+    cursor = None if control else _safe_cursor(data.get("id") if data.get("id") is not None else transport)
+    if not control and cursor is not None and transport is not None and int(cursor) != int(transport):
+        raise ValueError("SSE and native JSON id mismatch")
+    if native_session_id is not None and ("sessionId" in details or "sessionId" in data):
+        data = {**data, "data": {**details, "sessionId": session_id}}
     if cursor is not None:
         # Canonical daemon clients resume from the JSON envelope id, while SSE
         # also carries the wire id line. Both must identify the same POP event.
         data = {**data, "id": int(cursor)}
-    return {"id": cursor, "event": kind, "data": data}
+    return {"id": cursor, "event": kind, "data": data, "transportCursor": transport}
 
 
-async def session_events(ctx: Any, session_id: str, last_event_id: str | None, *, expose_headers: bool = False):
+async def session_events(ctx: Any, session_id: str, last_event_id: str | None, *, event_epoch: str | None = None,
+                         expose_headers: bool = False):
     """Decode raw/POP SSE without product-model casting or journal cursors."""
     from .live import runtime_for
     last_event_id = _safe_cursor(last_event_id)
-    request = OpenApiRequest(query={"SessionCode": session_id},
+    request = OpenApiRequest(query={"SessionCode": session_id, **({"EventEpoch": event_epoch} if event_epoch else {})},
                              headers={"accept": "text/event-stream", **({"Last-Event-Id": last_event_id} if last_event_id else {})})
     stream = ctx.client.call_sseapi_async(descriptor("GetAgentSessionEvents", "GET"), request, runtime_for())
     stream = await stream if inspect.isawaitable(stream) else stream
     pop_id = None
     header_id = None
     announced = False
+    replay = ReplayState(session_id, last_event_id, event_epoch)
+    suffix: list[dict[str, Any]] = []
+    suffix_bytes = 0
     try:
         async for response in stream:
             header_id = remote_request_id(response) or header_id
             pop_id = header_id or pop_id
             event = response.event
             if event is None or not event.data:
-                parsed = {"heartbeat": True}
+                if replay.actual_epoch is not None:
+                    yield {"heartbeat": True}
+                continue
             else:
-                payload = json.loads(event.data)
-                pop_id = header_id or safe_request_id(pop_ack_request_id(payload)) or pop_id
-                parsed = _parse_event(payload, event.id, event.event, session_id)
-            if expose_headers and not announced:
+                try:
+                    payload = json.loads(event.data)
+                    pop_id = header_id or safe_request_id(pop_ack_request_id(payload)) or pop_id
+                    parsed = _parse_event(payload, event.id, event.event, session_id, replay.native_session_id)
+                    if parsed is None:
+                        continue
+                    replay.take(parsed)
+                    headers = getattr(response, "headers", {}) or {}
+                    if not isinstance(headers, dict):
+                        raise ValueError("invalid Events HTTP headers")
+                    content_types = [value for key, value in headers.items() if key.lower() == "content-type"]
+                    if (getattr(response, "status_code", 200) != 200 or len(content_types) != 1
+                            or not isinstance(content_types[0], str) or not re.fullmatch(r"text/event-stream(?:\s*;.*)?", content_types[0], re.I)):
+                        raise ValueError("invalid Events HTTP metadata")
+                except (ValueError, TypeError, KeyError, OverflowError) as invalid:
+                    raise SdkError(api_error("stream_break", "原生事件续传契约校验失败")) from invalid
+            if parsed["event"] == "stream_open" and expose_headers and not announced:
                 announced = True
-                yield {"responseHeaders": {"x-acs-request-id": header_id} if header_id else {}}
-            if parsed is not None:
-                yield parsed
+                yield {"responseHeaders": {"x-acs-request-id": header_id} if header_id else {}, "eventEpoch": replay.actual_epoch}
+            if last_event_id is not None and not replay.receipt and (suffix or parsed["event"] in ("turn_complete", "turn_error")):
+                suffix_bytes += len(json.dumps(parsed, ensure_ascii=False).encode())
+                if len(suffix) >= 4096 or suffix_bytes > 4*1024*1024:
+                    raise SdkError(api_error("stream_break", "原生事件回放缓存超过上限"))
+                suffix.append(parsed)
+                continue
+            if parsed["event"] == "replay_complete":
+                for buffered in suffix:
+                    yield buffered
+                suffix.clear()
+            yield parsed
+        if last_event_id is not None and not replay.receipt:
+            raise SdkError(api_error("stream_break", "原生事件流缺少回放回执"))
     except Exception as exc:
         if not pop_id:
             raise

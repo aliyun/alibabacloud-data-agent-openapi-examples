@@ -463,6 +463,21 @@ class PopAdapterTest {
         }
     }
 
+    @Test void signedEventsCarryNativeEpochInPopQueryAlongsideCursor() throws Exception {
+        streaming = true;
+        reply = "event: stream_open\ndata: {\"Data\":{\"eventEpoch\":\"native_epoch-1\"}}\n\n";
+        try (var remote = adapter.events("session-A", "41", "native_epoch-1")) {
+            assertEquals(200, remote.metadata().status());
+            while (remote.next() != null) { }
+        }
+        var sent = request();
+        assertEquals("GetAgentSessionEvents", sent.get("action"));
+        assertEquals("GET", sent.get("method"));
+        assertEquals("session-A", sent.get("SessionCode"));
+        assertEquals("native_epoch-1", sent.get("EventEpoch"));
+        assertEquals("41", sent.get("cursor"));
+    }
+
     @Test void rawSignedGetPreservesDaemonSseAndExplicitZeroReplayCursor() throws Exception {
         streaming = true;
         reply = ": heartbeat\r\n\r\nid: 42\r\nevent: message\r\ndata: {\"v\":1,\"type\":\"text\",\"data\":{\"sessionId\":\"session-A\",\"text\":\"你好🌏\"},\"id\":42}\r\n\r\n";
@@ -679,7 +694,7 @@ class PopAdapterTest {
                 status = 403; headerRequestId = header ? "header-pop" : null;
                 reply = "{\"RequestId\":\"body-pop\",\"Message\":\"private SDK dump\",\"credentials\":\"private-secret\"}";
                 var response = new org.springframework.mock.web.MockHttpServletResponse();
-                controller.events("s", null, null, response);
+                controller.events("s", null, null, null, response);
                 assertEquals(502, response.getStatus());
                 assertEquals(header ? "header-pop" : "body-pop", JSON.readTree(response.getContentAsString()).path("requestId").asText());
                 assertFalse(response.getContentAsString().contains("private"));

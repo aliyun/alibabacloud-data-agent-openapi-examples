@@ -1,4 +1,4 @@
-import { DaemonSessionClient, type DaemonClient, type DaemonStandaloneSession } from '@qwen-code/sdk/daemon';
+import { DaemonHttpError, DaemonSessionClient, type DaemonClient, type DaemonStandaloneSession } from '@qwen-code/sdk/daemon';
 import { apiHttpError, formatSessionError } from './api-error';
 import { installHttpPromptTransport, type PromptTransport } from './http-prompt-transport';
 
@@ -8,6 +8,13 @@ const decorators = new WeakMap<DaemonClient, (session: DaemonSessionClient) => v
 const restoreFactories = ['load', 'resume', 'loadStandalone', 'resumeStandalone', 'createOrAttach', 'createStandalone'] as const;
 let restoreCompatibilityUsers = 0;
 let restoreCompatibilityCleanup: (() => void) | undefined;
+
+function normalizeOutputDirectory<T extends { sessionId: string; projectlessOutputDirectory?: string }>(session: T): T {
+  // The backend's protocol placeholder is not an observed remote filesystem root.
+  // Normalize after SDK wire validation; Web Shell treats an empty root as unknown.
+  return session.projectlessOutputDirectory === `/data-agent/out/${session.sessionId}`
+    ? { ...session, projectlessOutputDirectory: '' } : session;
+}
 
 /** Keep the response's missing-watermark provenance through the SDK's ?? 0 fallback. */
 function preserveRestoreCursor<T extends { state: object; lastEventId?: number }>(response: T): T {
@@ -62,11 +69,12 @@ function installRestoreCursorCompatibility(): () => void {
  * Do not retry an ambiguous POST: OpenAPI creation is not idempotent.
  */
 export interface OpenApiCreateOptions { agentName?: string; modelServiceId?: string; approvalMode?: string; reasoningEffort?: string; cu?: string }
-export interface SessionDefaults { agentName: string; model?: string; approvalMode: string; reasoningEffort?: string; cu?: string; models: string[]; promptTransport?: PromptTransport }
+export interface SessionDefaults { agentName: string; model?: string; approvalMode: string; reasoningEffort?: string; cu?: string; models: string[]; promptTransport?: PromptTransport; attachmentMaxBytes?: number }
 
 export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: string,
   configure?: (options: OpenApiCreateOptions) => Promise<OpenApiCreateOptions>,
-  hooks?: { onCreated?: (options: OpenApiCreateOptions, session: DaemonStandaloneSession) => void; onCreateError?: (error: Error) => void; defaults?: () => Promise<SessionDefaults>; agentName?: (sessionId?: string) => string | undefined | Promise<string | undefined>; onDiscovered?: (sid: string, agent: string) => void }): () => void {
+  hooks?: { onCreated?: (options: OpenApiCreateOptions, session: DaemonStandaloneSession) => void; onCreateError?: (error: Error) => void; defaults?: () => Promise<SessionDefaults>; agentName?: (sessionId?: string) => string | undefined | Promise<string | undefined>; onDiscovered?: (sid: string, agent: string) => void; onRecoveryRequired?: (sid: string, automatic: boolean) => void },
+  fetcher: typeof fetch = (...args) => fetch(...args)): () => void {
   // Reject before changing client methods or the shared SDK factory shim.
   if (installedClients.has(client)) throw new Error('OpenAPI session adapter is already installed on this client');
   installedClients.add(client);
@@ -80,7 +88,7 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
       const url = new URL(`${baseUrl}${path}`);
       const agent = await hooks.agentName!(sid);
       if (agent) url.searchParams.set('agentName', agent);
-      const response = await fetch(url.toString(), { signal: AbortSignal.timeout(30_000) });
+      const response = await fetcher(url.toString(), { signal: AbortSignal.timeout(30_000) });
       const body = await response.json().catch(() => undefined);
       if (!response.ok) throw apiHttpError(response.status, body, '读取 Agent 会话失败');
       return { body, agent };
@@ -117,11 +125,11 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
     catch (error) { throw formatSessionError(error); }
   };
   client.loadStandaloneSession = async (...args) => {
-    try { return preserveRestoreCursor(await originalLoadStandalone.apply(client, args)); }
+    try { return preserveRestoreCursor(normalizeOutputDirectory(await originalLoadStandalone.apply(client, args))); }
     catch (error) { throw formatSessionError(error); }
   };
   client.resumeStandaloneSession = async (...args) => {
-    try { return preserveRestoreCursor(await originalResumeStandalone.apply(client, args)); }
+    try { return preserveRestoreCursor(normalizeOutputDirectory(await originalResumeStandalone.apply(client, args))); }
     catch (error) { throw formatSessionError(error); }
   };
   let disposed = false;
@@ -130,14 +138,14 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
     let value: SessionDefaults;
     if (hooks?.defaults) value = await hooks.defaults();
     else {
-      const response = await fetch(`${baseUrl}/openapi/session-options`, { signal: AbortSignal.timeout(10_000) });
+      const response = await fetcher(`${baseUrl}/openapi/session-options`, { signal: AbortSignal.timeout(10_000) });
       if (!response.ok) throw apiHttpError(response.status, await response.json().catch(() => undefined), '无法读取后端 Prompt 协议');
       value = await response.json() as SessionDefaults;
     }
     if (value.promptTransport !== 'http-stream' && value.promptTransport !== 'daemon') throw new Error('后端未声明 Prompt 协议，请同步更新前后端。');
     return value.promptTransport;
   })();
-  const http = installHttpPromptTransport(client, baseUrl, readTransport);
+  const http = installHttpPromptTransport(client, baseUrl, readTransport, hooks?.onRecoveryRequired, fetcher);
   decorators.set(client, http.decorate);
   if (hooks?.defaults) client.getStandaloneSessionOptions = async () => {
     const result = await originalOptions.call(client);
@@ -152,7 +160,7 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
   client.createStandaloneSession = async (options = {}) => {
     try {
       const { agentName, modelServiceId, approvalMode, reasoningEffort, cu } = configure ? await configure(options) : options as OpenApiCreateOptions;
-      const response = await fetch(`${baseUrl}/standalone/sessions`, {
+      const response = await fetcher(`${baseUrl}/standalone/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agentName, modelServiceId, approvalMode, reasoningEffort, cu }),
@@ -163,8 +171,9 @@ export function installOpenApiSessionCreation(client: DaemonClient, baseUrl: str
         throw apiHttpError(response.status, body, '创建 OpenAPI 会话失败');
       }
       if (!isStandaloneSession(body)) throw new Error('创建会话返回了无效的 OpenAPI session');
-      hooks?.onCreated?.({ agentName, modelServiceId, approvalMode, reasoningEffort, cu }, body);
-      return body;
+      const session = normalizeOutputDirectory(body);
+      hooks?.onCreated?.({ agentName, modelServiceId, approvalMode, reasoningEffort, cu }, session);
+      return session;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error('创建会话请求失败');
       if (failure.name !== 'AbortError') hooks?.onCreateError?.(failure);
@@ -197,4 +206,26 @@ function isStandaloneSession(value: unknown): value is DaemonStandaloneSession {
     && s.sourceType === 'standalone' && context?.kind === 'standalone'
     && typeof s.projectlessOutputDirectory === 'string'
     && (directory?.state === 'ready' || directory?.state === 'recreated');
+}
+
+
+export interface SessionLoadNotice { sessionId: string; message?: string }
+
+/** Keep a failed history request visible while the shell reconnects. */
+export function installSessionLoadNotice(client: DaemonClient, notify: (notice: SessionLoadNotice) => void): () => void {
+  const original = client.loadStandaloneSession;
+  client.loadStandaloneSession = async (sessionId, request, clientId) => {
+    try {
+      const restored = await original.call(client, sessionId, {
+        ...request, timeoutMs: request?.timeoutMs && request.timeoutMs > 0 ? Math.min(request.timeoutMs, 35_000) : 35_000,
+      }, clientId);
+      notify({ sessionId });
+      return restored;
+    } catch (error) {
+      const status = error instanceof DaemonHttpError ? `（HTTP ${error.status}）` : '';
+      notify({ sessionId, message: `会话历史加载失败${status}，正在重试。若持续失败，请向管理员提供会话 ID：${sessionId}。` });
+      throw error;
+    }
+  };
+  return () => { client.loadStandaloneSession = original; };
 }

@@ -28,7 +28,7 @@ public record AppConfig(
     String agentName,
     String sessionSource,
     String resourceGroupId,
-    /** 可选的创建会话项目上下文（SDK InitialConfigOptions.ProjectId）。 */
+    /** 会话工作空间；不同于 SQL 执行器使用的数据源工作空间。 */
     String projectId,
     String accessKeyId,
     String accessKeySecret,
@@ -83,6 +83,20 @@ public record AppConfig(
     private static String nonEmpty(String raw) {
         String v = raw == null ? "" : raw.trim();
         return v.isEmpty() ? null : v;
+    }
+
+    static String parseProjectId(String raw) {
+        String value = nonEmpty(raw);
+        if (value == null) return null;
+        if (!value.matches("[1-9][0-9]*")) {
+            throw new IllegalArgumentException("DATAAGENT_PROJECT_ID must be a positive decimal integer or blank");
+        }
+        try {
+            Long.parseLong(value);
+        } catch (NumberFormatException ex) {
+            throw new IllegalArgumentException("DATAAGENT_PROJECT_ID exceeds signed 64-bit range");
+        }
+        return value;
     }
 
     private static int integer(String raw, int fallback) {
@@ -149,7 +163,7 @@ public record AppConfig(
             agent != null ? agent : Constants.DEFAULT_AGENT_NAME,
             source != null ? source : Constants.DEFAULT_SESSION_SOURCE,
             nonEmpty(env("RESOURCE_GROUP_ID")),
-            nonEmpty(env("DATAAGENT_PROJECT_ID")),
+            parseProjectId(env("DATAAGENT_PROJECT_ID")),
             accessKeyId,
             accessKeySecret,
             host != null ? host : "127.0.0.1",

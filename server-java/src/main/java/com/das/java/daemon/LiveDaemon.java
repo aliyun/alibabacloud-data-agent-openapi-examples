@@ -95,7 +95,6 @@ final class LiveDaemon {
             out.put("state", state);
             out.put("compactedReplay", events);
             out.put("liveJournal", List.of());
-            out.put("eventEpoch", "openapi:" + cfg.regionId() + ":" + id);
             out.put("historyHasMore", false);
             // No verified remote Load watermark: omit lastEventId, including after restart.
             return ResponseEntity.ok(out);

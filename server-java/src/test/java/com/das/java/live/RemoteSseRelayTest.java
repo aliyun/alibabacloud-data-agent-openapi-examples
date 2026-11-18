@@ -248,7 +248,12 @@ class RemoteSseRelayTest {
                 rejectLines(List.of("event:replay_complete", "id:42", "data:" + JSON.writeValueAsString(Map.of("Data", Map.of("replayedCount", 0, key, id)))));
             }
         }
-        rejectLines(List.of("event:replay_complete", "data:{\"Data\":{\"replayedCount\":1,\"lastEventId\":42}}"));
+        var nonemptyReplay = new ByteArrayOutputStream();
+        var receiptCursors = new ArrayList<String>();
+        RemoteSseRelay.writeFrame(List.of("event:replay_complete", "data:{\"Data\":{\"replayedCount\":1,\"lastEventId\":42}}"),
+            nonemptyReplay, "session-A", receiptCursors::add);
+        assertFalse(canonical(nonemptyReplay.toString(StandardCharsets.UTF_8)).containsKey("id"));
+        assertTrue(receiptCursors.isEmpty());
         rejectLines(List.of("event:replay_complete", "id:bad", "data:{\"Data\":{\"replayedCount\":0}}"));
         rejectLines(List.of("event:replay_complete", "data:{\"Id\":\"bad\",\"Data\":{\"replayedCount\":0}}"));
     }
@@ -472,6 +477,16 @@ class RemoteSseRelayTest {
         RemoteSseRelay.writeFrame(List.of("data: {\"Id\":\"99\",\"Data\":{\"ACKRequestId\":\"ack\",\"RequestId\":\"r\"}}"), output, "session-A", cursors::add);
         assertEquals(size, output.size());
         assertTrue(cursors.isEmpty());
+    }
+
+    @Test void standaloneNativeRetryIsTransportMetadataAndNeverAdvancesCursor() throws Exception {
+        var output = new ByteArrayOutputStream();
+        var cursors = new ArrayList<String>();
+        RemoteSseRelay.writeFrame(List.of("retry:3000"), output, "session-A", cursors::add);
+        assertEquals("retry:3000\n\n", output.toString(StandardCharsets.UTF_8));
+        assertTrue(cursors.isEmpty());
+        for (String invalid : List.of("retry:-1", "retry:bad", "retry:1.5", "id:4", "event:turn_complete"))
+            rejectLines(List.of(invalid));
     }
 
     private static void reject(String data) throws Exception {

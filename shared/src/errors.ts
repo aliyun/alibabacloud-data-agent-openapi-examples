@@ -153,7 +153,7 @@ function build(kind: ErrorKind, input: ErrorInput, message: string): ApiError {
 export function validRequestId(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const id = value.trim();
-  return id && id.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
+  return id && id !== 'undefined' && id !== 'null' && id.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
     && /^[\x21-\x7e]+$/.test(id) ? id : undefined;
 }
 

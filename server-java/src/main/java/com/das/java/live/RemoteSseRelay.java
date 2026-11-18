@@ -248,7 +248,9 @@ public final class RemoteSseRelay {
         }
         // Comments/heartbeats contain no event payload and never advance a cursor.
         if (data.isEmpty()) {
-            if (lines.stream().anyMatch(line -> !line.startsWith(":")))
+            // Native streams send a standalone retry directive after stream_open.
+            // It is transport metadata, not a journal event or a cursor advance.
+            if (lines.stream().anyMatch(line -> !line.startsWith(":") && !line.matches("retry: ?[0-9]+")))
                 throw new IOException("Remote SSE frame has fields without daemon data");
             output.write((String.join("\n", lines) + "\n\n").getBytes(StandardCharsets.UTF_8));
             output.flush();
@@ -315,8 +317,9 @@ public final class RemoteSseRelay {
         if (flattened && dataValue != decoded) rejectError(eventData, sdkErrorPayload(type, eventData));
         checkSession(eventData, sessionId);
         validateReplayMetadata(type, eventData);
-        boolean emptyCursorAllowed = "stream_open".equals(type)
-            || "replay_complete".equals(type) && ((Number) eventData.get("replayedCount")).doubleValue() == 0;
+        // Replay receipts describe a watermark in data; modern native streams do not
+        // give the receipt itself a new journal position, even for nonempty replay.
+        boolean emptyCursorAllowed = "stream_open".equals(type) || "replay_complete".equals(type);
         boolean cursorOptional = emptyCursorAllowed || cursorlessLifecyclePayload(type, eventData);
         // Missing id is legitimate for a synthetic frame; an explicit empty/invalid
         // id is not. Preserve only the existing opening/empty-replay reset exception.

@@ -97,18 +97,36 @@ final class PopAdapter implements AutoCloseable {
             .withInput(input).withRequest(request).withOutput(new Output()));
     }
 
-    RemoteEventStream events(String sessionId, String cursor) {
+    RemoteEventStream events(String sessionId, String cursor) { return events(sessionId, cursor, null); }
+
+    RemoteEventStream events(String sessionId, String cursor, String epoch) {
         var input = CancelAgentSessionRequest.create();
         HttpHeaders headers = new HttpHeaders();
         headers.set("Accept", "text/event-stream");
         if (cursor != null && !cursor.isBlank()) headers.set("Last-Event-Id", cursor);
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("SessionCode", sessionId);
+        if (epoch != null) query.put("EventEpoch", epoch);
         TeaRequest request = template.copy().setStyle(RequestStyle.RPC).setAction("GetAgentSessionEvents")
             // Match generated SSE calls: raw bytes belong to the response handler.
             // "binary" makes the SDK post-processor dereference the reactive response's null body.
             .setMethod(HttpMethod.GET).setPathRegex("/").setBodyType(BodyType.JSON)
-            .formModel(input).setQuery(Map.of("SessionCode", sessionId)).setHeaders(headers);
+            .formModel(input).setQuery(query).setHeaders(headers);
         RemoteEventStream stream = new RemoteEventStream();
         var future = handler.execute(new ClientExecutionParams<CancelAgentSessionRequest, Output>()
+            .withInput(input).withRequest(request).withOutput(new Output()).withHttpResponseHandler(stream));
+        future.whenComplete((ignored, error) -> { if (error != null) stream.onError(error); });
+        return stream;
+    }
+
+    RemoteEventStream prompt(com.aliyun.sdk.service.dataworks_public20240518.models.PromptAgentSessionRequest input) {
+        handler.validateRequestModel(input);
+        TeaRequest request = template.copy().setStyle(RequestStyle.RPC).setAction("PromptAgentSession")
+            .setMethod(HttpMethod.POST).setPathRegex("/").setBodyType(BodyType.JSON)
+            .setBodyIsForm(true).setReqBodyType(BodyType.FORM).formModel(input)
+            .setRequestConfiguration(darabonba.core.RequestConfiguration.create().setResponseTimeout(Duration.ofMinutes(10)));
+        RemoteEventStream stream = new RemoteEventStream();
+        var future = handler.execute(new ClientExecutionParams<RequestModel, Output>()
             .withInput(input).withRequest(request).withOutput(new Output()).withHttpResponseHandler(stream));
         future.whenComplete((ignored, error) -> { if (error != null) stream.onError(error); });
         return stream;

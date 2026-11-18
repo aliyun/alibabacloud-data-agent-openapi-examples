@@ -12,7 +12,7 @@ import { toApiError } from '../src/normalize.js';
 const FAKE_AK = 'LTAIfakefakefakefake1';
 const CAPTURED_401 =
   'Please contact Alibaba Security Team via DingTalk. Dingtalk group ID: 22245043795. ' +
-  `Deny: ${FAKE_AK}|source ip: 203.0.113.7 request id: 01A0A4F2-BD8E-59B4-972B-00E4CA265A0C`;
+  `Deny: ${FAKE_AK}|source ip: 203.0.113.7 request id: 00000000-0000-4000-8000-000000000001`;
 
 function unauthorized(): ResponseError {
   return new ResponseError({

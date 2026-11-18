@@ -27,7 +27,7 @@
 1. 在控制台准备并发布依赖 Skill/套件，取得 ID、来源及发布版本；按公开契约填写引用，不混用目录 ID、数据库 ID 和包版本。
 2. 先选定唯一名称；已有同名 Agent 时使用 Get/Update，不重复创建。调用 `CreateAgent`，提供 `Name`、`SystemPrompt`，按需传 `Skills`、`ExpertSuites`。立即使用时显式传 `PublishImmediately=true`，省略/false 保存草稿。
 3. 调用 `GetAgent` 核对保存的定义、引用和发布版本。保存与发布可能不是原子操作；失败先回读，不盲目重试 Create。
-4. 更新时读取当前 `Agent.AgentVersion`，传入 `UpdateAgent.ExpectedVersion`，按需传 `PublishImmediately=true`。冲突后重新读取并决定修改，不自动覆盖。不需要修改的引用列表应省略；当前新后端对 `Tools`、`Skills`、`CallableAgents` 的空数组保留已有引用，只有 `ExpertSuites=[]` 表示清空专家套件引用。不要使用通用的空数组清空规则。保存与发布不是原子操作，更新发布失败后也应先回读，避免重复生成版本。
+4. 更新时读取当前 `Agent.AgentVersion`，传入 `UpdateAgent.ExpectedVersion`，按需传 `PublishImmediately=true`。冲突后重新读取并决定修改，不自动覆盖。不需要修改的引用列表应省略。部署统一更新规则后，`Skills` 和 `ExpertSuites` 都按省略保留、非空列表整组替换、空数组清空处理。仍使用旧更新规则的地域会将 `Skills=[]` 解释为保留。清空后用 `GetAgent` 回读。`Tools` 和 `CallableAgents` 的空数组继续保留原引用。保存与发布不是原子操作，更新发布失败后也应先回读，避免重复生成版本。
 5. 将已发布名称写入会话服务环境配置，启动任一语言后端：
 
 ```dotenv
@@ -42,6 +42,8 @@ DATAAGENT_REASONING_EFFORT=none
 ## Agent 时间字段
 
 `CreateAgent`、`GetAgent`、`UpdateAgent` 和 `ListCustomAgents` 的接口模型将 `GmtCreateTime` 与 `GmtModifiedTime` 定义为 JSON 整数（`int64` Unix 毫秒）。页面按展示时区格式化即可。创建时间记录首次创建时刻，修改时间可随更新或发布推进。核对时请比较原始时间戳，避免把客户端格式化后的时区差异误判为数据差异。
+
+升级 SDK 时，请检查 `CreateAgent`、`GetAgent` 和 `ListCustomAgents` 的生成模型。旧版 Node.js 和 Java 模型将这两个字段读取为字符串，按新契约生成的候选 SDK 分别读取为 `number` 和 `Long`，Python 仍读取为 `int`。依赖字符串类型的代码需要调整类型和日期转换。新旧 SDK 的实测毫秒值一致。
 
 ## Node.js：先只读核对
 

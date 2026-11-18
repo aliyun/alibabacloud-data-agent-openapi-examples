@@ -92,6 +92,10 @@ def frame_from_sdk_body(body: Any) -> Frame | None:
     if acp_keys == 0:
         return None
 
+    meta = inner.get("_meta", inner.get("Meta", inner.get("meta")))
+    if isinstance(meta, dict):
+        frame["_meta"] = meta
+
     for key, value in inner.items():
         if key in _WIRE_KEYS or key in _SDK_KEYS or key in frame:
             continue

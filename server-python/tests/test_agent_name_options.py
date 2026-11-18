@@ -91,7 +91,7 @@ def test_list_and_lookup_forward_agent_filter_and_archived_on_each_request(monke
     assert response.status_code == 200
     assert response.json()["sessions"][0]["sessionId"] == "Remote-ID"
     assert pop.calls[-1][1] == {"AgentName": "custom", "SessionSourceList": ["test"],
-                               "MaxResults": 100, "Archived": True}
+                               "MaxResults": 10, "Archived": True}
     before = len(pop.calls)
     assert http.get("/d/standalone/sessions/Remote-ID", params={"agentName": " custom "}).status_code == 200
     queries = [params for _, params, _ in pop.calls[before:]]

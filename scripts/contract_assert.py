@@ -161,7 +161,7 @@ status, events, _ = stream("POST", "/api/sessions/mock-ack-only/prompt", {"text"
 error_events = [e for e in events if e.get("type") == "error"]
 check("ack: 有 error 事件", len(error_events) > 0)
 check("ack: kind=prompt_not_dispatched", error_events and error_events[0].get("error", {}).get("kind") == "prompt_not_dispatched")
-check("ack: POP 回执号进 message", error_events and "0dd3b146c75bf132a65efa7a3080e7cd" in error_events[0].get("error", {}).get("message", ""))
+check("ack: POP 回执号进 message", error_events and "0123456789abcdef0123456789abcdef" in error_events[0].get("error", {}).get("message", ""))
 
 print()
 if failures:

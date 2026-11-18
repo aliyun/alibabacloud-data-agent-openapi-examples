@@ -16,7 +16,7 @@
 |---|---|
 | `CreateAgent` | 顶层 `Name`、`SystemPrompt`、`Skills`、`ExpertSuites`；显式 `PublishImmediately=true` 才请求立即发布 |
 | `GetAgent` | 顶层 `Name`；可选 `AgentVersion`，省略读取当前定义 |
-| `UpdateAgent` | 顶层 `Name`、刚回读的 `ExpectedVersion`、要修改的字段；可选 `PublishImmediately`。未修改的引用列表应省略；当前新后端对 `Tools`/`Skills`/`CallableAgents` 的空数组保留引用，`ExpertSuites=[]` 清空套件引用；发布失败后先回读 |
+| `UpdateAgent` | 顶层 `Name`、刚回读的 `ExpectedVersion`、要修改的字段；可选 `PublishImmediately`。未修改的引用列表应省略。部署统一更新规则后，`Skills=[]` 和 `ExpertSuites=[]` 分别清空对应引用。`Tools` 和 `CallableAgents` 的空数组保留原引用。发布失败后先回读 |
 | `CreateAgentSession` | `Params.Meta.Agent.AgentName` 指定已发布 Agent；`Params.Meta.InitialConfigOptions` 下的 `Model`、`Mode`、`ReasoningEffort` 和 `Cu` 设置新会话配置 |
 | `UpdateAgentSessionTitle` | `Params={SessionId, Title}`，修改会话标题 |
 | `ArchiveAgentSession` | `Params={SessionId, Archived:true}` 归档；`false` 取消归档；列表使用 `ListAgentSessions.Params.Archived` 选择范围，不能恢复已删除会话 |
@@ -120,7 +120,7 @@ async def example():
 
 ### Java
 
-在 `server-java` 项目的独立程序中按需调用；使用 SDK `9.0.17`：
+在 `server-java` 项目的独立程序中按需调用；使用 SDK `10.0.2`：
 
 ```java
 import com.das.java.config.AppConfig;
@@ -143,18 +143,20 @@ Java 创建和改名使用生成式方法，缺少生成方法的接口通过[Po
 
 ## 订阅、发送与续接
 
-**灰度长任务推荐使用两条流。** 当前账号和目标地域需开启 `GetAgentSessionEvents` 灰度。创建会话后，保存返回的 `SessionId`，用它作为 Events 的 `SessionCode`。先建立 Events 订阅，再发送 `PromptAgentSession`，同时读取两条流，无需等待订阅结束。Workbench LIVE 用 Events 渲染进度和内容，用 Prompt 流处理本轮结果和业务错误。同一内容只渲染一次。直调 POP 时也可以仅消费 Prompt 自带的 SSE。
+**两条流按“先 Prompt、后 Events”衔接。** 当前账号和目标地域需开启 `GetAgentSessionEvents` 灰度。保留原 Session ID，提交一次 `PromptAgentSession` 并持续消费其 SSE；后台按需恢复运行态。收到真实业务帧的 `Meta.EventCursor`（SDK 可能是 `meta.eventCursor`，直接 JSON-RPC 为 `_meta.eventCursor`）后，再用其 `EventId` 作为 `Last-Event-Id`、`EventEpoch` 作为同名 query，订阅独立 Events。HTTP 200、POP RequestId、JSON-RPC id 都不是恢复完成或续接位置。
+
+首个游标指向已经收到的事件，因此这帧必须处理，不能直接丢弃后只显示 Events。本示例中，本浏览器提交轮次的内容、权限卡和结果统一由 Prompt 流处理；独立 Events 对同一原生 Prompt 的重复内容不再追加，其他观察者事件仍可接收。Prompt 流保留到业务终态，Events 失败不取消或重发 Prompt。兼容链路没有可信游标时继续 Prompt，不猜测 `0`，也不因此阻断发问。
 
 - `PromptAgentSession.Params={SessionId, Prompt:[{Type:"text", Text:"本轮问题"}]}`。第二轮只发送新问题，历史由远端会话维护。人卡问题通过 `ReplyAgentSession` 回复，requestId、选项 ID 和答案结构取自实际事件。
 - Prompt 在收到业务终态前超时或断流，本轮结果未知。保持 Events 订阅以观察后续进度，避免自动重发 Prompt。HTTP 200、心跳和连接关闭都不能用来判定本轮成功。
-- Events 断流后，用同一远端事件流最后已消费的 `Last-Event-Id` 和对应的 `EventEpoch` 尝试续接。省略游标只接收实时事件，显式 `0` 只尝试回放有界缓存。下表的 Demo 辅助方法目前只接收游标，需要同时传代次时可直接调用 POP。
-- 页面刷新、重开会话、游标失效或收到 `state_resync_required` 时，用 `LoadAgentSession` 恢复或核对历史，再按需重建订阅。历史回放结束只表示本次读取完成。Load 与 Events 之间没有已验证的共同水位，恢复时可能需要重新同步界面状态。
+- Events 断流后，用同一远端事件流最后已消费的 `Last-Event-Id` 和对应的 `EventEpoch` 尝试续接。省略游标只接收实时事件，显式 `0` 只尝试回放有界缓存。Node 和 Java 辅助方法已支持可选原生 epoch；Python 仍需核实其适配入口后再用于严格续接。
+- 页面刷新、重开会话需要展示历史，或者游标失效、收到 `state_resync_required` 时，可用 `LoadAgentSession` 核对历史。直接对旧会话发问不要求先 Load；闲置订阅失效后等待下一次 Prompt 取得新游标。历史回放结束只表示本次读取完成。Load 与 Events 之间没有已验证的共同水位，恢复时可能需要重新同步界面状态。
 
 | 语言 | Events 入口 | 流处理与游标校验示例 |
 |---|---|---|
-| Node.js | `openSessionEvents(client, sid, lastEventId?)` | [remote-events.ts](../server-node/src/daemon/remote-events.ts) 使用 `parseSse` 和 `remoteEvent` 增量解码与校验 |
+| Node.js | `openSessionEvents(client, sid, lastEventId?, eventEpoch?)` | [remote-events.ts](../server-node/src/daemon/remote-events.ts) 使用 `parseSse` 和 `remoteEvent` 增量解码与校验 |
 | Python | `session_events(ctx, sid, last_event_id)` | [pop.py](../server-python/src/das_python/pop.py)；缺省传 `None`，通过异步迭代读取 |
-| Java | `live.events(sid, cursor)` | [RemoteSseRelay](../server-java/src/main/java/com/das/java/live/RemoteSseRelay.java)；缺省 cursor 为 `null`，流使用后须关闭 |
+| Java | `live.events(sid, cursor, epoch)` | [RemoteSseRelay](../server-java/src/main/java/com/das/java/live/RemoteSseRelay.java)；缺省 cursor 为 `null`，流使用后须关闭 |
 
 ## 实现索引
 

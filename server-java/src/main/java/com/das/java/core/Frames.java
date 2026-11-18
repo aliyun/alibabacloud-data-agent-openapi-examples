@@ -60,6 +60,9 @@ public final class Frames {
         }
         // 一个 ACP 层键都没有 ⇒ 不是帧：只有 RequestId 的 POP 回执，或信封反解后字段全丢。
         if (acpKeys == 0) return null;
+        Object meta = innerMap.containsKey("_meta") ? innerMap.get("_meta")
+            : innerMap.containsKey("Meta") ? innerMap.get("Meta") : innerMap.get("meta");
+        if (meta != null) frame.put("_meta", meta);
 
         for (Map.Entry<?, ?> entry : innerMap.entrySet()) {
             String key = String.valueOf(entry.getKey());

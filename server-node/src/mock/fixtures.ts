@@ -163,7 +163,7 @@ export const MOCK_SCENARIOS: MockScenario[] = [
     title: '[MOCK] prompt 不派发 · 零帧 · 只有 POP 回执',
     // 没有 promptFixture：这一轮**一个 ACP 帧都没有**，上游只回了一个 POP 层回执就关流。
     promptFixture: undefined,
-    popAck: '0dd3b146c75bf132a65efa7a3080e7cd',
+    popAck: '0123456789abcdef0123456789abcdef',
     historyFixture: undefined,
     frameCount: 0,
     teaches: 'prompt 根本没派发：只有 POP 回执、零帧；与断流不同，任务没在跑',

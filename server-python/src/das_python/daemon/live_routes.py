@@ -1,7 +1,7 @@
 """Request-scoped LIVE daemon views. No session Registry, admission or receipt state."""
 from __future__ import annotations
 
-import hashlib
+import re
 import uuid
 from typing import Any
 
@@ -19,10 +19,6 @@ from .events import OPENAPI_ANSWERS_OPTION
 from .registry import WORKSPACE_CWD
 from .routes import _body, _error, _iso, _json, _not_found
 from .translate import history_frames_to_events
-
-
-def _remote_epoch(cfg: AppConfig, session_id: str) -> str:
-    return hashlib.sha256(f"{cfg.endpoint or ''}|{cfg.regionId}|{session_id}".encode()).hexdigest()[:24]
 
 
 def _session_body(session_id: str, created_at: Any = None) -> dict[str, Any]:
@@ -104,7 +100,7 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
             return {"v": 1, "sessionId": session_id, "events": events, "hasMore": False}
         return {**_session_body(session_id),
                 "state": {"models": {"availableModels": []}, "modes": {}, "configOptions": None},
-                "compactedReplay": events, "liveJournal": [], "eventEpoch": _remote_epoch(cfg, session_id),
+                "compactedReplay": events, "liveJournal": [],
                 "historyHasMore": False}
 
     @app.post("/d/standalone/sessions/{session_id}/load")
@@ -192,18 +188,24 @@ def register_live_routes(app: FastAPI, cfg: AppConfig, live: LiveContext) -> Non
         if cursor is not None and (not cursor.isascii() or not cursor.isdecimal()
                                    or len(cursor) > 20 or int(cursor) > 2**53 - 1):
             return _error(400, "Invalid Events cursor", "invalid_event_cursor")
-        upstream = session_events(live, session_id, cursor, expose_headers=True)
+        epoch = request.headers.get("x-qwen-event-epoch") or request.query_params.get("epoch")
+        if epoch is not None and (cursor is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", epoch)):
+            return _error(400, "epoch requires its cursor", "invalid_event_cursor")
+        upstream = session_events(live, session_id, cursor, event_epoch=epoch, expose_headers=True)
         try:
             first = await anext(upstream, None)
         except Exception as exc:
             await upstream.aclose()
             error = to_api_error(exc, "GetAgentSessionEvents")
             return _error(502, error.message, "events_upstream_error", error.requestId)
-        response_headers = first.get("responseHeaders", {}) if first else {}
+        if not first or not first.get("eventEpoch"):
+            await upstream.aclose()
+            return _error(502, "缺少可信原生开流身份", "events_upstream_error")
+        response_headers = first.get("responseHeaders", {})
         return StreamingResponse(_remote_sse_stream(live, session_id, cursor, upstream=upstream), media_type="text/event-stream", headers={
             **response_headers,
             "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no",
-            "X-Qwen-Event-Epoch": _remote_epoch(cfg, session_id), "X-Qwen-Sse-Stream-Id": uuid.uuid4().hex})
+            "X-Qwen-Event-Epoch": first["eventEpoch"], "X-Qwen-Sse-Stream-Id": uuid.uuid4().hex})
 
     @app.post("/d/session/{session_id}/heartbeat")
     async def heartbeat(session_id: str) -> Response:

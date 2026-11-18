@@ -7,8 +7,9 @@ import type { SessionDefaults } from '../../src/session-client';
 
 const harness = vi.hoisted(() => ({
   workspace: {} as { client: DaemonClient; baseUrl: string },
-  actions: { clearSession: vi.fn(async () => {}), createSession: vi.fn(), sendPrompt: vi.fn(), submitPrompt: vi.fn() },
+  actions: { clearSession: vi.fn(async () => {}), createSession: vi.fn(), attachSession: vi.fn<() => Promise<void>>(), sendPrompt: vi.fn(), submitPrompt: vi.fn() },
   shell: vi.fn(),
+  addTags: vi.fn(),
   store: null as DaemonTranscriptStore | null,
   connection: {} as { sessionId?: string },
 }));
@@ -19,8 +20,12 @@ vi.mock('@qwen-code/web-shell', () => ({
   useTranscriptStore: () => harness.store,
   DaemonWorkspaceProvider: ({ children }: { children: ReactNode }) => children,
   DaemonSessionProvider: ({ children }: { children: ReactNode }) => children,
-  WebShell: (props: { sidebar?: { footer?: { render?: () => ReactNode } }; renderComposerToolbarStart?: () => ReactNode }) => {
-    harness.shell(props); return <><div>Shell</div>{props.sidebar?.footer?.render?.()}{props.renderComposerToolbarStart?.()}</>;
+  WebShell: (props: { sidebar?: { footer?: { render?: () => ReactNode } };
+    renderComposerToolbarStart?: (info: { disabled: boolean }) => ReactNode;
+    composerRef?: { current: { addTags: typeof harness.addTags } | null } }) => {
+    harness.shell(props);
+    if (props.composerRef) props.composerRef.current = { addTags: harness.addTags };
+    return <><div>Shell</div><div contentEditable aria-label="消息输入框" />{props.sidebar?.footer?.render?.()}{props.renderComposerToolbarStart?.({ disabled: false })}</>;
   },
 }));
 import App, { OpenApiSessionCreation, OpenApiToolbarDefaults } from '../../src/App';
@@ -42,7 +47,9 @@ beforeEach(() => {
   saveSelectedAgent(base, 'a');
   harness.workspace = { client: new DaemonClient({ baseUrl: base, fetch: (input, init) => globalThis.fetch(input, init) }), baseUrl: base };
   harness.actions.createSession = vi.fn(options => DaemonSessionClient.createStandalone(harness.workspace.client, options).then(client => client.session));
+  harness.actions.attachSession.mockReset().mockResolvedValue(undefined);
   harness.shell.mockClear();
+  harness.addTags.mockClear();
   harness.actions.clearSession.mockClear();
   window.history.replaceState({}, '', '/');
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
@@ -53,6 +60,11 @@ beforeEach(() => {
       providers: [{ kind: 'model_provider', status: 'ok', authType: 'none', current: true,
         models: [{ modelId: 'env-model', baseModelId: 'env-model', name: 'Environment', isCurrent: true, isRuntime: false }] }], errors: [] });
     if (url.endsWith('/standalone/sessions')) { creates.push(JSON.parse(init!.body as string)); return Response.json(session); }
+    if (url.endsWith('/openapi/sessions/server-id/attachments')) {
+      const file = init!.body as File;
+      const id = 'a'.repeat(32);
+      return Response.json({ id, name: file.name, relativePath: `upload/server-id_${id}.csv`, size: file.size }, { status: 201 });
+    }
     if (url.endsWith('/api/health')) return Response.json({ result: { mock: false } });
     throw new Error(`Unexpected test request ${url}`);
   }));
@@ -76,6 +88,81 @@ async function mount() {
 }
 
 describe('App new-session settings', () => {
+  it('limits workbench chrome to sessions, chat, host settings and supported creation controls', async () => {
+    environment.approvalMode = 'yolo';
+    render(<App />);
+    await screen.findByRole('button', { name: '会话设置' });
+    const props = harness.shell.mock.calls.at(-1)![0];
+    expect(props.sidebar).toMatchObject({ primaryNav: { items: ['newTask'] }, hideProjectHeader: true,
+      showSessionSourceSwitch: false, footer: { items: ['collapse'] } });
+    expect(props.composerToolbarActions).toEqual(['model', 'approvalMode']);
+    expect(props.hiddenSlashCommands).toEqual(expect.arrayContaining(['auth', 'tasks', 'fork', 'context', 'rewind']));
+  });
+
+  it('changes the theme in host settings and restores it without creating a session', async () => {
+    const first = render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '会话设置' }));
+    fireEvent.change(await screen.findByLabelText('界面主题'), { target: { value: 'light' } });
+    expect(screen.getByRole('dialog', { name: '会话设置' }).getAttribute('data-theme')).toBe('light');
+    expect(localStorage.getItem('das.theme.v1')).toBe('light');
+    expect(harness.shell.mock.calls.at(-1)![0].theme).toBe('light');
+    expect(creates).toHaveLength(0);
+    first.unmount();
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: '会话设置' }));
+    expect((await screen.findByLabelText<HTMLSelectElement>('界面主题')).value).toBe('light');
+    fireEvent.change(screen.getByLabelText('界面主题'), { target: { value: 'dark' } });
+    expect(localStorage.getItem('das.theme.v1')).toBe('dark');
+    expect(creates).toHaveLength(0);
+  });
+
+  it('adds uploaded files from the picker and drop to the composer and rejects oversize files', async () => {
+    environment.attachmentMaxBytes = 8;
+    harness.connection = { sessionId: 'server-id' };
+    const { container } = render(<App />);
+    const button = await screen.findByRole('button', { name: '上传文件' });
+    const input = container.querySelector<HTMLInputElement>('input[type=file]')!;
+    const openPicker = vi.spyOn(input, 'click');
+    fireEvent.click(button);
+    expect(openPicker).toHaveBeenCalledOnce();
+    fireEvent.change(input, { target: { files: [new File(['a'], '选取.csv')] } });
+    await waitFor(() => expect(harness.addTags).toHaveBeenCalledOnce());
+    expect(harness.addTags).toHaveBeenLastCalledWith([expect.objectContaining({ label: '选取.csv', value: '选取.csv', kind: 'file',
+      serialized: `@upload/server-id_${'a'.repeat(32)}.csv` })], { placement: 'inline', position: 'end' });
+
+    fireEvent.drop(screen.getByLabelText('消息输入框'), {
+      dataTransfer: { types: ['Files'], files: [new File(['b'], '拖入.csv')] },
+    });
+    await waitFor(() => expect(harness.addTags).toHaveBeenCalledTimes(2));
+    expect(harness.addTags).toHaveBeenLastCalledWith([expect.objectContaining({ label: '拖入.csv' })], expect.anything());
+
+    fireEvent.change(input, { target: { files: [new File(['123456789'], '超限.csv')] } });
+    expect((await screen.findByRole('alert')).textContent).toContain('超过单文件上限');
+    expect(harness.addTags).toHaveBeenCalledTimes(2);
+  });
+
+  it('attaches a session created by the file picker before uploading or adding the file tag', async () => {
+    environment.attachmentMaxBytes = 8;
+    let finishAttaching!: () => void;
+    const attaching = new Promise<void>(resolve => { finishAttaching = resolve; });
+    harness.actions.attachSession.mockReturnValue(attaching);
+
+    const { container } = render(<App />);
+    await screen.findByRole('button', { name: '上传文件' });
+    fireEvent.change(container.querySelector<HTMLInputElement>('input[type=file]')!, {
+      target: { files: [new File(['a'], '首个附件.csv')] },
+    });
+
+    await waitFor(() => expect(harness.actions.attachSession).toHaveBeenCalledOnce());
+    expect(creates).toHaveLength(1);
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/attachments'))).toBe(false);
+    expect(harness.addTags).not.toHaveBeenCalled();
+
+    await act(async () => finishAttaching());
+    await waitFor(() => expect(harness.addTags).toHaveBeenCalledOnce());
+    expect(window.location.pathname).toBe('/session/server-id');
+  });
+
   it('preserves native model and mode selections with settings reasoning at creation', async () => {
     await mount();
     await act(() => harness.workspace.client.getStandaloneSessionOptions());

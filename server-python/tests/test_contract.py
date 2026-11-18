@@ -217,6 +217,6 @@ def test_ack_scenario_prompt_not_dispatched(mock_client: TestClient) -> None:
     error_event = next(e for e in events if e["type"] == "error")
     assert error_event["error"]["kind"] == "prompt_not_dispatched"
     # POP RequestId 是零帧场景下唯一还能拿去查的线索，必须出现在 message 里
-    assert "0dd3b146c75bf132a65efa7a3080e7cd" in error_event["error"]["message"]
+    assert "0123456789abcdef0123456789abcdef" in error_event["error"]["message"]
     # 没有 meta：rid 是上游给的，一帧没收到就不知道
     assert events[0]["type"] == "error"

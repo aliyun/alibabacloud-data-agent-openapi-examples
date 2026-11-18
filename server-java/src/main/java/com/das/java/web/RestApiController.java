@@ -44,6 +44,7 @@ public class RestApiController {
         this.live = holder.client();
     }
 
+
     // ------------------------------------------------------------------
     // 统一出口
     // ------------------------------------------------------------------
@@ -87,11 +88,16 @@ public class RestApiController {
     public Map<String, Object> health() {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("mock", cfg.mock());
+        result.put("backend", "java");
         result.put("region", cfg.regionId());
         result.put("agent", cfg.agentName());
         result.put("sessionSource", cfg.sessionSource());
         result.put("resourceGroupIdConfigured", cfg.resourceGroupId() != null);
         result.put("projectIdConfigured", cfg.projectId() != null);
+        // 配置诊断不是远端 scope/规则已生效的证明；批跑仍需服务端证据。
+        result.put("configuredProjectId", cfg.projectId());
+        result.put("runtimeInstanceId", RuntimeIdentity.ID);
+        result.put("runtimeStartedAtMs", RuntimeIdentity.STARTED_AT);
         // 只说"有没有"，不说"是什么"：health 是前端启动时第一个请求，
         // 内容会进浏览器 network 面板、日志和截图。
         result.put("credentials", cfg.accessKeyId() != null && cfg.accessKeySecret() != null ? "present" : "missing");
@@ -99,6 +105,11 @@ public class RestApiController {
             result.put("mockReplay", cfg.mockRealtime() ? "真实时间间隔" : "压平 + " + cfg.mockSpeed() + "x 倍速");
         }
         return ok(result);
+    }
+
+    private static final class RuntimeIdentity {
+        private static final String ID = java.util.UUID.randomUUID().toString();
+        private static final long STARTED_AT = java.lang.management.ManagementFactory.getRuntimeMXBean().getStartTime();
     }
 
     // ------------------------------------------------------------------

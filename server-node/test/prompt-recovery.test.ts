@@ -1,117 +1,91 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { AcpFrame } from '@das/shared';
+import { Readable } from 'node:stream';
+import { eventCursorOf, type AcpFrame, type EventCursor } from '@das/shared';
 import { recoverPromptFrames, type ResumeSource } from '../src/prompt-recovery.js';
 import { toApiError } from '../src/normalize.js';
 import { livePromptFrames } from '../src/live.js';
 
-const chunk = (offset: number, text = 'x', rid = 'turn'): AcpFrame => ({ Jsonrpc: '2.0', RequestId: rid,
-  Params: { sessionId: 'session', _meta: { offset }, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
-const end = (id = 'prompt', rid = 'turn', reason = 'end_turn'): AcpFrame =>
-  ({ Jsonrpc: '2.0', RequestId: rid, Id: id, Result: { stopReason: reason } });
+const cursor = (id: number, type = 'session_update'): EventCursor => ({ sessionId: 'session', eventEpoch: 'epoch',
+  eventId: String(id), promptId: 'native-prompt', eventType: type });
+const chunk = (id: number, text = 'x'): AcpFrame => ({ Jsonrpc: '2.0', RequestId: 'turn', _meta: { eventCursor: cursor(id) },
+  Params: { sessionId: 'session', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
+const end = (id = 6): AcpFrame => ({ Jsonrpc: '2.0', Id: 'prompt', Result: { stopReason: 'end_turn' },
+  _meta: { eventCursor: cursor(id, 'turn_complete') } });
 async function* frames(rows: AcpFrame[], error?: Error) { yield* rows; if (error) throw error; }
-const source = (rows: AcpFrame[], id = 'prompt', error?: Error): ResumeSource => ({ id, frames: frames(rows, error) });
-const retry = (e: unknown) => toApiError(e, 'LoadAgentSession').kind === 'transport';
+const source = (rows: AcpFrame[], error?: Error): ResumeSource => ({ id: 'prompt', frames: frames(rows, error) });
+const retry = (e: unknown) => toApiError(e, 'GetAgentSessionEvents').kind === 'transport';
 async function collect(rows: AsyncIterable<AcpFrame>) { const out: AcpFrame[] = []; for await (const r of rows) out.push(r); return out; }
-const opts = { delayMs: 0, attempts: 3 };
+const opts = { sessionId: 'session', delayMs: 0, attempts: 3 };
 
-describe('旧 Prompt 有界 Load 续接', () => {
-  it('EOF 后按已消费游标续接，忽略旧历史、重复帧及 Load 自身终态', async () => {
-    const load = vi.fn((_offset: number, _remaining: number) => source([chunk(99, 'old', 'older'), end('load', 'load-rid'), end('load', 'turn'), chunk(1), chunk(2, 'new'), end()], 'load'));
-    const result = await collect(recoverPromptFrames(source([chunk(1)]), load, retry, opts));
-    expect(result).toEqual([chunk(1), chunk(2, 'new'), end()]);
-    expect(load.mock.calls[0]?.[0]).toBe(1);
+describe('Prompt resumes only the native Events cursor', () => {
+  it('resumes after the applied event and keeps one original terminal', async () => {
+    const events = vi.fn(() => source([chunk(5, 'new'), end()]));
+    expect(await collect(recoverPromptFrames(source([chunk(4)]), events, retry, opts)))
+      .toEqual([chunk(4), chunk(5, 'new'), end()]);
+    expect(events.mock.calls).toHaveLength(1);
+    expect((events.mock.calls as unknown as EventCursor[][])[0]?.[0]).toEqual(cursor(4));
   });
-  it('旧 LSP buffer 缺 RequestId 时按同 session 游标接回正文；不接收其他 session', async () => {
-    const buffered = chunk(2, 'recovered'); delete buffered.RequestId;
-    const foreign = chunk(99, 'foreign'); delete foreign.RequestId; foreign.Params!.sessionId = 'other';
-    const result = await collect(recoverPromptFrames(source([chunk(1)]),
-      () => source([foreign, buffered, end()], 'load'), retry, opts));
-    expect(result).toEqual([chunk(1), buffered, end()]);
+  it('advances only fully handled cursors across repeated transport disconnects', async () => {
+    const events = vi.fn((saved: EventCursor) => source(saved.eventId === '4' ? [chunk(5)] : [end()]));
+    await collect(recoverPromptFrames(source([chunk(4)]), events, retry, opts));
+    expect(events.mock.calls.map(call => call[0].eventId)).toEqual(['4', '5']);
   });
-  it('跨多次断线继续推进游标，不重复已交付帧', async () => {
-    const load = vi.fn((offset: number) => source(offset === 1 ? [chunk(1), chunk(2)] : [chunk(2), chunk(3), end()], 'load'));
-    const result = await collect(recoverPromptFrames(source([chunk(1)]), load, retry, opts));
-    expect(result).toEqual([chunk(1), chunk(2), chunk(3), end()]);
-    expect(load.mock.calls.map(c => c[0])).toEqual([1, 2]);
+  it.each(['eventEpoch', 'promptId', 'sessionId', 'eventId'] as const)('rejects changed or duplicated cursor field %s', async key => {
+    const invalid = chunk(5);
+    (invalid._meta as { eventCursor: EventCursor }).eventCursor[key] = key === 'eventId' ? '4' : 'other';
+    await expect(collect(recoverPromptFrames(source([chunk(4)]), () => source([invalid]), retry, opts))).rejects.toThrow();
   });
-  it.each(['end_turn', 'cancelled'])('收到原轮 %s 后不再 Load', async reason => {
-    const load = vi.fn();
-    await collect(recoverPromptFrames(source([chunk(1), end('prompt', 'turn', reason)]), load, retry, opts));
-    expect(load).not.toHaveBeenCalled();
+  it('does not use a legacy offset as native resume proof', async () => {
+    const legacy = chunk(4); delete legacy._meta; legacy.Params!._meta = { offset: 900 };
+    const events = vi.fn(); await collect(recoverPromptFrames(source([legacy]), events, retry, opts));
+    expect(events).not.toHaveBeenCalled();
   });
-  it('原流传输异常可恢复，业务错误帧不恢复', async () => {
-    const load = vi.fn(() => source([end()], 'load'));
-    await collect(recoverPromptFrames(source([chunk(1)], 'prompt', new Error('socket closed')), load, retry, opts));
-    expect(load).toHaveBeenCalledOnce();
-    load.mockClear();
-    await collect(recoverPromptFrames(source([chunk(1), { Error: { code: -32603, message: 'permission_required' } }]), load, retry, opts));
-    expect(load).not.toHaveBeenCalled();
+  it('does not resume a terminal or a business rejection', async () => {
+    const events = vi.fn();
+    for (const rows of [[chunk(4), end()], [{ Error: { code: -32603, message: 'denied' } }]]) {
+      await collect(recoverPromptFrames(source(rows), events, retry, opts));
+    }
+    expect(events).not.toHaveBeenCalled();
   });
-  it('没有原轮游标不猜测续点，Load 反复空结束最多调用三次', async () => {
-    const load = vi.fn(() => source([], 'load'));
-    await collect(recoverPromptFrames(source([{ Jsonrpc: '2.0', RequestId: 'turn' }]), load, retry, opts));
-    expect(load).not.toHaveBeenCalled();
-    await collect(recoverPromptFrames(source([chunk(1)]), load, retry, opts));
-    expect(load).toHaveBeenCalledTimes(3);
+  it('a subscription error after a saved cursor checks Events instead of claiming execution failure', async () => {
+    const events = vi.fn(() => source([end()]));
+    const result = await collect(recoverPromptFrames(source([chunk(4), { Error: { errorCode: 'DAEMON_STREAM_ENDED', message: 'ended' } }]), events, retry, opts));
+    expect(result).toEqual([chunk(4), end()]); expect(events).toHaveBeenCalledOnce();
   });
-  it('Load 认证失败立即报错，不继续重连', async () => {
-    const load = vi.fn(() => source([], 'load', Object.assign(new Error('denied'), { statusCode: 403 })));
-    await expect(collect(recoverPromptFrames(source([chunk(1)]), load, retry, opts))).rejects.toThrow('denied');
-    expect(load).toHaveBeenCalledOnce();
+  it('bounds empty subscriptions and does not retry authentication failures', async () => {
+    const events = vi.fn(() => source([]));
+    await collect(recoverPromptFrames(source([chunk(4)]), events, retry, opts));
+    expect(events).toHaveBeenCalledTimes(3);
+    const denied = vi.fn(() => source([], Object.assign(new Error('denied'), { statusCode: 403 })));
+    await expect(collect(recoverPromptFrames(source([chunk(4)]), denied, retry, opts))).rejects.toThrow('denied');
+    expect(denied).toHaveBeenCalledOnce();
   });
-  it('Load 自身的 JSON-RPC 错误会报错，旧历史错误不污染本轮', async () => {
-    const load = vi.fn(() => source([
-      { Jsonrpc: '2.0', Id: 'old', RequestId: 'older', Error: { code: -32603, message: 'old failure' } },
-      { Jsonrpc: '2.0', Id: 'load', RequestId: 'load-rid', Error: { code: -32603, message: 'denied' } },
-    ], 'load'));
-    await expect(collect(recoverPromptFrames(source([chunk(1)]), load, retry, opts))).rejects.toThrow('denied');
-    expect(load).toHaveBeenCalledOnce();
-  });
-  it('消费者关闭时关闭源，不启动恢复', async () => {
+  it('closes the upstream on consumer disposal without starting another request', async () => {
     let closed = false;
-    const initial = { id: 'prompt', frames: (async function* () { try { yield chunk(1); yield chunk(2); } finally { closed = true; } })() };
-    const load = vi.fn();
-    const stream = recoverPromptFrames(initial, load, retry, opts);
+    const initial = { id: 'prompt', frames: (async function* () { try { yield chunk(4); } finally { closed = true; } })() };
+    const events = vi.fn(); const stream = recoverPromptFrames(initial, events, retry, opts);
     await stream.next(); await stream.return(undefined);
-    expect(closed).toBe(true); expect(load).not.toHaveBeenCalled();
+    expect(closed).toBe(true); expect(events).not.toHaveBeenCalled();
   });
-  it('当前轮回放文本缺失 offset 时不能追加整份历史并报成功', async () => {
-    const unsafe = chunk(2); delete unsafe.Params!._meta;
-    await expect(collect(recoverPromptFrames(source([chunk(1)]), () => source([unsafe, end()], 'load'), retry, opts)))
-      .rejects.toThrow('缺少 offset');
-  });
-  it('Load 静默时仍受恢复总预算限制', async () => {
-    vi.useFakeTimers();
-    try {
-      const load = vi.fn(() => ({ id: 'load', frames: (async function* () {
-        await new Promise(resolve => setTimeout(resolve, 100)); yield chunk(2);
-      })() }));
-      const result = collect(recoverPromptFrames(source([chunk(1)]), load, retry,
-        { delayMs: 0, budgetMs: 15 }));
-      await vi.advanceTimersByTimeAsync(20);
-      expect(await result).toEqual([chunk(1)]);
-      expect(load).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(100);
-    } finally { vi.useRealTimers(); }
-  });
-  it('SDK 集成只发一次 Prompt，Load 使用契约字段 BeginLogOffset', async () => {
+  it('preserves metadata through SDK core and waits for the receipt before publishing a native terminal', async () => {
+    const envelope = (id: number, type: string, data: object) => ({ v: 1, id, type, promptId: 'native-prompt', data });
+    const sse = (event: object, id?: number) => `${id === undefined ? '' : 'id: '+id+'\n'}event: ${(event as {type:string}).type}\ndata: ${JSON.stringify(event)}\n\n`;
     const client = {
-      promptAgentSessionWithSSE: vi.fn((req: { id: string }) => (async function* () { yield { body: chunk(7) }; })()),
-      loadAgentSessionWithSSE: vi.fn((req: { id: string }) => (async function* () {
-        yield { body: end(req.id, 'load-rid') };
-        yield { body: chunk(8) };
-        yield { body: end('1') };
-      })()),
+      callSSEApi: vi.fn(() => (async function* () { yield { event: { data: JSON.stringify(chunk(4)) }, statusCode: 200, headers: {} }; })()),
+      callApi: vi.fn(async () => ({ statusCode: 200, headers: { 'content-type': 'text/event-stream' }, body: Readable.from([
+        sse({ v: 1, type: 'stream_open', data: { sessionId: 'session', nativeSessionId: 'native-session', eventEpoch: 'epoch' } }),
+        sse(envelope(5, 'session_update', { sessionId: 'native-session', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'new' } } }), 5),
+        sse(envelope(6, 'turn_complete', { sessionId: 'native-session', stopReason: 'end_turn' }), 6),
+        sse(envelope(7, 'pending_prompt_completed', { sessionId: 'native-session' }), 7),
+        sse({ type: 'replay_complete', data: { replayedCount: 3, lastReplayedEventId: 7 } }),
+      ]) })),
     };
-    // 以真实生成的 Prompt id 构造原轮终态，避免依赖全局计数器。
-    client.loadAgentSessionWithSSE.mockImplementation(req => (async function* () {
-      yield { body: end(req.id, 'load-rid') }; const buffered = chunk(8); delete buffered.RequestId; yield { body: buffered };
-      yield { body: end(client.promptAgentSessionWithSSE.mock.calls[0]![0].id) };
-    })());
     const result = await collect(livePromptFrames({ client } as never, 'session', 'test'));
-    expect(client.promptAgentSessionWithSSE).toHaveBeenCalledOnce();
-    const request = client.loadAgentSessionWithSSE.mock.calls[0]![0] as any;
-    expect(request.toMap().Params.Meta).toEqual({ IsReload: true, BeginLogOffset: 7 });
-    expect(result).toHaveLength(3);
+    expect(client.callSSEApi).toHaveBeenCalledOnce(); expect(client.callApi).toHaveBeenCalledOnce();
+    const request = (client.callApi.mock.calls as unknown as unknown[][])[0]?.[1] as { query: object; headers: object };
+    expect(request.query).toEqual({ SessionCode: 'session', EventEpoch: 'epoch' });
+    expect(request.headers).toMatchObject({ 'Last-Event-Id': '4' });
+    expect(result).toHaveLength(3); expect(eventCursorOf(result.at(-1)!)).toEqual(cursor(6, 'turn_complete'));
+    expect(result[1]?.Params?.sessionId).toBe('session');
   });
 });

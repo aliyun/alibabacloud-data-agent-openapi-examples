@@ -47,6 +47,8 @@ export interface AppConfig {
   serverHost: string;
   /** 前端构建产物目录；存在则由本进程同源托管（单容器交付 UI+API）。 */
   webDist: string | undefined;
+  sessionAttachmentUpload?: boolean;
+  sessionAttachmentOssOrigin?: string;
 }
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
@@ -72,7 +74,15 @@ function num(raw: string | undefined, fallback: number): number {
 
 export function loadConfig(): AppConfig {
   loadEnvFile();
+  const cfg = readConfig();
+  if (!cfg.mock && (!cfg.accessKeyId || !cfg.accessKeySecret)) {
+    printMissingCredentials();
+    process.exit(1);
+  }
+  return cfg;
+}
 
+export function readConfig(): AppConfig {
   const mock = bool(process.env.MOCK);
   const accessKeyId = nonEmpty(process.env.ALIBABA_CLOUD_ACCESS_KEY_ID);
   const accessKeySecret = nonEmpty(process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET);
@@ -101,12 +111,9 @@ export function loadConfig(): AppConfig {
     securityToken: nonEmpty(process.env.ALIBABA_CLOUD_SECURITY_TOKEN),
     serverHost: nonEmpty(process.env.SERVER_HOST) ?? '127.0.0.1',
     webDist: nonEmpty(process.env.WEB_DIST) ?? path.join(REPO_ROOT, 'web', 'dist'),
+    sessionAttachmentUpload: bool(process.env.DAS_SESSION_ATTACHMENT_UPLOAD),
+    sessionAttachmentOssOrigin: nonEmpty(process.env.DAS_SESSION_ATTACHMENT_OSS_ORIGIN),
   };
-
-  if (!cfg.mock && (!cfg.accessKeyId || !cfg.accessKeySecret)) {
-    printMissingCredentials();
-    process.exit(1);
-  }
 
   return cfg;
 }
@@ -114,14 +121,14 @@ export function loadConfig(): AppConfig {
 /**
  * 选择要加载的 env 文件。
  *
- * 默认读 `.env`；设了 `DAS_ENV=<name>` 就改读 `.env.<name>`（例如 `DAS_ENV=beijing-pre`
- * 读 `.env.beijing-pre`），用来在多个上游环境（生产 / 预发 / 日常）之间切换而不动代码、
+ * 默认读 `.env`；设了 `DAS_ENV=<name>` 就改读 `.env.<name>`（例如 `DAS_ENV=staging`
+ * 读 `.env.staging`），用来在多个上游环境（生产 / 预发 / 日常）之间切换而不动代码、
  * 也不动 package.json——加一个新环境只需多放一个 `.env.<name>` 文件。
  *
  * 每个 env 文件都是**自包含**的（region / endpoint / 资源组 / 凭证各写一份），
  * 所以选中谁就只用谁，不做"基础 .env + 覆盖层"的叠加：叠加会让"我此刻到底在用哪份配置"
  * 变得说不清，而这正是切环境时最该确定的事。已经注入进程的环境变量
- * （`MOCK=1 DAS_ENV=beijing-pre npm run dev`）仍然优先于文件，单条命令临时改一个值照样生效。
+ * （`MOCK=1 DAS_ENV=staging npm run dev`）仍然优先于文件，单条命令临时改一个值照样生效。
  *
  * 指定了 DAS_ENV 却找不到对应文件就**直接退出，不静默回落到 `.env`**：
  * 回落等于让你以为在跑预发、其实打到了生产，是这套机制最该避免的失败形态。

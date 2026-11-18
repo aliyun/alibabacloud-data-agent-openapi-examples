@@ -17,12 +17,17 @@ function fixture(holdEvents = false) {
     const path = new URL(String(input)).pathname;
     paths.push(path);
     if (path.endsWith('/events')) {
-      // Real SDK SSE parser sees stream_open followed by EOF. It must wait for the owned HTTP request.
+      // The real SDK parser sees EOF/reconnect; the owned HTTP request remains independent.
       const opening = 'event: stream_open\ndata: {"v":1,"type":"stream_open","data":{}}\n\n';
+      let ended = false;
+      const signal = init?.signal;
+      let abort = () => {};
       const body = holdEvents ? new ReadableStream<Uint8Array>({ start(controller) {
         controller.enqueue(new TextEncoder().encode(opening));
-        closeEvents = () => controller.close();
-      } }) : opening;
+        abort = () => { if (!ended) { ended = true; controller.error(signal?.reason); } };
+        signal?.addEventListener('abort', abort, { once: true });
+        closeEvents = () => { if (!ended) { ended = true; signal?.removeEventListener('abort', abort); controller.close(); } };
+      }, cancel() { ended = true; signal?.removeEventListener('abort', abort); } }) : opening;
       return new Response(body,
         { headers: { 'content-type': 'text/event-stream' } });
     }
@@ -53,10 +58,11 @@ function fixture(holdEvents = false) {
 it.each([false, true])('local nonblocking abort (explicit Cancel=%s) publishes no failure or fabricated terminal and wakes EOF', async explicitCancel => {
   const f = fixture();
   const abort = new AbortController();
+  const eventAbort = new AbortController();
   const events: DaemonEvent[] = [];
   const store = createDaemonTranscriptStore();
   const consume = (async () => {
-    for await (const event of f.session.events()) {
+    for await (const event of f.session.events({ signal: eventAbort.signal })) {
       events.push(event);
       store.dispatch(normalizeDaemonEvent(event));
     }
@@ -65,12 +71,13 @@ it.each([false, true])('local nonblocking abort (explicit Cancel=%s) publishes n
   // Match WebShell Stop: abort local ownership, then explicitly call Cancel once.
   abort.abort();
   if (explicitCancel) await f.session.cancel();
-  await consume;
+  await expect.poll(() => f.streams[0]!.signal.aborted).toBe(true);
+  eventAbort.abort(); await consume;
   expect(f.streams[0]!.signal.aborted).toBe(true);
   expect(events.some(event => ['turn_error', 'turn_complete', 'prompt_cancelled'].includes(event.type))).toBe(false);
   expect(store.getSnapshot().blocks.some(block => block.kind === 'error')).toBe(false);
   const replay: DaemonEvent[] = [];
-  for await (const event of f.session.events()) replay.push(event);
+  for await (const event of f.session.events()) { replay.push(event); break; }
   expect(replay.some(event => event.promptId === admission.promptId)).toBe(false);
   expect(f.paths.filter(path => path.endsWith('/cancel'))).toHaveLength(explicitCancel ? 1 : 0);
   expect(f.paths.filter(path => path.endsWith('/prompt'))).toEqual(['/api/sessions/s/prompt']);
@@ -95,7 +102,8 @@ it.each(['upstream', 'unrequested AbortError'])('still reports %s failure to the
     sessionId: 's', clientId: 'waiter', workspaceCwd: '/fixture', attached: false,
   } });
   const events: DaemonEvent[] = [];
-  const consume = (async () => { for await (const event of session.events()) events.push(event); })();
+  const eventAbort = new AbortController();
+  const consume = (async () => { for await (const event of session.events({ signal: eventAbort.signal })) events.push(event); })();
   await expect.poll(() => events.length).toBe(1);
   const result = session.prompt(question);
   const rejected = expect(result).rejects.toThrow('real request failure');
@@ -105,7 +113,7 @@ it.each(['upstream', 'unrequested AbortError'])('still reports %s failure to the
     f.streams[0]!.controller.enqueue(new TextEncoder().encode('{"type":"error","error":{"message":"real request failure"}}\n'));
   } else f.streams[0]!.controller.error(new DOMException('real request failure', 'AbortError'));
   await rejected;
-  await consume;
+  eventAbort.abort(); await consume;
   expect(events.filter(event => event.type === 'turn_error')).toHaveLength(1);
   expect(f.streams[0]!.signal.aborted).toBe(false);
   expect(f.paths.filter(path => path.endsWith('/prompt'))).toHaveLength(1);

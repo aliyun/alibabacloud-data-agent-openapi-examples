@@ -19,7 +19,7 @@ const ASK_FRAME: AcpFrame = {
   Params: {
     kind: 'permission_request',
     data: {
-      requestId: '56bb881d-97dd-4724-ac43-03cb7a564a5c',
+      requestId: '00000000-0000-4000-8000-000000000005',
       sessionId: '00000000-0000-4000-8000-000000000001',
       toolCall: {
         _meta: {
@@ -56,7 +56,7 @@ const ASK_FRAME: AcpFrame = {
     },
     _meta: { offset: 12 },
   },
-  RequestId: '0b33d9d2-6ec1-4a2f-9d13-2f0f0b9f6b1a',
+  RequestId: '00000000-0000-4000-8000-000000000003',
   Timestamp: 1789635950330,
 };
 
@@ -64,7 +64,7 @@ describe('pendingInteractionOf — 人卡请求帧解析', () => {
   it('从 _qwen/notify permission_request 帧提取 requestId / toolName / interactionKind', () => {
     const interaction = pendingInteractionOf(ASK_FRAME);
     expect(interaction).toBeDefined();
-    expect(interaction?.requestId).toBe('56bb881d-97dd-4724-ac43-03cb7a564a5c');
+    expect(interaction?.requestId).toBe('00000000-0000-4000-8000-000000000005');
     expect(interaction?.sessionId).toBe('00000000-0000-4000-8000-000000000001');
     expect(interaction?.toolName).toBe('ask_user_question');
     expect(interaction?.interactionKind).toBe('user_question');
@@ -121,10 +121,10 @@ describe('permissionResolvedOf — 回覆采纳回执', () => {
       Method: '_qwen/notify',
       Params: {
         kind: 'permission_resolved',
-        data: { requestId: '56bb881d-97dd-4724-ac43-03cb7a564a5c', outcome: { outcome: 'selected', optionId: 'proceed_once' } },
+        data: { requestId: '00000000-0000-4000-8000-000000000005', outcome: { outcome: 'selected', optionId: 'proceed_once' } },
       },
     };
-    expect(permissionResolvedOf(frame)).toEqual({ requestId: '56bb881d-97dd-4724-ac43-03cb7a564a5c' });
+    expect(permissionResolvedOf(frame)).toEqual({ requestId: '00000000-0000-4000-8000-000000000005' });
     expect(permissionResolvedOf(ASK_FRAME)).toBeUndefined();
   });
 });

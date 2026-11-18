@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DaemonClient, DaemonSessionClient } from '@qwen-code/sdk/daemon';
-import { installOpenApiSessionCreation } from '../src/session-client';
+import { installOpenApiSessionCreation, installSessionLoadNotice } from '../src/session-client';
 
 const session = {
   sessionId: 'openapi-real-session-id', clientId: 'client-id', workspaceCwd: '/data-agent',
@@ -8,6 +8,41 @@ const session = {
   projectlessOutputDirectory: '/data-agent/out/openapi-real-session-id', workingDirectory: { state: 'ready' },
 };
 afterEach(() => vi.unstubAllGlobals());
+
+it.each(['createStandaloneSession', 'loadStandaloneSession', 'resumeStandaloneSession'] as const)(
+  'treats only the OpenAPI placeholder as an unknown output root after SDK %s validation', async method => {
+    let outputDirectory = session.projectlessOutputDirectory;
+    vi.stubGlobal('fetch', vi.fn(async input => Response.json(String(input).endsWith('/capabilities')
+      ? { v: 1, features: ['standalone_sessions_v1'] }
+      : { ...session, projectlessOutputDirectory: outputDirectory, state: {}, compactedReplay: [], liveJournal: [] })));
+    const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+    const restore = installOpenApiSessionCreation(client, 'http://localhost/d');
+    const read = () => method === 'createStandaloneSession' ? client[method]() : client[method](session.sessionId);
+    try {
+      expect((await read()).projectlessOutputDirectory).toBe('');
+      for (outputDirectory of ['/remote/real-output', '/data-agent/out/another-session']) {
+        expect((await read()).projectlessOutputDirectory).toBe(outputDirectory);
+      }
+    } finally { restore(); client.dispose(); }
+  },
+);
+
+it.each(['loadStandaloneSession', 'resumeStandaloneSession'] as const)(
+  'keeps SDK wire validation and unadapted directory handling for %s', async method => {
+    let outputDirectory = session.projectlessOutputDirectory;
+    vi.stubGlobal('fetch', vi.fn(async input => Response.json(String(input).endsWith('/capabilities')
+      ? { v: 1, features: ['standalone_sessions_v1'] }
+      : { ...session, projectlessOutputDirectory: outputDirectory, state: {}, compactedReplay: [], liveJournal: [] })));
+    const adapted = new DaemonClient({ baseUrl: 'http://localhost/d' });
+    const unadapted = new DaemonClient({ baseUrl: 'http://localhost/native' });
+    const restore = installOpenApiSessionCreation(adapted, 'http://localhost/d');
+    try {
+      expect((await unadapted[method](session.sessionId)).projectlessOutputDirectory).toBe(outputDirectory);
+      outputDirectory = '';
+      await expect(adapted[method](session.sessionId)).rejects.toThrow(/projectlessOutputDirectory/);
+    } finally { restore(); adapted.dispose(); unadapted.dispose(); }
+  },
+);
 
 describe('OpenAPI session creation with the actual SDK', () => {
   it('retains the server ID and uses it for subsequent SDK prompt requests', async () => {
@@ -143,4 +178,22 @@ it.each([
   try {
     await expect(client.getStandaloneSession('session-id')).rejects.toThrow('lookup denied (requestId=POP-lookup)');
   } finally { restore(); client.dispose(); }
+});
+
+
+it('exposes load failure without swallowing it and clears the notice after recovery', async () => {
+  const client = new DaemonClient({ baseUrl: 'http://localhost/d' });
+  const original = vi.spyOn(client, 'loadStandaloneSession')
+    .mockRejectedValueOnce(new Error('upstream timeout'))
+    .mockResolvedValueOnce({ ...session } as any);
+  const notify = vi.fn();
+  const restore = installSessionLoadNotice(client, notify);
+  await expect(client.loadStandaloneSession('test-session')).rejects.toThrow('upstream timeout');
+  expect(notify.mock.calls[0]?.[0]).toMatchObject({ sessionId: 'test-session', message: expect.stringContaining('加载失败') });
+  expect(original).toHaveBeenCalledWith('test-session', { timeoutMs: 35_000 }, undefined);
+  await client.loadStandaloneSession('test-session');
+  expect(notify).toHaveBeenLastCalledWith({ sessionId: 'test-session' });
+  restore();
+  expect(client.loadStandaloneSession).toBe(original);
+  client.dispose();
 });

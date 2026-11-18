@@ -52,6 +52,7 @@ public class PromptApiController {
         this.inflight = inflight;
     }
 
+
     /**
      * 返回 ResponseEntity 的提前返回都是"还没碰到上游"的校验失败（普通 JSON）；
      * 一旦决定进流，就直接在请求线程上写 HttpServletResponse——
@@ -92,7 +93,7 @@ public class PromptApiController {
         }
 
         Acquired acquired = null;
-        if (live == null) {
+        if (cfg.mock()) {
             AcquireResult acquire = inflight.tryAcquire(sessionId);
             if (acquire instanceof Inflight.Rejected rejected) { source.close(); return json(rejected.error()); }
             acquired = (Acquired) acquire;
@@ -227,7 +228,7 @@ public class PromptApiController {
         List<String> popRequestIds,
         Acquired acquired
     ) throws IOException {
-        Pipeline pipeline = new Pipeline(sessionId, live == null, System.currentTimeMillis());
+        Pipeline pipeline = new Pipeline(sessionId, cfg.mock(), System.currentTimeMillis());
         java.util.concurrent.ArrayBlockingQueue<Object> events = new java.util.concurrent.ArrayBlockingQueue<>(128);
         java.util.concurrent.atomic.AtomicBoolean disconnected = new java.util.concurrent.atomic.AtomicBoolean();
 

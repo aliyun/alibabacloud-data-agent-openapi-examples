@@ -120,7 +120,7 @@ public final class MockFixtures {
             "error-concurrent-rejected.jsonl", "load-clean.jsonl", null, 1,
             "同一会话同时只能跑一轮，第二次请求被服务端直接拒绝", 1_788_276_326_000L, null),
         new MockScenario(ACK, "[MOCK] prompt 不派发 · 零帧 · 只有 POP 回执",
-            null, null, "0dd3b146c75bf132a65efa7a3080e7cd", 0,
+            null, null, "0123456789abcdef0123456789abcdef", 0,
             "prompt 根本没派发：只有 POP 回执、零帧；与断流不同，任务没在跑", 1_789_483_174_000L, null),
         new MockScenario("mock-permission", "[MOCK] 人卡交互 · 弹卡 + 回覆",
             "prompt-permission.jsonl", "load-clean.jsonl", null, 3,

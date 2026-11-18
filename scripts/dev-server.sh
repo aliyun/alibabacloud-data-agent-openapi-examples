@@ -5,7 +5,7 @@
 #   ./scripts/dev-server.sh <node|python|java> [环境变量先行照常生效]
 #
 #   MOCK=1 ./scripts/dev-server.sh java                     # MOCK 回放（免凭证预览）
-#   DAS_ENV=beijing-pre ./scripts/dev-server.sh python      # 选上游环境（.env.beijing-pre）
+#   DAS_ENV=staging ./scripts/dev-server.sh python      # 选上游环境（.env.staging）
 #
 # 三个实现都读仓库根同一份 .env（DAS_ENV 规则一致），都从 PORT（默认 3000）起服务。
 # 同时启动前端请用 npm start -- <node|python|java>。

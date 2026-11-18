@@ -16,19 +16,42 @@ function event(id, text, type = 'session_update') {
 }
 function sse(value, outer = value.id) { return `${outer === undefined ? '' : `id: ${outer}\n`}data: ${JSON.stringify(value)}\n\n`; }
 async function fixture(scenario = 'ok') {
+  const attachmentLimit = scenario === 'attachments-10' ? 10 * 1024 * 1024
+    : scenario === 'attachments' ? 8 * 1024 * 1024 : undefined;
   const state = { memory: '', answer: '', events: [], subscribers: new Set(), calls: [], ownedDone: 0, deleted: false, title: '', archived: false };
   const servers = [];
   const start = async label => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, 'http://localhost');
+      const upload = url.pathname === '/d/openapi/sessions/sid/attachments';
+      if (upload && attachmentLimit && Number(req.headers['content-length']) > attachmentLimit) {
+        state.calls.push({ label, method: req.method, url: req.url });
+        res.writeHead(413, { connection: 'close' }).end();
+        return;
+      }
       const chunks = []; for await (const chunk of req) chunks.push(chunk);
-      const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined;
+      const raw = Buffer.concat(chunks);
+      const body = upload ? undefined : chunks.length ? JSON.parse(raw) : undefined;
       state.calls.push({ label, method: req.method, url: req.url, body, after: req.headers['last-event-id'] });
       const json = value => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value)); };
       if (url.pathname === '/api/health') return json({ ok: true, result: { mock: false, region: 'test-region' } });
-      if (url.pathname === '/d/openapi/session-options') return json({ agentName: 'test-agent' });
+      if (url.pathname === '/d/openapi/session-options') return json({ agentName: 'test-agent',
+        ...(attachmentLimit ? { attachmentMaxBytes: attachmentLimit } : {}) });
+      if (upload && attachmentLimit) {
+        const id = 'a'.repeat(32);
+        const name = req.headers['x-attachment-name'];
+        const relativePath = `upload/sid_${id}${path.extname(name)}`;
+        if (name !== 'probe.csv') assert.equal(raw.length, attachmentLimit);
+        if (name.endsWith('.csv')) state.attachment = { relativePath, content: raw.subarray(0, 64).toString() };
+        res.statusCode = 201;
+        return json({ id, relativePath, size: raw.length });
+      }
       if (url.pathname === '/d/standalone/sessions' && req.method === 'POST') return json({ sessionId: 'sid' });
-      if (url.pathname === '/api/sessions') return json({ result: { sessions: state.deleted || state.archived ? [] : [{ sessionId: 'sid', title: state.title }] } });
+      if (url.pathname === '/api/sessions') {
+        assert.equal(url.searchParams.get('sessionId'), 'sid');
+        const archived = url.searchParams.get('archived') === 'true';
+        return json({ result: { sessions: state.deleted || Boolean(state.archived) !== archived ? [] : [{ sessionId: 'sid', title: state.title }] } });
+      }
       if (url.pathname === '/d/standalone/sessions' && req.method === 'GET') return json({ sessions: state.archived ? [{ sessionId: 'sid' }] : [] });
       if (url.pathname.endsWith('/load')) return json({ compactedReplay: [event(1, state.answer)], liveJournal: [] });
       if (url.pathname.endsWith('/cancel')) { res.writeHead(204); return res.end(); }
@@ -50,7 +73,14 @@ async function fixture(scenario = 'ok') {
         assert.equal(typeof body.text, 'string');
         const followup = body.text.includes('FOLLOWUP_');
         let answer;
-        if (!followup) { state.memory = body.text.match(/WB_[a-f0-9]+/)[0]; answer = state.memory; }
+        if (!followup) {
+          if (attachmentLimit) {
+            assert.ok(body.text.includes(`@${state.attachment.relativePath}`));
+            assert.ok(!body.text.includes('WB_'), 'the witness must come from the uploaded file');
+            state.memory = state.attachment.content.split('\n')[1];
+          } else state.memory = body.text.match(/WB_[a-f0-9]+/)[0];
+          answer = state.memory;
+        }
         else {
           assert.ok(!body.text.includes(state.memory), 'follow-up Prompt must not repeat the memory marker');
           answer = `${body.text.match(/FOLLOWUP_[a-f0-9]+/)[0]}:${state.memory}`;
@@ -100,6 +130,22 @@ async function execute(scenario, hook, extra = {}) {
     return { ...result, state: f.state };
   } finally { await f.cleanup(); if (result) fs.rmSync(result.output, { recursive: true, force: true }); }
 }
+
+test('attachment journey uploads at the byte limit and recovers the marker from the CSV', async () => {
+  const { report, state } = await execute('attachments', undefined, { attachments: true });
+  assert.equal(report.status, 'PASS');
+  assert.equal(report.attachmentMaxBytes, 8 * 1024 * 1024);
+  assert.equal(state.calls.filter(call => call.url.endsWith('/attachments')).length, 3);
+  assert.equal(state.deleted, true);
+});
+
+test('10 MiB journey recovers the marker from the exact-limit file itself', async () => {
+  const { report, state } = await execute('attachments-10', undefined, { attachments: true, 'attachment-max-mib': '10' });
+  assert.equal(report.status, 'PASS');
+  assert.equal(report.attachmentMaxBytes, 10 * 1024 * 1024);
+  assert.equal(state.calls.filter(call => call.url.endsWith('/attachments')).length, 2);
+  assert.equal(state.deleted, true);
+});
 
 test('dual-server journey requires both streams, alternates Prompt/Events, renames cross-server and deletes once', async () => {
   const { report, state } = await execute('ok');

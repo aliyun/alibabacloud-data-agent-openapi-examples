@@ -19,8 +19,6 @@ import {
   LoadAgentSessionRequest,
   LoadAgentSessionRequestParams,
   LoadAgentSessionRequestParamsMeta,
-  PromptAgentSessionRequest,
-  PromptAgentSessionRequestParams,
   PromptAgentSessionRequestParamsPrompt,
   ReplyAgentSessionRequest,
   ReplyAgentSessionRequestParams,
@@ -38,6 +36,7 @@ import {
   popAckRequestId,
   reduceHistory,
   type AcpFrame,
+  type EventCursor,
   type ApiResult,
   type ArtifactsResult,
   type CancelResult,
@@ -57,7 +56,8 @@ import type { AppConfig } from './config.js';
 import { recoverPromptFrames } from './prompt-recovery.js';
 import { readLoadSnapshot } from './load-recovery.js';
 import { sessionOptions, type SessionCreationOptions } from './session-options.js';
-import { callOpenApi } from './openapi.js';
+import { callOpenApi, openPromptEvents } from './openapi.js';
+import { remoteEvents, invalidReplay } from './daemon/remote-events.js';
 import { headerRequestId, missingResultError, readNonStreamBody, toApiError } from './normalize.js';
 import { SdkError, runtimeFor, runtimeForSse, type SdkClient } from './sdk.js';
 import { trackedSse, type StreamTraceScope } from './stream-diagnostics.js';
@@ -116,6 +116,7 @@ function nextRpcId(): string {
 /** 列表分页的硬上限。上游没承诺页数收敛，不设上限等于把死循环的可能留给线上。 */
 const MAX_PAGES = 10;
 const PAGE_SIZE = 100;
+const SESSION_PAGE_SIZE = 10;
 
 // ---------------------------------------------------------------------------
 // 会话
@@ -246,11 +247,32 @@ export async function liveCreateSession(ctx: LiveContext, mode: SessionMode | Se
   }
 }
 
-export async function liveListSessions(ctx: LiveContext, archived = false): Promise<ApiResult<SessionsResult>> {
+/** UI pagination must not wait for a complete directory scan behind the ingress timeout. */
+export async function liveListSessionPage(ctx: LiveContext, archived: boolean, size: number, cursor?: string): Promise<ApiResult<{ sessions: SessionSummary[]; nextCursor?: string }>> {
+  const api = 'ListAgentSessions';
+  try {
+    const response = await callOpenApi(ctx.client, api, {
+      AgentName: ctx.cfg.agentName, SessionSourceList: [ctx.cfg.sessionSource], Archived: archived,
+      MaxResults: size, ...(cursor ? { NextToken: cursor } : {}),
+    });
+    const body = readNonStreamBody(response);
+    if (!body.result) return { ok: false, error: missingResultError(api, body) };
+    const rows = body.result.agentSessions;
+    return { ok: true, result: {
+      sessions: Array.isArray(rows) ? rows.map(toSessionSummary).filter((row): row is SessionSummary => !!row) : [],
+      ...(str(body.result.nextToken) ? { nextCursor: str(body.result.nextToken) } : {}),
+    } };
+  } catch (error) {
+    return { ok: false, error: toApiError(error, api) };
+  }
+}
+
+export async function liveListSessions(ctx: LiveContext, archived = false, sessionId?: string,
+  pageRequest?: { size?: number; cursor?: string }): Promise<ApiResult<SessionsResult & { nextCursor?: string }>> {
   const api = 'ListAgentSessions';
   try {
     const collected: SessionSummary[] = [];
-    let nextToken: string | undefined;
+    let nextToken = pageRequest?.cursor;
     let totalCount: number | undefined;
     let truncated = false;
 
@@ -265,7 +287,8 @@ export async function liveListSessions(ctx: LiveContext, archived = false): Prom
             AgentName: ctx.cfg.agentName,
             SessionSourceList: [ctx.cfg.sessionSource],
             Archived: archived,
-            MaxResults: PAGE_SIZE,
+            MaxResults: Math.min(pageRequest?.size ?? SESSION_PAGE_SIZE, SESSION_PAGE_SIZE),
+            ...(sessionId ? { SessionId: sessionId } : {}),
             ...(nextToken ? { NextToken: nextToken } : {}),
       });
 
@@ -282,7 +305,7 @@ export async function liveListSessions(ctx: LiveContext, archived = false): Prom
       }
 
       nextToken = str(body.result.nextToken);
-      if (!nextToken) break;
+      if (!nextToken || pageRequest) break;
       if (page === MAX_PAGES - 1) {
         truncated = true;
         ctx.log?.warn({ pages: MAX_PAGES, collected: collected.length }, '会话列表达到分页上限，结果可能不完整');
@@ -303,6 +326,7 @@ export async function liveListSessions(ctx: LiveContext, archived = false): Prom
         filteredOut: Math.max(0, (totalCount ?? collected.length) - collected.length),
         total: totalCount ?? collected.length,
         truncated,
+        ...(pageRequest && nextToken ? { nextCursor: nextToken } : {}),
       },
     };
   } catch (err) {
@@ -703,32 +727,68 @@ export async function* livePromptFrames(
   const id = nextRpcId();
   try { yield* recoverPromptFrames(
     { id, frames: initialPromptFrames(ctx, sessionId, outboundText, id, acks, scope) },
-    (offset, timeoutMs) => {
-      const loadId = nextRpcId();
-      return { id: loadId, frames: liveLoadStream(ctx, sessionId, loadId, offset, timeoutMs, scope) };
-    },
-    error => toApiError(error, 'LoadAgentSession').kind === 'transport',
-    { onResume: (offset, attempt) => ctx.log?.info({ sessionId, offset, attempt }, 'prompt_stream_resume') },
+    (cursor, timeoutMs) => ({ id, frames: resumedPromptFrames(ctx, sessionId, id, cursor, timeoutMs, scope) }),
+    error => toApiError(error, 'GetAgentSessionEvents').kind === 'transport',
+    { sessionId, onResume: (cursor, attempt) => ctx.log?.info({ sessionId, eventId: cursor.eventId, attempt }, 'prompt_stream_resume') },
   ); } catch (error) {
     const api = toApiError(error, 'PromptAgentSession');
     throw new SdkError(scope.current ? scope.current.withError(api) : api);
   }
 }
 
+async function* resumedPromptFrames(ctx: LiveContext, sessionId: string, id: string, cursor: EventCursor,
+  timeoutMs: number, scope: StreamTraceScope): AsyncGenerator<AcpFrame> {
+  delete scope.current;
+  const signal = AbortSignal.timeout(timeoutMs);
+  let receipt = false;
+  let held: AcpFrame | undefined;
+  const events = remoteEvents(ctx, sessionId, cursor.eventId, cursor.eventEpoch, { signal, timeoutMs,
+    onOpen: (_identity, requestId) => { scope.current = { requestId: () => requestId,
+      withError: error => withRequestId(error, requestId, !!requestId) }; } });
+  for await (const event of events) {
+    if (event.type === 'stream_open' || event.type === 'slow_client_warning') continue;
+    if (event.type === 'replay_complete') {
+      receipt = true;
+      if (held) { yield held; return; }
+      continue;
+    }
+    const promptId = event.promptId ?? event.data.promptId;
+    if (promptId !== cursor.promptId) continue;
+    if (held) {
+      if (event.type !== 'pending_prompt_completed') throw invalidReplay();
+      continue;
+    }
+    if (event.id === undefined) throw invalidReplay();
+    const frame: AcpFrame = { Jsonrpc: '2.0', _meta: { ...event._meta, eventCursor: {
+      sessionId, eventEpoch: cursor.eventEpoch, eventId: String(event.id), promptId: cursor.promptId, eventType: event.type } } };
+    if (event.type === 'turn_complete') { frame.Id = id; frame.Result = event.data; }
+    else if (event.type === 'turn_error') { frame.Id = id; frame.Error = { code: -32000,
+      errorCode: typeof event.data.code === 'string' ? event.data.code : 'NATIVE_TURN_FAILED',
+      message: typeof event.data.message === 'string' ? event.data.message : '原生执行失败', data: event.data }; }
+    else { frame.Method = event.type === 'session_update' ? 'session/update' : '_qwen/notify';
+      frame.Params = event.type === 'session_update' ? event.data : { kind: event.type, data: event.data }; }
+    if (frame.Result || frame.Error) {
+      if (!receipt) held = frame;
+      else { yield frame; return; }
+    } else yield frame;
+  }
+}
+
 async function* initialPromptFrames(ctx: LiveContext, sessionId: string, outboundText: string,
   id: string, acks: string[] | undefined, scope: StreamTraceScope): AsyncGenerator<AcpFrame> {
   delete scope.current;
-  const tracked = trackedSse(ctx.client, receiver => receiver.promptAgentSessionWithSSE(
-    new PromptAgentSessionRequest({
-      id,
-      jsonrpc: JSONRPC_VERSION,
-      params: new PromptAgentSessionRequestParams({
-        sessionId,
-        prompt: [new PromptAgentSessionRequestParamsPrompt({ type: 'text', text: outboundText })],
-      }),
-    }),
-    runtimeForSse(),
-  ));
+  const attachments = ctx.cfg?.sessionAttachmentUpload ? new Set(
+    Array.from(outboundText.matchAll(/(?:^|\s)@(upload\/([A-Za-z0-9_-]{1,128})_[a-f0-9]{32}(?:\.[A-Za-z0-9]{1,12})?)(?=\s|$)/g))
+      .filter(match => match[2] === sessionId)
+      .map(match => match[1]!),
+  ) : [];
+  const prompt = [new PromptAgentSessionRequestParamsPrompt({ type: 'text', text: outboundText })];
+  for (const relativePath of attachments) {
+    prompt.push(new PromptAgentSessionRequestParamsPrompt({
+      type: 'resource_link', name: relativePath.slice('upload/'.length), uri: `dataagent-attachment:${relativePath}`,
+    }));
+  }
+  const tracked = trackedSse(ctx.client, receiver => openPromptEvents(receiver, sessionId, outboundText, id, prompt));
   scope.current = tracked;
 
   let unrecognized = 0;

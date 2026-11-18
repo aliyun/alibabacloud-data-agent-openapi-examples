@@ -49,17 +49,17 @@ Agent 默认名为 `dataworks_data_agent`，环境变量 `DATAAGENT_AGENT_NAME` 
 
 LIVE 只使用 `POST /api/sessions/{id}/prompt`、body `{text}`，返回 UTF-8 NDJSON。参数校验后立即 flush 响应 headers，不等待模型首帧；HTTP 200 表示流已建立，不能单独当作 POP 已执行成功。浏览器持续消费自己请求的 `meta/frame/done/error`，按有效 `done.stopReason` 或 `error` 结算自己的 UI 请求；页面内容来自独立的远端 Events 订阅，不重复渲染 NDJSON 内容。
 
-每个连接独立持有帧处理、rid/offset、只读恢复和有界输出队列；LIVE 不使用全局 inflight 锁。多个提交的业务准入交由 POP 判定。恢复只读当前轮次的远端 Load，并过滤其他轮次/Load 自身终态，不重发 Prompt。无真实终态的 EOF（含零帧/ACK-only）是 `stream_break`，结果未知；未知 stopReason 不能产生成功 done。客户端断开会关闭本地读取并释放连接资源，不自动 Cancel。需要取消时显式调用 cancel 端点。
+每个连接独立持有读取和恢复预算，不使用全局 inflight 锁。Prompt 断流仅凭完整已消费帧的 `_meta.eventCursor` 只读续接 Events，验证 epoch、排他连续编号、promptId 和 replay_complete 后接受原轮次终态。不拼接 Load，不重发 Prompt；无可信证明或协议损坏明确失败，未知 stopReason 不产生成功 done。客户端断开释放本地连接，不自动 Cancel。
 
 旧 LIVE `POST /d/session/{id}/prompt`（202 后台提交）和 `POST /d/session/{id}/openapi-prompt/{promptId}/receipt` 均返回 410。没有本地 admission/completion/receipt 缓存或额外控制事件，也没有跨实例 waiter 状态。MOCK 保留原来的 daemon 202、journal 和演示准入锁。
 
 ### 远端事件和权威状态
 
-LIVE `/d/session/{id}/events` 直接以路径 SID 调用 POP `GetAgentSessionEvents`：query 为 `SessionCode`，游标只读取 `Last-Event-Id` header。显式 `0` 原样上送，缺省 header 表示没有续接游标；不会从 Load、本地 Map 或其他连接补 cursor。保留现有 POP `{Id,Event,Data,RequestId}` 解包、daemon 事件展开、UTF-8、id/event/cursor 校验、跨 session 拒绝和业务 Error 拒绝；不生成本地 terminal。允许 idless `stream_open`，跳过 ACKRequestId-only 控制帧。首帧前失败为 502，响应开始后失败终止流。
+LIVE `/d/session/{id}/events` 以路径 SID 调用 POP GetAgentSessionEvents，传递 SessionCode、Last-Event-Id 和 EventEpoch；显式0保留，不从历史或本地状态补游标。epoch 只取真实上游响应头或 stream_open；严格订阅缺失或不匹配时在输出事件前失败。保留远端事件号和工具载荷，拒绝跨会话数据，不生成本地 terminal。允许独立 retry 控制帧以及无事件号的 replay_complete，不推进内容游标。首帧前失败为502，开始后失败终止流。断流恢复使用 NativeEvents 校验原生 identity、连续编号和回放 receipt 后接受原轮次终态；普通 Events 转发兼容没有 receipt 的线上旧链路。UI 关闭乐观用户副本，每端原生 echo 各显示一份。
 
 LIVE 不构造 Registry/Runner，也不保存 session summary、creation options、pending/resolved permission、deleted/archived 标记或历史。列表直接取 POP；单会话 lookup 用 SDK 的精确 `SessionId` 过滤查询 active/archived。rename/archive/delete 只以远端操作结果确认，随后读取的标题/归档状态仍取远端，不用本地覆盖掩盖读回结果。批量失败逐项返回 errors。
 
-Load、resume、transcript 每次都读取本次远端历史，转换为临时响应；Load 返回 idless `compactedReplay`、空 `liveJournal`、未知模型 `{currentModelId:null,availableModels:[]}`。未提供已核验的快照水位时省略 `lastEventId`。eventEpoch 稳定使用 region/session，不随进程重启改变。adapter workspace 等必需协议字段不代表远端文件系统观测；未观测到的状态/时间不合成缓存事实。
+Load、resume、transcript 每次读取远端历史，返回 idless compactedReplay、空 liveJournal、未知模型配置；无已核验快照水位时省略 lastEventId。eventEpoch 只取原生响应头或 stream_open，Load 不生成替代 epoch。adapter workspace 等协议字段不代表远端文件系统观测。
 
 permission 必须有路径 SID，每次直接调用 POP 验证，不能凭本地缓存判断已处理；UI-only answers sentinel 会被移除。无 SID 的 legacy permission 返回 404。session/daemon status 无可靠远端数据时返回 404 降级，heartbeat 返回空 204；两者均不会触发 Prompt、重发或 Cancel。远端内容、历史和权限在跨 server/重启后仍由 POP 决定。Load/Events 没有已核验的原子快照订阅协议，本示例不宣称关闭该 gap。
 
@@ -67,9 +67,9 @@ Cancel 保留兼容：现代响应明确 Delivered/Noop 为 true，或旧响应�
 
 ## SDK 覆盖与本地验证
 
-使用官方异步 SDK `com.aliyun:alibabacloud-dataworks_public20240518:10.0.0`。创建会话、改名、列表使用生成式 `AsyncClient` 方法，Prompt/Load 使用生成式 SSE 方法。需要保留原始响应的操作通过官方 `BaseClientBuilder` / `TeaAsyncHandler` 扩展接口调用。Events GET 使用 SDK 签名及字节流传输。
+使用官方异步 SDK `com.aliyun:alibabacloud-dataworks_public20240518:10.0.2`。创建会话、改名、列表使用生成式 `AsyncClient` 方法，Prompt/Load 使用生成式 SSE 方法。需要保留原始响应的操作通过官方 `BaseClientBuilder` / `TeaAsyncHandler` 扩展接口调用。Events GET 使用 SDK 签名及字节流传输。
 
-按 Java 异步 SDK 10.0.0 的 JAR 核对：
+按 Java 异步 SDK 10.0.2 的 JAR 核对：
 
 | 能力 | 正式 SDK 模型与本示例调用方式 |
 | --- | --- |

@@ -66,6 +66,7 @@ public final class LiveClient implements AutoCloseable {
     /** 列表分页的硬上限。上游没承诺页数收敛，不设上限等于把死循环留给线上。 */
     private static final int MAX_PAGES = 10;
     private static final int PAGE_SIZE = 100;
+    private static final int SESSION_PAGE_SIZE = 10;
 
     private final AsyncClient rest;
     private final AsyncClient sse;
@@ -242,6 +243,7 @@ public final class LiveClient implements AutoCloseable {
     }
 
     public RemoteEventStream events(String id, String cursor) { return pop.events(id, cursor); }
+    public RemoteEventStream events(String id, String cursor, String epoch) { return pop.events(id, cursor, epoch); }
 
     private static String responseRequestId(Object bodyId, Map<String, String> headers) {
         String id = ApiError.validRequestId(bodyId);
@@ -346,7 +348,7 @@ public final class LiveClient implements AutoCloseable {
         int total = 0;
         boolean truncated = false;
         for (int page = 0; page < MAX_PAGES; page++) {
-            var params = ListAgentSessionsRequest.Params.builder().maxResults(PAGE_SIZE).archived(archived).nextToken(next);
+            var params = ListAgentSessionsRequest.Params.builder().maxResults(SESSION_PAGE_SIZE).archived(archived).nextToken(next);
             if (sessionId == null) params.agentName(agentName != null ? agentName : cfg.agentName()).sessionSourceList(List.of(cfg.sessionSource()));
             else {
                 params.sessionId(sessionId);
@@ -568,7 +570,7 @@ public final class LiveClient implements AutoCloseable {
 
     /** 历史快照总预算30秒，最多3次只读拉取；完整Load回执前不返回半份历史。 */
     public List<Map<String, Object>> loadFrames(String sessionId) throws Exception {
-        return LoadSnapshotReader.read(remainingMs -> openLoadStream(sessionId, null),
+        return LoadSnapshotReader.read(remainingMs -> openLoadStream(sessionId),
             Constants.HISTORY_READ_TIMEOUT_MS, 3, 250);
     }
 
@@ -592,8 +594,7 @@ public final class LiveClient implements AutoCloseable {
         String api = "PromptAgentSession";
         String promptId = java.util.UUID.randomUUID().toString();
         try {
-            ResponseIterable<com.aliyun.sdk.service.dataworks_public20240518.models.PromptAgentSessionResponseBody> iterable =
-                sse.promptAgentSessionWithResponseIterable(
+            RawSse raw = new RawSse(pop.prompt(
                     PromptAgentSessionRequest.builder()
                         .id(promptId)
                         .jsonrpc(JSONRPC_VERSION)
@@ -604,23 +605,63 @@ public final class LiveClient implements AutoCloseable {
                                 .text(outboundText)
                                 .build()))
                             .build())
-                        .build());
-            return new RecoveringPromptStream(promptId,
-                RecoveringPromptStream.wrap(new SdkSseStream(api, iterable.iterator(), iterable::getStatusCode, iterable::getHeaders)),
-                (offset, remainingMs) -> openLoadStream(sessionId, offset));
+                        .build()));
+            RecoveringPromptStream.Source initial = new RecoveringPromptStream.Source() {
+                public String next(long timeout) throws Exception { var frame = raw.next(timeout); return frame == null ? null : frame.data(); }
+                public String requestId() { return raw.requestId(); }
+                public void close() { raw.close(); }
+            };
+            return new RecoveringPromptStream(promptId, sessionId, initial,
+                (cursor, remainingMs) -> openEventsPrompt(sessionId, promptId, cursor, remainingMs), 3, 600_000, 250);
         } catch (Exception e) {
             throw toDas(e, api);
         }
     }
-    /** 在途 Load 必须流式消费；调用方用剩余恢复预算限制每次 next。 */
-    private RecoveringPromptStream.Source openLoadStream(String sessionId, Long offset) throws Exception {
+    private RecoveringPromptStream.Source openLoadStream(String sessionId) throws Exception {
         String loadId = nextRpcId();
         var iterable = sse.loadAgentSessionWithResponseIterable(LoadAgentSessionRequest.builder()
-            .id(loadId).jsonrpc(JSONRPC_VERSION)
-            .params(LoadAgentSessionRequest.Params.builder().sessionId(sessionId)
-                .meta(LoadAgentSessionRequest.Meta.builder().isReload(true).beginLogOffset(offset).build())
-                .build()).build());
+            .id(loadId).jsonrpc(JSONRPC_VERSION).params(LoadAgentSessionRequest.Params.builder().sessionId(sessionId)
+                .meta(LoadAgentSessionRequest.Meta.builder().isReload(true).build()).build()).build());
         return RecoveringPromptStream.wrap(new SdkSseStream("LoadAgentSession", iterable.iterator(), iterable::getStatusCode, iterable::getHeaders), loadId);
+    }
+
+    private RecoveringPromptStream.Source openEventsPrompt(String sessionId, String rpcId, EventCursor cursor, long remainingMs) throws Exception {
+        NativeEvents events = new NativeEvents(pop.events(sessionId, cursor.eventId(), cursor.eventEpoch()), sessionId, cursor.eventId(), cursor.eventEpoch(), remainingMs);
+        return resumeSource(events, sessionId, rpcId, cursor);
+    }
+    static RecoveringPromptStream.Source resumeSource(NativeEvents events, String sessionId, String rpcId, EventCursor cursor) {
+        return new RecoveringPromptStream.Source() {
+            boolean receipt;
+            Map<String, Object> held;
+            public String requestId() { return events.requestId(); }
+            public String next(long timeout) throws Exception {
+                long deadline = System.nanoTime()+Math.max(1, timeout)*1_000_000;
+                for (;;) {
+                    long left = (deadline-System.nanoTime())/1_000_000;
+                    if (left <= 0) throw new java.io.IOException("Prompt Events deadline exceeded");
+                    var event = events.next(left);
+                    if (event == null) return null;
+                    String type = (String) event.get("type");
+                    if (type.equals("replay_complete")) { receipt = true; if (held != null) return MAPPER.writeValueAsString(held); continue; }
+                    if (java.util.Set.of("stream_open", "slow_client_warning").contains(type)) continue;
+                    Map<String, Object> data = Frames.asMap(event.get("data"));
+                    if (!cursor.promptId().equals(event.getOrDefault("promptId", data.get("promptId")))) continue;
+                    if (held != null) { if (!type.equals("pending_prompt_completed")) throw RawSse.invalid(); continue; }
+                    Map<String, Object> meta = new java.util.LinkedHashMap<>();
+                    if (event.get("_meta") instanceof Map<?, ?> supplied) meta.putAll(Frames.asMap(supplied));
+                    meta.put("eventCursor", new EventCursor(sessionId, cursor.eventEpoch(), String.valueOf(event.get("id")), cursor.promptId(), type).toMap());
+                    Map<String, Object> frame = new java.util.LinkedHashMap<>(); frame.put("Jsonrpc", "2.0"); frame.put("_meta", meta);
+                    if (type.equals("turn_complete")) { frame.put("Id", rpcId); frame.put("Result", data); }
+                    else if (type.equals("turn_error")) { frame.put("Id", rpcId); frame.put("Error", Map.of("code", -32000,
+                        "errorCode", data.getOrDefault("code", "NATIVE_TURN_FAILED"), "message", data.getOrDefault("message", "原生执行失败"), "data", data)); }
+                    else { frame.put("Method", type.equals("session_update") ? "session/update" : "_qwen/notify");
+                        frame.put("Params", type.equals("session_update") ? data : Map.of("kind", type, "data", data)); }
+                    if (!receipt && (type.equals("turn_complete") || type.equals("turn_error"))) { held = frame; continue; }
+                    return MAPPER.writeValueAsString(frame);
+                }
+            }
+            public void close() { events.close(); }
+        };
     }
 
 }

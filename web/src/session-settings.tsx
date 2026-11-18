@@ -13,13 +13,17 @@ export interface SessionSettingsValue {
   createError?: string;
   clearCreateError: () => void;
   open: boolean;
-  setOpen: (open: boolean) => void;
+  setOpen: (open: boolean, section?: SettingsSection) => void;
+  section?: SettingsSection;
+  setSection?: (section: SettingsSection) => void;
   selectAgent?: (name: string) => void;
   update: (options: OpenApiCreateOptions) => void;
   reset: () => void;
   revision: number;
   theme: 'dark' | 'light' | 'system';
+  onThemeChange?: (theme: 'dark' | 'light') => void;
 }
+export type SettingsSection = 'connection' | 'session';
 export const SessionSettingsContext = createContext<SessionSettingsValue | undefined>(undefined);
 const approvalLabels: Record<string, string> = { default: '请求批准', 'auto-edit': '自动编辑', auto: '智能审批', yolo: '完全访问权限', plan: '计划' };
 function approvalLabel(mode: string) { return approvalLabels[mode] ? `${approvalLabels[mode]} · ${mode}` : mode; }
@@ -43,6 +47,7 @@ export function SessionSettingsButton() {
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path d="M10 3h4l1 3 3 1 2 3-2 2 1 3-3 3-3-1-2 2-3-2-1-3-3-1v-4l3-1 1-3z" /><circle cx="12" cy="12" r="3" />
     </svg>
+    <span>设置</span>
   </button>;
 }
 
@@ -70,13 +75,14 @@ export function SessionConfiguration({ sessionId }: { sessionId?: string }) {
     </span> : <span className="session-config-source" title={sessionId ? '未记录此会话的创建配置，上游历史也未返回权威配置。' : '等待读取后端默认值。'}>
       {sessionId ? '会话配置未记录' : '正在读取配置'}
     </span>}
-    <button type="button" className="session-config-open" onClick={() => setOpen(true)} aria-label="设置新会话默认配置" title="新会话默认配置">设置</button>
+    <button type="button" className="session-config-open" onClick={() => setOpen(true, 'session')} aria-label="设置新会话默认配置" title="新会话默认配置">设置</button>
   </div>;
 }
 
-export function SessionSettingsDialog() {
+export function SessionSettingsDialog({ extension }: { extension?: import('react').ReactNode } = {}) {
   const settings = useSettings();
   const { open, setOpen, defaults, preferences, configured, configError, update, reset, theme } = settings;
+  const showConnection = !!extension && settings.section === 'connection';
   const [agentDraft, setAgentDraft] = useState(defaults?.agentName ?? 'dataworks_data_agent');
   const [agentError, setAgentError] = useState<string>();
   useEffect(() => { setAgentDraft(defaults?.agentName ?? 'dataworks_data_agent'); setAgentError(undefined); }, [defaults?.agentName, open]);
@@ -101,11 +107,15 @@ export function SessionSettingsDialog() {
   }, [open]);
   return <dialog ref={dialog} className="session-settings-dialog" data-theme={theme} aria-labelledby="session-settings-title"
     onCancel={event => { event.preventDefault(); setOpen(false); }} onClose={() => setOpen(false)}>
-    <header><div><h2 id="session-settings-title">会话设置</h2><p>设置后续新会话的默认行为</p></div>
+    <header><div><h2 id="session-settings-title">会话设置</h2><p>{extension ? '管理 OpenAPI 连接和新会话默认配置' : '设置后续新会话的默认行为'}</p></div>
       <button type="button" aria-label="关闭会话设置" onClick={() => setOpen(false)}>×</button></header>
-    <div className="session-settings-body">
-      <nav aria-label="设置分类"><span aria-current="page">会话默认值</span></nav>
-      <section aria-label="会话默认值">
+    <div className="session-settings-body" data-has-connection={extension ? 'true' : undefined}>
+      <nav aria-label="设置分类">{extension ? <>
+        <button type="button" aria-current={showConnection ? 'page' : undefined} onClick={() => settings.setSection?.('connection')}>OpenAPI 连接</button>
+        <button type="button" aria-current={!showConnection ? 'page' : undefined} onClick={() => settings.setSection?.('session')}>会话默认配置</button>
+      </> : <span aria-current="page">会话默认值</span>}</nav>
+      {extension && <section aria-label="OpenAPI 连接" hidden={!showConnection}>{extension}</section>}
+      <section aria-label="会话默认值" hidden={showConnection}>
         <h3>新会话默认配置</h3><p>创建时未显式指定的选项使用以下默认值；已有会话保持原配置。</p>
         {defaults && configured && preferences ? <>
           <label>Agent<input aria-label="Agent 名称" value={agentDraft} maxLength={128} placeholder="dataworks_data_agent"
@@ -132,8 +142,12 @@ export function SessionSettingsDialog() {
           </select></label>}
           <p className="session-settings-note">{preferences.persistence === 'memory' ? '浏览器存储不可用，设置仅在当前页面保留。' : '已自动保存到本浏览器，按后端地址和 Agent 隔离。'}模型与思考深度须由目标模型支持。</p>
         </> : <p role="status">{configError ?? '正在读取配置…'}</p>}
+        {settings.onThemeChange && <label>主题<select aria-label="界面主题" value={theme} onChange={event => settings.onThemeChange?.(event.target.value as 'dark' | 'light')}>
+          <option value="dark">深色</option><option value="light">浅色</option>
+        </select><small>立即应用并保存到本浏览器，不改变会话配置。</small></label>}
       </section>
     </div>
-    <footer><button type="button" disabled={!defaults} onClick={reset}>恢复环境默认值</button><button className="session-settings-done" type="button" onClick={() => { if (applyAgent()) setOpen(false); }}>完成</button></footer>
+    <footer>{showConnection ? <span /> : <button type="button" disabled={!defaults} onClick={reset}>恢复环境默认值</button>}
+      <button className="session-settings-done" type="button" onClick={() => { if (showConnection || applyAgent()) setOpen(false); }}>完成</button></footer>
   </dialog>;
 }

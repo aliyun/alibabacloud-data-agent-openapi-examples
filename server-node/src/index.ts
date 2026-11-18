@@ -69,6 +69,7 @@ export async function buildServer(cfg: AppConfig): Promise<FastifyInstance> {
       'content-type',
       'authorization',
       'x-qwen-client-id',
+      'x-attachment-name',
       'last-event-id',
       'x-qwen-event-epoch',
     ],

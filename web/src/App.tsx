@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useState, useContext, useRef, type ComponentProps, type ReactNode } from 'react';
 
 import {
-  DaemonWorkspaceProvider, DaemonSessionProvider, useActions, useConnection, useWorkspace, WebShell, type WebShellTheme, type ComposerToolbarAction,
+  DaemonWorkspaceProvider, DaemonSessionProvider, useActions, useConnection, useWorkspace, WebShell, type WebShellTheme, type ComposerToolbarAction, type WebShellComposerApi,
 } from '@qwen-code/web-shell';
 
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { OpenApiPromptRendering } from './components/OpenApiPromptRendering';
-import { installOpenApiSessionCreation, type OpenApiCreateOptions, type SessionDefaults } from './session-client';
+import { installOpenApiSessionCreation, installSessionLoadNotice, type SessionLoadNotice, type OpenApiCreateOptions, type SessionDefaults } from './session-client';
 import { clearPreferences, effectiveDefaults, readPreferences, readPreferenceState, resolveCreationOptions, savePreferences, readSelectedAgent, saveSelectedAgent } from './session-preferences';
 import { sessionIdFromLocation, writeSessionRoute } from './session-route';
 import { saveSessionConfiguration, saveSessionAgent, readSessionAgent } from './session-configuration';
-import { SessionSettingsContext, SessionSettingsButton, SessionSettingsDialog, SessionCreateError } from './session-settings';
+import { SessionSettingsContext, SessionSettingsButton, SessionSettingsDialog, SessionCreateError, type SettingsSection } from './session-settings';
 import { apiHttpError } from './api-error';
 import { resolveClientId } from './client-id';
+import { uploadSessionAttachment, validateAttachment } from './session-attachments';
+import { SessionRecoveryContext, SessionEventRecovery, type SessionRecoveryRequest } from './session-recovery';
 import dataAgentLogo from './assets/data-agent-logo.png';
+import type { DaemonTransport } from '@qwen-code/sdk/daemon';
 
 const BRAND = {
   name: 'Data Agent',
@@ -56,6 +59,7 @@ function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 const DAEMON_BASE = `${API_BASE}/d`;
+const defaultFetch: typeof fetch = (...args) => fetch(...args);
 
 /**
  * 主题持久化：web-shell 自带的持久化通道是 daemon settings（POST /workspaces/:id/settings），
@@ -80,7 +84,12 @@ function resolveTheme(): WebShellTheme {
  * standalone 正是 web-shell 为"产品集成、无 daemon 工作区"准备的形态。
  * 服务端由 server-node/src/daemon 把 web-shell 协议适配为 DataAgent OpenAPI 调用。
  */
-export default function App() {
+export default function App({ fetcher, transport, settingsExtension, settingsInitiallyOpen }: {
+  fetcher?: typeof fetch;
+  transport?: DaemonTransport;
+  settingsExtension?: ReactNode;
+  settingsInitiallyOpen?: boolean;
+} = {}) {
   const [sessionId, setSessionId] = useState<string | undefined>(sessionIdFromLocation);
   const [clientId] = useState(resolveClientId);
   const [theme, setTheme] = useState<WebShellTheme>(resolveTheme);
@@ -109,14 +118,15 @@ export default function App() {
   return (
     <div style={{ height: '100%' }}>
       <ErrorBoundary label="Web Shell" variant="panel" resetKeys={[sessionId]}>
-        <DaemonWorkspaceProvider baseUrl={DAEMON_BASE}>
-          <OpenApiSessionCreation theme={theme}>
+        <DaemonWorkspaceProvider baseUrl={DAEMON_BASE} transport={transport}>
+          <OpenApiSessionCreation theme={theme} onThemeChange={handleThemeChange} sessionId={sessionId} fetcher={fetcher} settingsExtension={settingsExtension} settingsInitiallyOpen={settingsInitiallyOpen}>
             <DaemonSessionProvider
               sessionContext={{ kind: 'standalone' }}
               sessionId={sessionId}
               clientId={clientId}
               suppressOwnUserEcho={false}
             >
+              <SessionEventRecovery />
               <OpenApiPromptRendering>
                 <OpenApiToolbarDefaults>
                   <SessionWebShell
@@ -125,9 +135,11 @@ export default function App() {
                     onThemeChange={handleThemeChange}
                     language="zh-CN"
                     brand={BRAND}
-                    sidebar={{ ...SIDEBAR, footer: { items: ['theme', 'version', 'sessionsOverview', 'workspacesOverview', 'splitView', 'daemonStatus', 'localFiles', 'collapse'],
+                    sidebar={{ ...SIDEBAR, primaryNav: { items: ['newTask'] }, hideProjectHeader: true, showSessionSourceSwitch: false,
+                      footer: { items: ['collapse'],
                       render: () => <SessionSettingsButton /> } }}
                     renderComposerHeader={SessionCreateError}
+                    hiddenSlashCommands={['auth', 'language', 'btw', 'status', 'stats', 'context', 'tasks', 'recap', 'rewind', 'fork', 'reset']}
                     cycleModeOnTab={false}
                   />
                 </OpenApiToolbarDefaults>
@@ -141,14 +153,66 @@ export default function App() {
   );
 }
 
-// Existing sessions cannot change model or mode through POP yet.
-const SESSION_TOOLBAR_ACTIONS: readonly ComposerToolbarAction[] = [
-  'commands', 'contextUsage', 'gitBranch', 'widthMode', 'voice', 'workspace',
-];
-
 function SessionWebShell(props: ComponentProps<typeof WebShell>) {
   const settings = useContext(SessionSettingsContext);
   const { sessionId } = useConnection();
+  const actions = useActions();
+  const composer = useRef<WebShellComposerApi>(null);
+  const picker = useRef<HTMLInputElement>(null);
+  const pending = useRef<{ sessionId?: string; abort: AbortController }>();
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string>();
+  const maxBytes = settings?.defaults?.attachmentMaxBytes;
+  useEffect(() => {
+    if (pending.current && pending.current.sessionId !== sessionId) pending.current.abort.abort();
+    setUploadError(undefined);
+  }, [sessionId]);
+  useEffect(() => () => pending.current?.abort.abort(), []);
+
+  async function addFiles(files: File[]) {
+    if (!maxBytes || !settings || !files.length || pending.current) return;
+    const operation = { sessionId, abort: new AbortController() };
+    const { signal } = operation.abort;
+    pending.current = operation;
+    setUploading(true);
+    setUploadError(undefined);
+    try {
+      for (const file of files) validateAttachment(file, maxBytes);
+      let target = sessionId;
+      if (!target) {
+        target = (await actions.createSession()).sessionId;
+        signal.throwIfAborted();
+        operation.sessionId = target;
+        // Creating the session alone does not subscribe to its transcript events.
+        await actions.attachSession();
+        signal.throwIfAborted();
+        props.onSessionIdChange?.(target);
+      }
+      for (const file of files) {
+        const attachment = await uploadSessionAttachment(settings.baseUrl, target, file, maxBytes, signal);
+        signal.throwIfAborted();
+        composer.current?.addTags([{
+          id: attachment.id, kind: 'file', label: attachment.name, value: attachment.name,
+          serialized: `@${attachment.relativePath}`, removable: true,
+        }], { placement: 'inline', position: 'end' });
+      }
+    } catch (error) {
+      if (!signal.aborted) setUploadError(error instanceof Error ? error.message : '上传文件失败');
+    } finally {
+      if (pending.current === operation) pending.current = undefined;
+      if (!signal.aborted || pending.current === undefined) setUploading(false);
+    }
+  }
+
+  function captureFileDrop(event: React.DragEvent<HTMLDivElement>) {
+    if (!maxBytes || !event.dataTransfer.types.includes('Files') ||
+        !event.nativeEvent.composedPath().some(node => node instanceof HTMLElement &&
+          node.matches('[contenteditable="true"], [data-workbench-upload]'))) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'copy';
+    if (event.type === 'drop') void addFiles(Array.from(event.dataTransfer.files));
+  }
   const [sidebarEnabled, setSidebarEnabled] = useState(true);
   const sidebarAgent = useRef(settings?.configured?.agentName);
   useEffect(() => {
@@ -165,14 +229,34 @@ function SessionWebShell(props: ComponentProps<typeof WebShell>) {
     const timer = setTimeout(() => setSidebarEnabled(true), 0);
     return () => clearTimeout(timer);
   }, [sidebarEnabled]);
-  const actions: readonly ComposerToolbarAction[] = sessionId ? SESSION_TOOLBAR_ACTIONS
-    : ['model', ...(settings?.configured?.approvalMode === 'plan' ? [] : ['approvalMode'] as const), ...SESSION_TOOLBAR_ACTIONS];
-  return <WebShell {...props} sidebar={{ ...(typeof props.sidebar === 'object' ? props.sidebar : {}), enabled: props.sidebar !== false && sidebarEnabled }} composerToolbarActions={actions} onSlashCommand={command => {
+  const toolbarActions: readonly ComposerToolbarAction[] = sessionId ? []
+    : ['model', ...(settings?.configured?.approvalMode === 'plan' ? [] : ['approvalMode'] as const)];
+  return <div style={{ height: '100%' }} onDragOverCapture={captureFileDrop} onDropCapture={captureFileDrop}>
+    <WebShell {...props} composerRef={composer}
+      renderComposerToolbarStart={maxBytes ? ({ disabled }) => (
+        <span data-workbench-upload>
+          <button type="button" aria-label="上传文件" title="上传文件" disabled={disabled || uploading}
+            onClick={() => picker.current?.click()}>+</button>
+          <input ref={picker} type="file" multiple hidden onChange={event => {
+            const files = Array.from(event.currentTarget.files ?? []);
+            event.currentTarget.value = '';
+            void addFiles(files);
+          }} />
+          {uploading && <span role="status">正在上传文件…</span>}
+          {uploadError && <span role="alert">{uploadError}</span>}
+        </span>
+      ) : props.renderComposerToolbarStart}
+      onSubmitBefore={async submission => {
+        if (pending.current) throw new Error('请等待附件上传完成');
+        await props.onSubmitBefore?.(submission);
+      }}
+      sidebar={{ ...(typeof props.sidebar === 'object' ? props.sidebar : {}), enabled: props.sidebar !== false && sidebarEnabled }} composerToolbarActions={toolbarActions} onSlashCommand={command => {
     if (['settings', 'model', 'approval-mode', 'plan'].includes(command.command)) {
       settings?.setOpen(true);
       return true;
     }
-  }} />;
+  }} />
+  </div>;
 }
 
 /** Keep native standalone create overrides; Plan remains an atomic POP option. */
@@ -214,18 +298,31 @@ export function OpenApiToolbarDefaults({ children }: { children: ReactNode }) {
 }
 
 /** Install before mounting the session provider, including StrictMode remounts. */
-export function OpenApiSessionCreation({ children, theme = 'dark' }: { children: ReactNode; theme?: WebShellTheme }) {
+export function OpenApiSessionCreation({ children, theme = 'dark', onThemeChange, sessionId, fetcher = defaultFetch, settingsExtension, settingsInitiallyOpen }: {
+  children: ReactNode; theme?: WebShellTheme; onThemeChange?: (theme: 'dark' | 'light') => void;
+  sessionId?: string; fetcher?: typeof fetch; settingsExtension?: ReactNode; settingsInitiallyOpen?: boolean;
+}) {
   const { client, baseUrl } = useWorkspace();
+  const [notice, setNotice] = useState<SessionLoadNotice>();
   const [readyClient, setReadyClient] = useState<typeof client>();
   const [defaults, setDefaults] = useState<SessionDefaults>();
   const [configError, setConfigError] = useState<string>();
   const [createError, setCreateError] = useState<string>();
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(settingsInitiallyOpen ?? false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(settingsExtension ? 'connection' : 'session');
   const [revision, setRevision] = useState(0);
+  const [recoveryRequest, setRecoveryRequest] = useState<SessionRecoveryRequest>();
+  const recoveryId = useRef(0);
+  const requestRecovery = useCallback((sessionId: string, automatic = true) => {
+    setRecoveryRequest(current => current?.sessionId === sessionId ? current : { sessionId, automatic, id: ++recoveryId.current });
+  }, []);
+  const completeRecovery = useCallback((request: SessionRecoveryRequest) => {
+    setRecoveryRequest(current => current === request ? undefined : current);
+  }, []);
   useEffect(() => {
     let mounted = true;
     const readDefaults = async () => {
-      const response = await fetch(`${baseUrl}/openapi/session-options`, { signal: AbortSignal.timeout(10_000) });
+      const response = await fetcher(`${baseUrl}/openapi/session-options`, { signal: AbortSignal.timeout(10_000) });
       if (!response.ok) throw apiHttpError(response.status, await response.json().catch(() => undefined), '无法读取会话配置，请确认后端版本');
       const remote = await response.json() as SessionDefaults;
       const options = { ...remote, agentName: readSelectedAgent(baseUrl) };
@@ -240,6 +337,7 @@ export function OpenApiSessionCreation({ children, theme = 'dark' }: { children:
       const options = await readDefaults();
       return { ...resolveCreationOptions(options, preferences, initial), agentName };
     }, {
+      onRecoveryRequired: requestRecovery,
       onDiscovered: (sid, agent) => saveSessionAgent(baseUrl, sid, agent),
       agentName: sid => sid ? readSessionAgent(baseUrl, sid) ?? readSelectedAgent(baseUrl) : readSelectedAgent(baseUrl),
       defaults: async () => {
@@ -260,10 +358,11 @@ export function OpenApiSessionCreation({ children, theme = 'dark' }: { children:
       },
       // A successful create is not a user preference change. In particular it
       // must not turn inherited environment values into persistent overrides.
-    });
+    }, fetcher);
+    const restoreLoad = installSessionLoadNotice(client, setNotice);
     setReadyClient(client);
-    return () => { mounted = false; restore(); };
-  }, [client, baseUrl]);
+    return () => { mounted = false; restoreLoad(); restore(); };
+  }, [client, baseUrl, fetcher, requestRecovery]);
   const preferences = defaults ? readPreferenceState(baseUrl, defaults.agentName) : undefined;
   const configured = defaults ? effectiveDefaults(defaults, preferences!.options) : undefined;
   const update = (options: OpenApiCreateOptions) => {
@@ -272,7 +371,9 @@ export function OpenApiSessionCreation({ children, theme = 'dark' }: { children:
     setDefaults({ ...defaults });
   };
   return <SessionSettingsContext.Provider value={{ baseUrl, defaults, configured, preferences, configError, createError, clearCreateError: () => setCreateError(undefined),
-    open: settingsOpen, setOpen: setSettingsOpen, update, revision, theme,
+    open: settingsOpen, section: settingsSection, setSection: setSettingsSection,
+    setOpen: (open, section) => { if (section) setSettingsSection(section); setSettingsOpen(open); },
+    update, revision, theme, onThemeChange,
     selectAgent: name => {
       saveSelectedAgent(baseUrl, name);
       if (defaults) setDefaults({ ...defaults, agentName: name.trim() });
@@ -282,8 +383,12 @@ export function OpenApiSessionCreation({ children, theme = 'dark' }: { children:
       if ((event.metaKey || event.ctrlKey) && event.key === ',') {
         event.preventDefault(); event.stopPropagation(); setSettingsOpen(true);
       }
-    }}>{readyClient === client ? children : null}</div>
-    <SessionSettingsDialog />
+    }}><SessionRecoveryContext.Provider value={{ request: recoveryRequest, complete: completeRecovery,
+      retry: sid => setRecoveryRequest({ sessionId: sid, automatic: true, id: ++recoveryId.current }) }}>
+      {notice?.sessionId === sessionId && notice?.message && <div role="alert" style={{ position: 'fixed', top: 12, right: 12, maxWidth: 520, zIndex: 100, padding: 12, borderRadius: 8, background: '#4a2020', color: '#fff' }}>{notice.message}</div>}
+      {readyClient === client ? children : null}
+    </SessionRecoveryContext.Provider></div>
+    <SessionSettingsDialog extension={settingsExtension} />
   </SessionSettingsContext.Provider>;
 }
 

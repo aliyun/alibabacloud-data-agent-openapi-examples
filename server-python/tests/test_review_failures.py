@@ -87,6 +87,7 @@ async def test_normal_events_eof_returns_immediately_without_admission_grace():
     from das_python.daemon.live_routes import _remote_sse_stream
     backend = FakeEvents([])
     stream = _remote_sse_stream(LiveContext(backend, config()), 's', None)
+    assert 'event: stream_open' in await anext(stream)
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(anext(stream), .2)
     assert backend.closed

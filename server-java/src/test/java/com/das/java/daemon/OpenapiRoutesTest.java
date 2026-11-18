@@ -170,21 +170,61 @@ class OpenapiRoutesTest {
         stateless(controller);
     }
     static RemoteEventStream remote(String wire) {
+        return remote(wire, Map.of("Content-Type", "text/event-stream"));
+    }
+    static RemoteEventStream remote(String wire, Map<String, String> headers) {
         var stream = new RemoteEventStream();
         stream.onStream(subscriber -> subscriber.onSubscribe(new Subscription() {
             boolean sent;
             public void request(long n) { if (!sent) { sent = true; subscriber.onNext(ByteBuffer.wrap(wire.getBytes(StandardCharsets.UTF_8))); subscriber.onComplete(); } }
             public void cancel() {}
-        }), 200, new HttpHeaders(Map.of("Content-Type", "text/event-stream")));
+        }), 200, new HttpHeaders(headers));
         return stream;
     }
-    @Test void eventsUseOnlyHeaderCursorAndNeverEmitControlsOrAdvanceACachedCursor() throws Exception {
-        String wire = "id: 91\nevent: turn_complete\ndata: {\"v\":1,\"type\":\"turn_complete\",\"data\":{\"sessionId\":\"session-A\",\"promptId\":\"remote-external\",\"stopReason\":\"end_turn\"}}\n\n";
+    @Test void nativeEpochFromOpeningFrameReachesSdkBeforeHeartbeatCommitsHeaders() throws Exception {
+        String wire = ": heartbeat\n\nevent: stream_open\ndata: {\"Data\":{\"eventEpoch\":\"native_epoch-1\"}}\n\n";
+        when(live.events("session-A", "41", "native_epoch-1")).thenReturn(remote(wire));
+        mvc.perform(get("/d/session/session-A/events").header("Last-Event-Id", "41")
+                .header("X-Qwen-Event-Epoch", "native_epoch-1"))
+            .andExpect(status().isOk()).andExpect(header().string("X-Qwen-Event-Epoch", "native_epoch-1"));
+        verify(live).events("session-A", "41", "native_epoch-1");
+    }
+    @Test void nativeEpochFromHeaderIsPreservedAndNeverSynthesized() throws Exception {
+        for (String epoch : new String[]{"native_epoch-1", null}) {
+            var headers = new java.util.LinkedHashMap<String, String>();
+            headers.put("Content-Type", "text/event-stream");
+            if (epoch != null) headers.put("X-Qwen-Event-Epoch", epoch);
+            when(live.events("session-A", null)).thenReturn(remote("event: stream_open\ndata: {\"Data\":{}}\n\n", headers));
+            var response = new MockHttpServletResponse();
+            controller.events("session-A", null, null, response);
+            assertEquals(200, response.getStatus());
+            assertEquals(epoch, response.getHeader("X-Qwen-Event-Epoch"));
+        }
+    }
+    @Test void strictEventsRejectMissingOrConflictingNativeEpochBeforeAnyFrame() throws Exception {
+        for (String data : new String[]{"{}", "{\"eventEpoch\":\"other\"}"}) {
+            when(live.events("session-A", "41", "native_epoch-1"))
+                .thenReturn(remote(": heartbeat\n\nevent: stream_open\ndata: {\"Data\":" + data + "}\n\n"));
+            var result = mvc.perform(get("/d/session/session-A/events").header("Last-Event-Id", "41")
+                    .header("X-Qwen-Event-Epoch", "native_epoch-1"))
+                .andExpect(status().isBadGateway()).andReturn();
+            assertFalse(result.getResponse().getContentAsString().contains("data:"));
+            assertNull(result.getResponse().getHeader("X-Qwen-Event-Epoch"));
+        }
+        mvc.perform(get("/d/session/session-A/events").header("X-Qwen-Event-Epoch", "native_epoch-1"))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test void eventsUseOnlyThisHeadersCursorWithVerifiedNativeIdentity() throws Exception {
         for (String cursor : new String[]{"0", null, "7"}) {
+            long id = cursor == null ? 91 : Long.parseLong(cursor)+1;
+            String wire = "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"session-A\",\"nativeSessionId\":\"native\",\"eventEpoch\":\"epoch\"}}\n\n"
+                +"id: "+id+"\nevent: turn_complete\ndata: {\"v\":1,\"type\":\"turn_complete\",\"data\":{\"sessionId\":\"session-A\",\"promptId\":\"remote-external\",\"stopReason\":\"end_turn\"}}\n\n";
+            if (cursor != null) wire += "data: {\"v\":1,\"type\":\"replay_complete\",\"data\":{\"replayedCount\":1,\"lastEventId\":"+id+"}}\n\n";
             when(live.events("session-A", cursor)).thenReturn(remote(wire));
             var response = new MockHttpServletResponse();
-            freshController().events("session-A", "1", cursor, response);
-            assertEquals(200, response.getStatus());
+            freshController().events("session-A", "1", cursor, null, response);
+            assertEquals(200, response.getStatus()); assertEquals("epoch", response.getHeader("X-Qwen-Event-Epoch"));
             assertTrue(response.getContentAsString().contains("remote-external"));
             assertFalse(response.getContentAsString().contains("workbench_prompt_result"));
             verify(live).events("session-A", cursor);
@@ -196,12 +236,12 @@ class OpenapiRoutesTest {
             "data: {\"v\":1,\"type\":\"turn_complete\",\"data\":{\"sessionId\":\"other\",\"stopReason\":\"end_turn\"}}\n\n")) {
             when(live.events("session-A", null)).thenReturn(remote(wire));
             var response = new MockHttpServletResponse();
-            controller.events("session-A", null, null, response);
+            controller.events("session-A", null, null, null, response);
             assertEquals(502, response.getStatus());
             assertFalse(response.getContentAsString().contains("data:"));
         }
         var invalid = new MockHttpServletResponse();
-        controller.events("session-A", null, "-1", invalid);
+        controller.events("session-A", null, "-1", null, invalid);
         assertEquals(400, invalid.getStatus());
         verify(live, never()).events("session-A", "-1");
     }
@@ -301,15 +341,15 @@ class OpenapiRoutesTest {
                     if (sent) return;
                     sent = true;
                     if (committed) subscriber.onNext(ByteBuffer.wrap(
-                        "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"s\"}}\n\n".getBytes(StandardCharsets.UTF_8)));
+                        "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"s\",\"nativeSessionId\":\"native\",\"eventEpoch\":\"epoch\"}}\n\n".getBytes(StandardCharsets.UTF_8)));
                     subscriber.onError(new java.io.IOException("private exception detail"));
                 }
                 public void cancel() {}
             }), 200, new HttpHeaders(Map.of("Content-Type", "text/event-stream", "X-Acs-Request-Id", id)));
             when(live.events("s", null)).thenReturn(remote);
             var response = new MockHttpServletResponse();
-            if (committed) assertThrows(java.io.IOException.class, () -> controller.events("s", null, null, response));
-            else controller.events("s", null, null, response);
+            if (committed) assertThrows(java.io.IOException.class, () -> controller.events("s", null, null, null, response));
+            else controller.events("s", null, null, null, response);
             assertEquals(id, response.getHeader("x-acs-request-id"));
             assertFalse(response.getContentAsString().contains("private exception detail"));
             assertFalse(response.getContentAsString().contains("turn_complete"));
@@ -329,7 +369,7 @@ class OpenapiRoutesTest {
             headers.put("Set-Cookie", "private-cookie");
             if (id != null) headers.put("X-Acs-Request-Id", id);
             var stream = new RemoteEventStream();
-            String wire = "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"s\"}}\n\n";
+            String wire = "data: {\"v\":1,\"type\":\"stream_open\",\"data\":{\"sessionId\":\"s\",\"nativeSessionId\":\"native\",\"eventEpoch\":\"epoch\"}}\n\n";
             stream.onStream(subscriber -> subscriber.onSubscribe(new Subscription() {
                 boolean sent;
                 public void request(long n) {
@@ -342,7 +382,7 @@ class OpenapiRoutesTest {
             }), 200, new HttpHeaders(headers));
             when(live.events("s", null)).thenReturn(stream);
             var response = new MockHttpServletResponse();
-            controller.events("s", null, null, response);
+            controller.events("s", null, null, null, response);
             assertEquals(200, response.getStatus());
             assertEquals(id != null && id.replace(" ", "").equals("events-pop") ? "events-pop" : null, response.getHeader("x-acs-request-id"));
             assertNull(response.getHeader("Authorization"));
@@ -359,7 +399,7 @@ class OpenapiRoutesTest {
         stream.onError(new java.util.concurrent.CompletionException(sdk));
         when(live.events("s", null)).thenReturn(stream);
         var response = new MockHttpServletResponse();
-        controller.events("s", null, null, response);
+        controller.events("s", null, null, null, response);
         assertEquals(502, response.getStatus());
         assertEquals("events-sdk-pop", response.getHeader("x-acs-request-id"));
         var body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(response.getContentAsString());

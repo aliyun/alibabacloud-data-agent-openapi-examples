@@ -3,19 +3,22 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-export const HELP = 'node scripts/e2e/run.mjs --base-url URL [--secondary-base-url URL] [--prompt-server primary|secondary|alternate] [--language node|python|java] [--region cn-beijing] [--model MODEL] [--mode yolo] [--reasoning-effort none] [--output-dir NEW_DIR]\nRequires LIVE servers with the same endpoint/identity/Agent. Creates one test session, sends exactly two prompts, requires both owned NDJSON done and independent remote Events answer/terminal. Second round verifies cursor reconnection and conversation memory. Deletes only after all earlier checks succeed. No Prompt retries or role assumption. Secondary mode alternates Prompt/Events across servers and renames on B, reads back on A. Reports default to a private temporary directory. For owned-process restart use managed.mjs.';
+export const HELP = 'node scripts/e2e/run.mjs --base-url URL [--secondary-base-url URL] [--prompt-server primary|secondary|alternate] [--language node|python|java] [--region cn-beijing] [--model MODEL] [--mode yolo] [--reasoning-effort none] [--output-dir NEW_DIR] [--attachments [--attachment-max-mib 8|10]]\nRequires LIVE servers with the same endpoint/identity/Agent. Creates one test session, sends exactly two prompts, requires both owned NDJSON done and independent remote Events answer/terminal. Second round verifies cursor reconnection and conversation memory. With --attachments, verifies the byte limit and requires the first answer to come from an uploaded CSV. The 10 MiB case requires the Agent to read the exact-limit file. Deletes only after all earlier checks succeed. No Prompt retries or role assumption. Secondary mode alternates Prompt/Events across servers and renames on B, reads back on A. Reports default to a private temporary directory. For owned-process restart use managed.mjs.';
 export function parseOptions(argv) {
   return parseArgs({ args: argv, options: {
     'base-url': { type: 'string' }, 'secondary-base-url': { type: 'string' },
     'prompt-server': { type: 'string', default: 'alternate' },
     model: { type: 'string' }, 'reasoning-effort': { type: 'string' },
     mode: { type: 'string', default: 'yolo' }, region: { type: 'string', default: 'cn-beijing' },
-    language: { type: 'string' }, 'output-dir': { type: 'string' }, help: { type: 'boolean' },
+    language: { type: 'string' }, 'output-dir': { type: 'string' }, attachments: { type: 'boolean' }, help: { type: 'boolean' },
+    'attachment-max-mib': { type: 'string' },
   } }).values;
 }
 export function validateBase(value) {
@@ -64,6 +67,7 @@ export async function consumeOwned(response, sessionId, diagnostics = {}) {
     assert.ok(!done, 'owned data after done');
     if (event.type === 'error') {
       diagnostics.errorKind = /^[a-z_]{1,64}$/.test(event.error?.kind ?? '') ? event.error.kind : 'unknown';
+      if (isRequestId(event.error?.requestId)) diagnostics.requestId = event.error.requestId;
       throw new Error('owned Prompt error (no retry)');
     }
     if (event.type === 'hb') continue;
@@ -90,6 +94,10 @@ export async function consumeOwned(response, sessionId, diagnostics = {}) {
   }
   assert.ok(done, 'owned stream ended without done (no retry)');
   return { rid, frameCount: count, stopReason: 'end_turn' };
+}
+
+function isRequestId(value) {
+  return typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
 }
 // Diagnostics contain event/schema names only, never payload values or upstream messages.
 function eventShape(event) {
@@ -155,7 +163,11 @@ export async function consumeEvents(response, sessionId, expected, after) {
     } catch (error) { throw new Error(`${String(error.message).split('\n')[0]}; eventShape=${shape}`); }
   }
   assert.ok(terminal, `remote stream ended without terminal; eventShape=${lastShape ?? 'none'}`);
-  assert.ok(answer.includes(expected), `expected remote assistant answer missing; eventShape=${lastShape ?? 'none'}`);
+  // The follow-up must preserve both exact tokens, while the model may format their separator.
+  const followup = /^(FOLLOWUP_[a-f0-9]{32}):(WB_[a-f0-9]{32})$/.exec(expected);
+  const matches = answer.includes(expected) || (followup
+    && new RegExp(followup[1] + '[`*]*\\s*[:：]\\s*[`*]*' + followup[2]).test(answer));
+  assert.ok(matches, `expected remote assistant answer missing; eventShape=${lastShape ?? 'none'}`);
   return { answer, lastEventId, eventCount: count, controlCount, controlShapes, stopReason: 'end_turn' };
 }
 
@@ -189,11 +201,20 @@ export async function runHarness(args, { beforeFollowup, beforePrompt, lifecycle
     const response = await fetch(`${server}${url}`, { method, headers: { 'content-type': 'application/json' },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(timeoutMs) });
     const value = await response.json();
-    assert.ok(response.ok && value.ok !== false, `${method} ${url}: HTTP/business failure`);
+    if (!response.ok || value.ok === false) {
+      const requestId = value?.error?.requestId ?? value?.requestId ?? response.headers.get('x-request-id');
+      const safeId = typeof requestId === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(requestId) ? requestId : 'unavailable';
+      throw new Error(`${method} ${url.split('?')[0]}: HTTP/business failure (HTTP ${response.status}, requestId=${safeId})`);
+    }
     return value;
   };
-  const remoteSessions = async (server = base) => {
-    const { result } = await request('/api/sessions', 'GET', undefined, server);
+  const remoteSessions = async (server = base, archived = false) => {
+    if (archived && args.language !== 'node') {
+      return (await request('/d/standalone/sessions?archiveState=archived', 'GET', undefined, server)).sessions;
+    }
+    const query = new URLSearchParams({ sessionId, archived: String(archived) });
+    const route = args.language === 'node' ? `/api/sessions?${query}` : '/api/sessions';
+    const { result } = await request(route, 'GET', undefined, server);
     assert.ok(Array.isArray(result?.sessions), 'missing remote sessions');
     assert.notEqual(result.truncated, true, 'incomplete remote list');
     return result.sessions;
@@ -215,6 +236,12 @@ export async function runHarness(args, { beforeFollowup, beforePrompt, lifecycle
         assert.ok(defaults.agentName);
         if (report.agentName) assert.equal(defaults.agentName, report.agentName, 'server Agent mismatch');
         report.agentName = defaults.agentName;
+        if (args.attachments) {
+          const expectedMiB = args['attachment-max-mib'] ?? '8';
+          assert.ok(expectedMiB === '8' || expectedMiB === '10', 'expected --attachment-max-mib 8 or 10');
+          assert.equal(defaults.attachmentMaxBytes, Number(expectedMiB) * 1024 * 1024, `expected ${expectedMiB} MiB attachment capability`);
+          report.attachmentMaxBytes = defaults.attachmentMaxBytes;
+        }
       }
     });
     await check('CreateAgentSession on primary with selected settings', async () => {
@@ -227,6 +254,52 @@ export async function runHarness(args, { beforeFollowup, beforePrompt, lifecycle
     });
     const sid = encodeURIComponent(sessionId);
     const marker = `WB_${randomUUID().replaceAll('-', '')}`;
+    let attachmentPath;
+    if (args.attachments) {
+      const staged = args['attachment-max-mib'] === '10';
+      const csv = Buffer.from(`value\n${marker}\n`);
+      const upload = async (name, content) => {
+        const response = await fetch(`${base}/d/openapi/sessions/${sid}/attachments`, {
+          method: 'POST', headers: { 'content-type': 'application/octet-stream', 'x-attachment-name': name },
+          body: content, signal: AbortSignal.timeout(timeoutMs),
+        });
+        const value = await response.json().catch(() => undefined);
+        return { status: response.status, value };
+      };
+      await check('Upload enforces the advertised byte limit', async () => {
+        const endpoint = new URL(`${base}/d/openapi/sessions/${sid}/attachments`);
+        // Let the server reject the declared length before sending any file bytes.
+        const oversizeStatus = await new Promise((resolve, reject) => {
+          const transport = endpoint.protocol === 'https:' ? https : http;
+          const request = transport.request(endpoint, {
+            method: 'POST', signal: AbortSignal.timeout(timeoutMs),
+            headers: { 'content-type': 'application/octet-stream', 'x-attachment-name': 'oversize.bin',
+              'content-length': report.attachmentMaxBytes + 1 },
+          }, response => { response.resume(); resolve(response.statusCode); });
+          request.on('error', reject);
+          request.end();
+        });
+        assert.equal(oversizeStatus, 413);
+        const body = Buffer.alloc(report.attachmentMaxBytes, staged ? 'x\n' : 0xff);
+        if (staged) csv.copy(body);
+        const maximum = await upload(staged ? 'limit.csv' : 'limit.bin', body);
+        assert.equal(maximum.status, 201, `exact-limit upload failed, requestId=${maximum.value?.requestId ?? 'unavailable'}`);
+        assert.equal(maximum.value.size, report.attachmentMaxBytes);
+        if (staged) {
+          assert.match(maximum.value.id, /^[a-f0-9]{32}$/);
+          assert.equal(maximum.value.relativePath, `upload/${sessionId}_${maximum.value.id}.csv`);
+          attachmentPath = maximum.value.relativePath;
+        }
+      });
+      if (!staged) await check('Upload returns a session-scoped attachment path', async () => {
+        const { status, value } = await upload('probe.csv', csv);
+        assert.equal(status, 201, `CSV upload failed, requestId=${value?.requestId ?? 'unavailable'}`);
+        assert.match(value.id, /^[a-f0-9]{32}$/);
+        assert.equal(value.relativePath, `upload/${sessionId}_${value.id}.csv`);
+        assert.equal(value.size, csv.length);
+        attachmentPath = value.relativePath;
+      });
+    }
     const promptRound = async (expected, after, text) => {
       const round = report.rounds.length;
       const useSecondary = secondary && (promptServer === 'secondary' || promptServer === 'alternate' && round % 2 === 1);
@@ -243,10 +316,16 @@ export async function runHarness(args, { beforeFollowup, beforePrompt, lifecycle
         const events = await fetch(`${eventsBase}/d/session/${sid}/events`, {
           headers: after !== undefined ? { 'Last-Event-Id': cursor(after) } : {}, signal,
         });
+        route.eventsHttpStatus = events.status;
+        const requestId = events.headers.get('x-acs-request-id');
+        if (isRequestId(requestId)) route.eventsRequestId = requestId;
         // Reject a failed subscription before invoking any writing request.
         // An async consumer's rejection alone may arrive after POST was dispatched.
         if (events.status !== 200 || !/text\/event-stream/.test(events.headers.get('content-type') ?? '')) {
-          await events.body?.cancel();
+          if (/application\/json/.test(events.headers.get('content-type') ?? '')) {
+            const failure = await events.json().catch(() => undefined);
+            if (isRequestId(failure?.requestId)) route.eventsRequestId = failure.requestId;
+          } else await events.body?.cancel();
           throw new Error('Events subscription rejected before Prompt; no write dispatched');
         }
         const remote = guarded(() => consumeEvents(events, sessionId, expected, after));
@@ -272,7 +351,10 @@ export async function runHarness(args, { beforeFollowup, beforePrompt, lifecycle
     };
     let completedAnswer;
     await check('Owned NDJSON done AND independent remote Events answer/terminal', async () => {
-      completedAnswer = await promptRound(marker, undefined, `请记住本会话的测试字符串：${marker}。本轮只回复该字符串，不执行工具。`);
+      const text = attachmentPath
+        ? `读取下方 CSV，记住 value 列第一条数据的字符串，只回复该字符串。\n\n@${attachmentPath}`
+        : `请记住本会话的测试字符串：${marker}。本轮只回复该字符串，不执行工具。`;
+      completedAnswer = await promptRound(marker, undefined, text);
     });
     const load = async (server = secondary ?? base) => {
       const loaded = await request(`/d/standalone/sessions/${sid}/load`, 'POST', {}, server);
@@ -309,7 +391,7 @@ export async function runHarness(args, { beforeFollowup, beforePrompt, lifecycle
     await check('Archive and restore persist across servers', async () => {
       const archived = await request('/d/standalone/sessions/archive', 'POST', { sessionIds: [sessionId] }, secondary ?? base);
       assert.ok(archived.archived.includes(sessionId));
-      assert.ok((await request('/d/standalone/sessions?archiveState=archived')).sessions.some(item => item.sessionId === sessionId));
+      assert.ok((await remoteSessions(base, true)).some(item => item.sessionId === sessionId));
       assert.ok(!(await remoteSessions()).some(item => item.sessionId === sessionId), 'archived session remains active');
       const restored = await request('/d/standalone/sessions/unarchive', 'POST', { sessionIds: [sessionId] });
       assert.ok(restored.unarchived.includes(sessionId));

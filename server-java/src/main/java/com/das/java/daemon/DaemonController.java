@@ -58,6 +58,11 @@ public class DaemonController {
         this.remote = live == null ? null : new LiveDaemon(cfg, live);
     }
 
+    private LiveDaemon remote() {
+        var client = live;
+        return client == live ? remote : new LiveDaemon(cfg, client);
+    }
+
     /**
      * 解析 MOCK 演示会话，必须是已知场景（与 /api 的行为对齐：不认的 id 明确 404）。
      */
@@ -182,7 +187,7 @@ public class DaemonController {
     @GetMapping("/openapi/session-options")
     public Map<String, Object> openapiSessionOptions() {
         Map<String, Object> out = new LinkedHashMap<>(SessionOptions.describe(cfg));
-        out.put("promptTransport", live == null ? "daemon" : "http-stream");
+        out.put("promptTransport", live != null ? "http-stream" : "daemon");
         return out;
     }
 
@@ -192,10 +197,6 @@ public class DaemonController {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(errorBody(
             "POP supports configuration only at creation; create a new session to change model, mode or reasoning effort.",
             "requires-new-session"));
-    }
-
-    private String eventEpoch(String id) {
-        return live == null ? epoch : "openapi:" + cfg.regionId() + ":" + id;
     }
 
     @GetMapping("/standalone/session-options")
@@ -248,8 +249,8 @@ public class DaemonController {
         @RequestParam(name = "agentName", required = false) String agentName) {
         agentName = queryAgentName(agentName);
         boolean archived = "archived".equals(archiveState);
-        if (remote != null) {
-            try { return ResponseEntity.ok(remote.list(archived, agentName)); }
+        if (live != null) {
+            try { return ResponseEntity.ok(remote().list(archived, agentName)); }
             catch (Exception error) { return LiveDaemon.failure(error, "ListAgentSessions"); }
         }
         return ResponseEntity.ok(Map.of("sessions", archived ? registry.archivedSummaries() : registry.listSummaries(cfg)));
@@ -260,7 +261,7 @@ public class DaemonController {
         SessionOptions options;
         try { options = SessionOptions.resolve(cfg, body); }
         catch (IllegalArgumentException error) { return ResponseEntity.badRequest().body(errorBody(error.getMessage(), "invalid_session_options")); }
-        if (remote != null) return remote.create(options);
+        if (live != null) return remote().create(options);
         String id = (String) MockFixtures.mockCreateSession("新建会话").get("sessionId");
         return ResponseEntity.ok(standaloneSessionBody(registry.ensure(id), id));
     }
@@ -269,7 +270,7 @@ public class DaemonController {
     public ResponseEntity<?> getSession(@PathVariable("id") String id,
         @RequestParam(name = "agentName", required = false) String agentName) {
         agentName = queryAgentName(agentName);
-        if (remote != null) return remote.get(id, agentName);
+        if (live != null) return remote().get(id, agentName);
         Registry.Record record = resolveSession(id);
         if (record == null || record.deleted) return notFound(id);
         return ResponseEntity.ok(registry.summaryFor(record, id));
@@ -328,19 +329,19 @@ public class DaemonController {
         Map<String, Object> accepted = new LinkedHashMap<>();
         accepted.put("promptId", admitted.promptId());
         accepted.put("lastEventId", admitted.lastEventId());
-        accepted.put("eventEpoch", eventEpoch(record.realId));
+        accepted.put("eventEpoch", epoch);
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(accepted);
     }
 
     @PostMapping("/session/{id}/openapi-prompt/{promptId}/receipt")
     public ResponseEntity<?> promptReceipt(@PathVariable("id") String id, @PathVariable("promptId") String promptId) {
-        return live == null ? ResponseEntity.noContent().build()
+        return cfg.mock() ? ResponseEntity.noContent().build()
             : ResponseEntity.status(HttpStatus.GONE).body(errorBody("Local prompt receipts are retired", "prompt_transport_retired"));
     }
 
     @PostMapping("/session/{id}/cancel")
     public ResponseEntity<?> cancel(@PathVariable("id") String id) {
-        if (remote != null) return remote.cancel(id);
+        if (live != null) return remote().cancel(id);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
 
@@ -352,14 +353,20 @@ public class DaemonController {
         return ResponseEntity.noContent().build();
     }
 
+    public void events(String id, String snapshotParam, String lastRaw, HttpServletResponse response) throws IOException {
+        events(id, snapshotParam, lastRaw, null, response);
+    }
+
     @GetMapping("/session/{id}/events")
     public void events(
         @PathVariable("id") String id,
         @RequestParam(name = "snapshot", required = false) String snapshotParam,
         @RequestHeader(name = "last-event-id", required = false) String lastRaw,
+        @RequestHeader(name = "X-Qwen-Event-Epoch", required = false) String remoteEpoch,
         HttpServletResponse response) throws IOException {
         if (live != null) {
-            if (lastRaw != null && !RemoteSseRelay.safeCursor(lastRaw)) {
+            if (lastRaw != null && !RemoteSseRelay.safeCursor(lastRaw)
+                || remoteEpoch != null && (lastRaw == null || !remoteEpoch.matches("[A-Za-z0-9_-]{1,64}"))) {
                 response.setStatus(400);
                 response.setContentType("application/json");
                 response.getWriter().write("{\"error\":\"Invalid remote cursor\",\"code\":\"invalid_cursor\"}");
@@ -368,7 +375,7 @@ public class DaemonController {
             String remoteCursor = lastRaw;
             Integer upstreamStatus = null;
             String upstreamRequestId = null;
-            try (var stream = live.events(id, remoteCursor)) {
+            try (var stream = remoteEpoch == null ? live.events(id, remoteCursor) : live.events(id, remoteCursor, remoteEpoch)) {
                 var metadata = stream.metadata();
                 upstreamStatus = metadata.status();
                 upstreamRequestId = metadata.headers().entrySet().stream()
@@ -398,16 +405,20 @@ public class DaemonController {
                 }
                 if (metadata.status() / 100 == 2 && !contentType.split(";", 2)[0].trim().equalsIgnoreCase("text/event-stream"))
                     throw new IOException("GetAgentSessionEvents returned a non-SSE response");
+                String nativeEpoch = metadata.headers().entrySet().stream()
+                    .filter(header -> header.getKey().equalsIgnoreCase("X-Qwen-Event-Epoch"))
+                    .map(Map.Entry::getValue).findFirst().orElse(null);
                 response.setStatus(metadata.status());
                 response.setContentType(metadata.status() / 100 == 2 ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8");
                 response.setHeader("Cache-Control", "no-store, no-transform");
                 response.setHeader("X-Accel-Buffering", "no");
-                response.setHeader("X-Qwen-Event-Epoch", eventEpoch(id));
                 for (var header : metadata.headers().entrySet()) {
                     if (header.getKey().equalsIgnoreCase("X-Qwen-Sse-Stream-Id")) response.setHeader(header.getKey(), header.getValue());
                 }
                 if (metadata.status() / 100 == 2) {
-                    RemoteSseRelay.relay(stream, response.getOutputStream(), id, ignored -> {});
+                    var output = new NativeEventEpochOutput(response, remoteEpoch, nativeEpoch);
+                    RemoteSseRelay.relay(stream, output, id, ignored -> {}, output::observe);
+                    output.finish();
                 } else {
                     byte[] chunk;
                     while ((chunk = stream.next()) != null) response.getOutputStream().write(chunk);
@@ -484,7 +495,7 @@ public class DaemonController {
 
     @GetMapping("/session/{id}/transcript")
     public ResponseEntity<?> transcript(@PathVariable("id") String id) {
-        if (remote != null) return remote.transcript(id);
+        if (live != null) return remote().transcript(id);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
         // 此历史端点返回完整快照；在途 Prompt 的增量恢复由帧源单独处理
@@ -518,7 +529,7 @@ public class DaemonController {
 
     @DeleteMapping("/session/{id}")
     public ResponseEntity<?> deleteSession(@PathVariable("id") String id) {
-        if (remote != null) return remote.delete(id);
+        if (live != null) return remote().delete(id);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
 
@@ -536,7 +547,7 @@ public class DaemonController {
         @PathVariable("id") String id,
         @PathVariable("requestId") String requestId,
         @RequestBody(required = false) Map<String, Object> body) {
-        if (remote != null) return remote.permission(id, requestId, body);
+        if (live != null) return remote().permission(id, requestId, body);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
         Map<String, Object> pending = record.pendingPermissions.get(requestId);
@@ -621,7 +632,7 @@ public class DaemonController {
     // ------------------------------------------------------------------
 
     private ResponseEntity<?> loadSessionImpl(String id, String mode) {
-        if (remote != null) return remote.load(id); // Resume also reads fresh remote history.
+        if (live != null) return remote().load(id); // Resume also reads fresh remote history.
         Registry.Record record = resolveSession(id);
         if (record == null || record.deleted) return notFound(id);
         if ("load".equals(mode)) {
@@ -652,7 +663,7 @@ public class DaemonController {
             return ResponseEntity.badRequest().body(errorBody("displayName 不能为空", "invalid_metadata"));
         }
         if (name.length() > 512) return ResponseEntity.badRequest().body(errorBody("Title exceeds 512 characters", "invalid_metadata"));
-        if (remote != null) return remote.rename(id, name);
+        if (live != null) return remote().rename(id, name);
         Registry.Record record = resolveSession(id);
         if (record == null) return notFound(id);
 
@@ -664,7 +675,7 @@ public class DaemonController {
     }
 
     private Map<String, Object> batchMutate(String action, Object rawIds) {
-        if (remote != null) return remote.batch(action, rawIds);
+        if (live != null) return remote().batch(action, rawIds);
         List<String> ids = new ArrayList<>();
         if (rawIds instanceof List<?> list) {
             for (Object v : list) {

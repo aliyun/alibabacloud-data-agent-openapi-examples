@@ -8,10 +8,10 @@ from fastapi.testclient import TestClient
 from das_python import main
 from das_python.config import AppConfig
 from das_python.daemon.registry import SessionRecord
-from das_python.daemon.live_routes import _remote_sse_stream, _remote_epoch
+from das_python.daemon.live_routes import _remote_sse_stream
 from das_python.live import LiveContext, _create_session_result, _list_sessions_result
 from das_python.normalize import SdkError
-from das_python.pop import rpc, session_events
+from das_python.pop import rpc, session_events, _parse_event
 from das_python.session_options import creation_options
 
 
@@ -128,6 +128,17 @@ def test_routes_defaults_creation_mutations_and_failures(monkeypatch):
     assert pop.calls[-1][0].action == "DeleteAgentSession"
 
 
+async def next_business(source):
+    while True:
+        event = await anext(source)
+        if event.get("event") not in ("stream_open", "replay_complete"):
+            return event
+
+
+def opening(sid):
+    return 'data: '+json.dumps({"type": "stream_open", "data": {"sessionId": sid, "nativeSessionId": "native", "eventEpoch": "epoch"}})+'\n\n'
+
+
 class FakeEvents:
     def __init__(self, frames):
         self.frames = frames
@@ -136,9 +147,22 @@ class FakeEvents:
 
     async def call_sseapi_async(self, descriptor, request, runtime):
         self.requests.append((descriptor, request))
+        sid = request.query["SessionCode"]
+        opener = {"type": "stream_open", "data": {"sessionId": sid, "nativeSessionId": "native", "eventEpoch": "epoch"}}
+        def response(cursor, kind, data):
+            return SimpleNamespace(status_code=200, headers={"content-type": "text/event-stream"},
+                event=SimpleNamespace(id=cursor, event=kind, data=json.dumps(data)))
         try:
+            yield response(None, "stream_open", opener)
+            numbered = []
             for cursor, kind, data in self.frames:
-                yield SimpleNamespace(event=SimpleNamespace(id=cursor, event=kind, data=json.dumps(data)))
+                yield response(cursor, kind, data)
+                parsed = _parse_event(data, cursor, kind, sid, "native")
+                if parsed and parsed["id"] is not None:
+                    numbered.append(int(parsed["id"]))
+            if request.headers.get("Last-Event-Id") is not None:
+                yield response(None, "replay_complete", {"type": "replay_complete", "data": {
+                    "replayedCount": len(numbered), **({"lastEventId": numbered[-1]} if numbered else {})}})
         finally:
             self.closed = True
 
@@ -148,7 +172,7 @@ async def test_raw_and_pop_events_preserve_cursors_data_and_close():
     data = {"v": 1, "type": "session_update", "data": {"TextWithCase": "kept"}}
     client = FakeEvents([("0042", "session_update", data),
         (None, None, {"Id": "43", "Event": "session_update", "Data": json.dumps(data)})])
-    events = [event async for event in session_events(LiveContext(client, config()), "session", "0041")]
+    events = [event async for event in session_events(LiveContext(client, config()), "session", "0041") if event["event"] not in ("stream_open", "replay_complete")]
     desc, req = client.requests[0]
     assert desc.action == "GetAgentSessionEvents" and desc.method == "GET"
     assert req.query == {"SessionCode": "session"}
@@ -166,12 +190,11 @@ async def test_live_stream_never_uses_journal_cursor_or_events():
     record = SessionRecord("public-session")
     record.journal.append({"v": 1, "type": "local_only", "data": {}})
     ctx = LiveContext(client, config())
-    output = "".join([chunk async for chunk in _remote_sse_stream(ctx, record.real_id, "0")])
-    assert client.requests[0][1].headers == {"accept": "text/event-stream", "Last-Event-Id": "0"}
+    output = "".join([chunk async for chunk in _remote_sse_stream(ctx, record.real_id, "6")])
+    assert client.requests[0][1].headers == {"accept": "text/event-stream", "Last-Event-Id": "6"}
     assert "id: 7" in output and "local_only" not in output
     assert '"sessionId":"public-session"' in output
     assert not record.pending_permissions
-    assert _remote_epoch(ctx.cfg, record.real_id) == _remote_epoch(ctx.cfg, record.real_id)
 
 
 @pytest.mark.asyncio
@@ -190,6 +213,7 @@ async def test_real_sdk_events_streams_before_eof_and_signs_correct_get(monkeypa
         assert request.headers["Accept"] == "text/event-stream"
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
+        await response.write(opening("public-session").encode())
         await response.write(b'id: 18\nevent: session_update\ndata: {"v":1,"type":"session_update","data":{"text":"live"}}\n\n')
         await release.wait()
         return response
@@ -206,7 +230,7 @@ async def test_real_sdk_events_streams_before_eof_and_signs_correct_get(monkeypa
     client._protocol = "http"
     stream = session_events(LiveContext(client, cfg), "public-session", "17")
     try:
-        event = await asyncio.wait_for(anext(stream), 2)
+        event = await asyncio.wait_for(next_business(stream), 2)
         assert event["id"] == "18" and event["data"]["data"]["text"] == "live"
         assert not release.is_set()  # first frame arrived before upstream EOF
         assert received == [("GET", "GetAgentSessionEvents", "public-session", "17")]
@@ -231,7 +255,7 @@ async def test_event_wrapper_and_partial_close():
     data = {"v": 1, "type": "session_update", "data": {"text": "live"}}
     client = FakeEvents([(None, None, {"Id": "24", "Event": data}), ("25", "session_update", data)])
     stream = session_events(LiveContext(client, config()), "s", None)
-    assert (await anext(stream))["id"] == "24"
+    assert (await next_business(stream))["id"] == "24"
     await stream.aclose()
     assert client.closed
 
@@ -266,11 +290,11 @@ def test_load_prompt_watermarks_are_remote_and_live_events_route_is_remote(monke
     from das_python.daemon import live_routes as routes
     http, pop = live_app(monkeypatch)
     event = {"v": 1, "type": "session_update", "data": {"sessionId": "Remote-ID", "update": {"sessionUpdate": "agent_message_chunk"}}}
-    events = FakeEvents([("42", "session_update", event)])
+    events = FakeEvents([("1", "session_update", event)])
     pop.call_sseapi_async = events.call_sseapi_async
     http.post("/d/standalone/sessions", json={"modelServiceId": "selected"})
     response = http.get("/d/session/Remote-ID/events", headers={"Last-Event-Id": "0"})
-    assert "id: 42" in response.text
+    assert "id: 1" in response.text
     assert events.requests[0][1].headers == {"accept": "text/event-stream", "Last-Event-Id": "0"}
     assert response.headers["x-qwen-event-epoch"]
 
@@ -279,7 +303,7 @@ def test_load_prompt_watermarks_are_remote_and_live_events_route_is_remote(monke
     monkeypatch.setattr(routes, "_load_frames", history)
     loaded = http.post("/d/standalone/sessions/Remote-ID/load").json()
     assert "lastEventId" not in loaded
-    assert loaded["eventEpoch"] == response.headers["x-qwen-event-epoch"]
+    assert "eventEpoch" not in loaded
     assert loaded["state"]["models"] == {"availableModels": []}
     assert loaded["liveJournal"] == []
     response = http.post("/d/session/Remote-ID/prompt", json={"prompt": [{"type": "text", "text": "test"}]})
@@ -335,20 +359,21 @@ def test_archived_directory_survives_app_restart_and_list_errors_propagate(monke
 @pytest.mark.parametrize("variant", ["raw", "event-object", "event-json", "data-object", "data-json", "named-data", "named-json-data"])
 @pytest.mark.asyncio
 async def test_all_verified_event_wrappers_and_ack_skip(variant):
-    data = {"v": 1, "type": "session_update", "id": 8,
+    data = {"v": 1, "type": "session_update", "id": 10,
             "data": {"sessionId": "s", "text": "中文"}}
     variants = {
         "raw": data,
-        "event-object": {"Id": "9", "Event": data},
-        "event-json": {"Id": "9", "Event": json.dumps(data)},
-        "data-object": {"Id": "9", "Event": "session_update", "Data": data},
-        "data-json": {"Id": "9", "Event": "session_update", "Data": json.dumps(data)},
-        "named-data": {"Id": "9", "Event": "session_update", "Data": data["data"]},
-        "named-json-data": {"Id": "9", "Event": "session_update", "Data": json.dumps(data["data"])},
+        "event-object": {"Id": "10", "Event": data},
+        "event-json": {"Id": "10", "Event": json.dumps(data)},
+        "data-object": {"Id": "10", "Event": "session_update", "Data": data},
+        "data-json": {"Id": "10", "Event": "session_update", "Data": json.dumps(data)},
+        "named-data": {"Id": "10", "Event": "session_update", "Data": data["data"]},
+        "named-json-data": {"Id": "10", "Event": "session_update", "Data": json.dumps(data["data"])},
     }
     client = FakeEvents([("200", "message", {"RequestId": "ack"}), ("0010", None, variants[variant])])
-    events = [event async for event in session_events(LiveContext(client, config()), "s", None)]
-    assert len(events) == 1 and events[0]["id"] == "0010"
+    events = [event async for event in session_events(LiveContext(client, config()), "s", None) if event["event"] not in ("stream_open", "replay_complete")]
+    assert len(events) == 1 and int(events[0]["id"]) == 10
+    assert events[0]["transportCursor"] == "0010"
     assert events[0]["event"] == "session_update"
     assert events[0]["data"]["data"] == data["data"]
 
@@ -358,21 +383,21 @@ async def test_all_verified_event_wrappers_and_ack_skip(variant):
 async def test_unsafe_outer_cursor_rejected_before_fallback(cursor):
     data = {"v": 1, "type": "session_update", "data": {}}
     client = FakeEvents([(cursor, None, {"Id": "12", "Event": json.dumps(data)})])
-    with pytest.raises(ValueError, match="cursor"):
-        _ = [event async for event in session_events(LiveContext(client, config()), "s", None)]
+    with pytest.raises(SdkError):
+        _ = [event async for event in session_events(LiveContext(client, config()), "s", None) if event["event"] not in ("stream_open", "replay_complete")]
     assert client.closed
 
 
 @pytest.mark.asyncio
 async def test_payload_cursor_fallback_and_crosssession_rejection():
     data = {"v": 1, "type": "session_update", "id": 8, "data": {"sessionId": "s"}}
-    client = FakeEvents([(None, None, {"Id": 12, "Event": json.dumps(data)}), (None, None, data)])
-    events = [event async for event in session_events(LiveContext(client, config()), "s", None)]
-    assert [event["id"] for event in events] == ["12", "8"]
+    client = FakeEvents([(None, None, {"Id": 8, "Event": json.dumps(data)}), (None, None, {**data, "id": 9})])
+    events = [event async for event in session_events(LiveContext(client, config()), "s", None) if event["event"] not in ("stream_open", "replay_complete")]
+    assert [event["id"] for event in events] == ["8", "9"]
     forbidden = {"v": 1, "type": "permission_request", "data": {"sessionId": "other", "requestId": "p"}}
     client = FakeEvents([("20", None, {"Event": json.dumps(forbidden)})])
     record = SessionRecord("s")
-    with pytest.raises(ValueError, match="another session"):
+    with pytest.raises(SdkError):
         _ = [part async for part in _remote_sse_stream(LiveContext(client, config()), record.real_id, None)]
     assert record.pending_permissions == {}
 
@@ -403,8 +428,8 @@ async def test_actual_sdk_fragmented_utf8_multiline_sse_and_wire_cursor(monkeypa
     release = asyncio.Event()
     seen = []
     daemon = {"v": 1, "type": "session_update", "data": {"sessionId": "s", "text": "中文续传"}}
-    payload = json.dumps({"Id": 42, "Event": json.dumps(daemon["data"] if flattened else daemon, ensure_ascii=False)}, ensure_ascii=False, indent=2)
-    wire = ('id: 999\r\ndata: {"RequestId":"ack-only"}\r\n\r\n'
+    payload = json.dumps({"Id": 18, "Event": json.dumps(daemon["data"] if flattened else daemon, ensure_ascii=False)}, ensure_ascii=False, indent=2)
+    wire = (opening("s")+'id: 999\r\ndata: {"RequestId":"ack-only"}\r\n\r\n'
             'id: 0018\r\nevent: session_update\r\n'
             + ''.join(f'data: {line}\r\n' for line in payload.splitlines()) + '\r\n').encode("utf-8")
 
@@ -432,8 +457,8 @@ async def test_actual_sdk_fragmented_utf8_multiline_sse_and_wire_cursor(monkeypa
     client._protocol = "http"
     stream = session_events(LiveContext(client, cfg), "s", "0017")
     try:
-        result = await asyncio.wait_for(anext(stream), 4)
-        assert result["id"] == "0018"  # outer SSE cursor wins over Id=42
+        result = await asyncio.wait_for(next_business(stream), 4)
+        assert result["id"] == "0018"  # transport and native IDs agree
         assert result["event"] == "session_update" and result["data"] == {**daemon, "id": 18}
         assert seen == [("GET", "s", "0017")]
         assert not release.is_set()
@@ -454,19 +479,20 @@ async def test_flattened_public_events_normalize_to_canonical_daemon(kind, flat,
               "data": {"Data": flat}, "data-json": {"Data": json.dumps(flat)},
               "named-data": {"Event": kind, "Data": flat}}
     client = FakeEvents([("51", "message", shapes[wrapper])])
-    result = [event async for event in session_events(LiveContext(client, config()), "s", "50")]
-    assert result == [{"id": "51", "event": kind, "data": {"v": 1, "type": kind, "data": flat, "id": 51}}]
+    result = [event async for event in session_events(LiveContext(client, config()), "s", "50") if event["event"] not in ("stream_open", "replay_complete")]
+    assert result == [{"id": "51", "event": kind, "data": {"v": 1, "type": kind, "data": flat, "id": 51,
+        **({"promptId": flat["promptId"]} if "promptId" in flat else {})}, "transportCursor": "51"}]
 
 
 @pytest.mark.asyncio
 async def test_flattened_public_fields_and_crosssession_validation():
     client = FakeEvents([(None, None, {"Id": 52, "Data": {"SessionId": "s", "StopReason": "end_turn", "PromptId": "p"}})])
-    events = [event async for event in session_events(LiveContext(client, config()), "s", None)]
+    events = [event async for event in session_events(LiveContext(client, config()), "s", None) if event["event"] not in ("stream_open", "replay_complete")]
     assert events[0]["id"] == "52"
     assert events[0]["data"]["data"] == {"sessionId": "s", "stopReason": "end_turn", "promptId": "p"}
     client = FakeEvents([("53", None, {"Data": {"sessionId": "another", "update": {}}})])
-    with pytest.raises(ValueError, match="another session"):
-        _ = [event async for event in session_events(LiveContext(client, config()), "s", None)]
+    with pytest.raises(SdkError):
+        _ = [event async for event in session_events(LiveContext(client, config()), "s", None) if event["event"] not in ("stream_open", "replay_complete")]
 
 
 def test_standalone_session_options_exposes_env_approval_and_models(monkeypatch):

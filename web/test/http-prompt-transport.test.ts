@@ -71,9 +71,9 @@ function byteStream(signal?: AbortSignal | null) {
 }
 type ByteStream = ReturnType<typeof byteStream>;
 
-function fixture(options: { transport?: 'http-stream' | 'daemon'; capabilityStatus?: number; capabilityBody?: unknown; capabilityError?: Error;
-  http?: (signal?: AbortSignal | null) => Response | Promise<Response>; } = {}) {
-  const requests: Array<{ path: string; method: string; body: unknown; signal?: AbortSignal | null }> = [];
+function fixture(options: { recovery?: (sid: string, automatic: boolean) => void; transport?: 'http-stream' | 'daemon'; capabilityStatus?: number; capabilityBody?: unknown; capabilityError?: Error;
+  http?: (signal?: AbortSignal | null) => Response | Promise<Response>; events?: (attempt: number) => Response | undefined; initialEpoch?: string; } = {}) {
+  const requests: Array<{ path: string; method: string; body: unknown; signal?: AbortSignal | null; headers: Headers }> = [];
   const http: ByteStream[] = [];
   const sse: ByteStream[] = [];
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -81,18 +81,20 @@ function fixture(options: { transport?: 'http-stream' | 'daemon'; capabilityStat
     const path = new URL(request?.url ?? String(input)).pathname;
     const method = init?.method ?? request?.method ?? 'GET';
     const signal = init?.signal ?? request?.signal;
-    requests.push({ path, method, body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined, signal });
+    requests.push({ path, method, body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined, signal, headers: new Headers(init?.headers ?? request?.headers) });
     if (signal?.aborted) throw signal.reason;
     if (path === '/d/openapi/session-options' && options.capabilityError) throw options.capabilityError;
     if (path === '/d/openapi/session-options') return Response.json(options.capabilityBody ?? {
       agentName: 'fixture', models: [], approvalMode: 'default', promptTransport: options.transport ?? 'http-stream',
     }, { status: options.capabilityStatus ?? 200 });
     if (path === '/d/capabilities') return Response.json({ v: 1, features: ['standalone_sessions_v1'] });
-    if (path === '/d/standalone/sessions' || path === '/d/session' || /\/(load|resume)$/.test(path)) return Response.json(sessionResponse);
+    if (path === '/d/standalone/sessions' || path === '/d/session' || /\/(load|resume)$/.test(path)) return Response.json({ ...sessionResponse, ...(options.initialEpoch ? { eventEpoch: options.initialEpoch } : {}) });
     if (path.endsWith('/events')) {
+      const override = options.events?.(requests.filter(request => request.path.endsWith('/events')).length);
+      if (override) return override;
       const stream = byteStream(signal); sse.push(stream);
       stream.event({ v: 1, type: 'stream_open', data: {} });
-      return new Response(stream.body, { headers: { 'content-type': 'text/event-stream' } });
+      return new Response(stream.body, { headers: { 'content-type': 'text/event-stream', ...((new Headers(init?.headers).get('X-Qwen-Event-Epoch') ?? options.initialEpoch) ? { 'X-Qwen-Event-Epoch': (new Headers(init?.headers).get('X-Qwen-Event-Epoch') ?? options.initialEpoch)! } : {}) } });
     }
     if (path === promptPath) {
       expect(method).toBe('POST');
@@ -110,7 +112,7 @@ function fixture(options: { transport?: 'http-stream' | 'daemon'; capabilityStat
   });
   function browser() {
     const client = new DaemonClient({ baseUrl: `${base}/d` });
-    const restore = installOpenApiSessionCreation(client, `${base}/d`);
+    const restore = installOpenApiSessionCreation(client, `${base}/d`, undefined, { onRecoveryRequired: options.recovery });
     cleanups.push(() => { restore(); client.dispose(); });
     return { client, restore };
   }
@@ -504,7 +506,7 @@ it('rejects an oversized unfinished NDJSON line before it can grow without bound
   assertSingleHttp(f);
 });
 
-it('ends the merged subscription when SSE EOF precedes a POST network failure before response headers', async () => {
+it('ends Events after EOF once an owned POST fails before response headers', async () => {
   const postStarted = deferred();
   const failBeforeHeaders = deferred();
   const f = fixture({ http: async () => {
@@ -523,7 +525,6 @@ it('ends the merged subscription when SSE EOF precedes a POST network failure be
   expect(subscription.ended).toBe(false);
   failBeforeHeaders.resolve();
   await bounded(expect(admission).rejects.toThrow('fixture POST disconnected before response headers'), 'failed admission');
-  // Ending normally or reporting a stream error is acceptable; waiting forever is not.
   await bounded(subscription.consume.catch(() => {}), 'merged subscription exits after failed admission');
   expect(subscription.ended).toBe(true);
   expect(subscription.events.filter(local)).toHaveLength(0);
@@ -646,4 +647,163 @@ it('uses a safe fallback for a non-JSON HTTP error body', async () => {
   const f = fixture({ http: () => new Response('<html>hidden-response-token</html>', { status: 502 }) });
   const { client } = f.browser();
   await expect(client.prompt(sid, question)).rejects.toThrow(/^OpenAPI 请求失败或未返回 NDJSON$/);
+});
+
+
+it('reconnects remote Events before HTTP finishes, resumes its applied cursor and never resends Prompt', async () => {
+  const f = fixture();
+  const { session, subscription } = await opened(f);
+  const accepted = await session.submitPrompt(question);
+  f.sse[0]!.event({ v: 1, id: 18, type: 'session_update', data: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'before' } } } });
+  await expect.poll(() => subscription.events.some(event => event.id === 18)).toBe(true);
+  f.sse[0]!.close();
+  await expect.poll(() => f.sse.length, { timeout: 1500 }).toBe(2);
+  expect(f.http[0]!.aborted).toBe(false);
+  expect(f.requests.filter(request => request.path.endsWith('/events')).at(-1)?.headers.get('last-event-id')).toBe('18');
+  expect(subscription.events.filter(local)).toHaveLength(0);
+  f.sse[1]!.event({ v: 1, id: 19, type: 'session_update', data: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'after' } } } });
+  await expect.poll(() => subscription.events.some(event => event.id === 19)).toBe(true);
+  f.http[0]!.line(done); f.http[0]!.close();
+  assertOwn(await terminal(subscription.events, accepted.promptId), accepted.promptId);
+  expect(f.cancels()).toHaveLength(0); assertSingleHttp(f);
+});
+
+it('pauses idle runtime subscriptions without Load or a false model error until the next Prompt', async () => {
+  const recovery = vi.fn(); const f = fixture({ recovery });
+  const first = await opened(f);
+  f.sse[0]!.event({ v: 1, type: 'turn_error', data: { code: 'DAEMON_SESSION_NOT_FOUND', message: 'idle released' } });
+  await expect.poll(() => f.sse[0]!.aborted).toBe(true);
+  expect(recovery).not.toHaveBeenCalled();
+  expect(first.subscription.events.some(event => event.type === 'turn_error')).toBe(false);
+  expect(f.requests.filter(request => /\/(load|resume)$/.test(request.path))).toHaveLength(0);
+  const accepted = await first.session.submitPrompt(question);
+  f.http[0]!.line(done); f.http[0]!.close();
+  assertOwn(await terminal(first.subscription.events, accepted.promptId), accepted.promptId);
+  assertSingleHttp(f);
+});
+
+it('keeps foreign real turn_error visible and never Loads because an idle subscription disappears', async () => {
+  const recovery = vi.fn(); const f = fixture({ recovery });
+  const { session, subscription } = await opened(f);
+  const accepted = await session.submitPrompt(question);
+  f.sse[0]!.event({ v: 1, type: 'turn_error', data: { promptId: 'real-native-turn', code: 'INSTANCE_NOT_FOUND', message: 'real business error' } });
+  await expect.poll(() => subscription.events.some(event => event.type === 'turn_error')).toBe(true);
+  expect(recovery).not.toHaveBeenCalled();
+  f.sse[0]!.event({ v: 1, type: 'turn_error', data: { code: 'RUNTIME_NOT_READY' } });
+  await tick(); expect(recovery).not.toHaveBeenCalled(); expect(f.http[0]!.aborted).toBe(false);
+  f.http[0]!.line(done); f.http[0]!.close();
+  await terminal(subscription.events, accepted.promptId);
+  expect(recovery).not.toHaveBeenCalled();
+  assertSingleHttp(f); expect(f.cancels()).toHaveLength(0);
+});
+
+function nativeFrame(id: number, text: string, epoch = 'native-epoch', promptId = 'native-prompt') {
+  return { type: 'frame', rid: 'rpc-A', body: { Jsonrpc: '2.0', Method: 'session/update',
+    Meta: { EventCursor: { SessionId: sid, PromptId: promptId, EventId: String(id), EventEpoch: epoch, EventType: 'session_update' } },
+    Params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } } };
+}
+it('restores through one Prompt, waits for its native cursor and renders the first frame exactly once', async () => {
+  const recovery = vi.fn();
+  const f = fixture({ recovery, events: attempt => attempt === 1 ? Response.json({ code: 'DAEMON_SESSION_NOT_FOUND' }, { status: 502 }) : undefined });
+  const { client } = f.browser();
+  const session = await DaemonSessionClient.createStandalone(client);
+  const subscription = subscribe(session);
+  await expect.poll(() => f.requests.filter(request => request.path.endsWith('/events')).length).toBe(1);
+  const accepted = await session.submitPrompt(question);
+  await tick();
+  expect(f.requests.filter(request => request.path.endsWith('/events'))).toHaveLength(1);
+  f.http[0]!.line(nativeFrame(7, '首段🌏'));
+  await bounded(subscription.connected, 'native subscription after actual restoration');
+  const get = f.requests.filter(request => request.path.endsWith('/events')).at(-1)!;
+  expect(get.headers.get('last-event-id')).toBe('7');
+  expect(get.headers.get('x-qwen-event-epoch')).toBe('native-epoch');
+  f.sse[0]!.event({ v: 1, id: 7, type: 'session_update', promptId: 'native-prompt',
+    data: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '首段🌏' } } } });
+  f.http[0]!.line(nativeFrame(8, '后段'));
+  f.http[0]!.line(nativeFrame(8, '后段')); // repeated replay must not append twice
+  f.http[0]!.line(done); f.http[0]!.close();
+  await terminal(subscription.events, accepted.promptId);
+  const chunks = subscription.events.filter(event => event.type === 'session_update');
+  expect(chunks.map(event => (event.data as { update: { content: { text: string } } }).update.content.text)).toEqual(['首段🌏', '后段']);
+  expect(f.requests.filter(request => /\/(load|resume)$/.test(request.path))).toHaveLength(0);
+  expect(recovery).not.toHaveBeenCalled();
+  expect(f.cancels()).toHaveLength(0); assertSingleHttp(f);
+});
+it('keeps Prompt content and completion when strict Events cannot verify the native epoch', async () => {
+  const f = fixture({ events: attempt => attempt > 1 ? Response.json({ error: 'native epoch missing' }, { status: 502 }) : undefined });
+  const { session, subscription } = await opened(f);
+  const accepted = await session.submitPrompt(question);
+  f.http[0]!.line(nativeFrame(1, 'before'));
+  await expect.poll(() => f.requests.filter(request => request.path.endsWith('/events')).length).toBe(2);
+  await tick();
+  expect(f.http[0]!.aborted).toBe(false);
+  f.http[0]!.line(nativeFrame(2, 'after')); f.http[0]!.line(done); f.http[0]!.close();
+  assertOwn(await terminal(subscription.events, accepted.promptId), accepted.promptId);
+  expect(subscription.events.filter(event => event.type === 'session_update')).toHaveLength(2);
+  expect(subscription.events.filter(event => event.type === 'turn_error')).toHaveLength(0);
+  assertSingleHttp(f); expect(f.cancels()).toHaveLength(0);
+});
+it('renders old no-cursor Prompt frames without blocking or guessing a new subscription cursor', async () => {
+  const f = fixture({ events: () => Response.json({ code: 'DAEMON_SESSION_NOT_FOUND' }, { status: 502 }) });
+  const { client } = f.browser();
+  const session = await DaemonSessionClient.createStandalone(client);
+  const subscription = subscribe(session);
+  await tick();
+  const accepted = await session.submitPrompt(question);
+  const frame = nativeFrame(1, 'compatible');
+  delete (frame.body as { Meta?: unknown }).Meta;
+  f.http[0]!.line(frame); f.http[0]!.line(done); f.http[0]!.close();
+  assertOwn(await terminal(subscription.events, accepted.promptId), accepted.promptId);
+  expect(subscription.events.some(event => event.type === 'session_update')).toBe(true);
+  expect(f.requests.filter(request => request.path.endsWith('/events'))).toHaveLength(1);
+  assertSingleHttp(f);
+});
+
+it('resets the public SDK watermark when native epoch changes from old 100 to new 7', async () => {
+  const f = fixture({ initialEpoch: 'epoch-A' });
+  const { client } = f.browser();
+  const session = await DaemonSessionClient.createStandalone(client);
+  session.setLastEventId(100);
+  const first = subscribe(session); await bounded(first.connected, 'old generation');
+  const accepted = await session.submitPrompt(question);
+  f.http[0]!.line(nativeFrame(7, 'new generation', 'epoch-B'));
+  await expect.poll(() => first.events.some(event => event.id === 7)).toBe(true);
+  await expect.poll(() => session.lastEventId).toBe(7);
+  first.abort.abort(); await first.consume;
+  const replacement = subscribe(session); await bounded(replacement.connected, 'replacement new generation');
+  const request = f.requests.filter(request => request.path.endsWith('/events')).at(-1)!;
+  expect(request.headers.get('last-event-id')).toBe('7');
+  expect(request.headers.get('x-qwen-event-epoch')).toBe('epoch-B');
+  f.http[0]!.line(done); f.http[0]!.close();
+  assertOwn(await terminal(replacement.events, accepted.promptId), accepted.promptId);
+  assertSingleHttp(f);
+});
+it('keeps a pending Prompt usable when an independent Events stream becomes malformed', async () => {
+  const f = fixture();
+  const { session, subscription } = await opened(f);
+  const accepted = await session.submitPrompt(question);
+  f.sse[0]!.text('data: {not-json}\n\n');
+  await tick(); await tick();
+  expect(subscription.ended).toBe(false);
+  expect(f.http[0]!.aborted).toBe(false);
+  f.http[0]!.line(nativeFrame(3, 'still works')); f.http[0]!.line(done); f.http[0]!.close();
+  assertOwn(await terminal(subscription.events, accepted.promptId), accepted.promptId);
+  expect(subscription.events.some(event => event.type === 'session_update')).toBe(true);
+  assertSingleHttp(f);
+});
+
+it('refuses capacity overflow instead of evicting a completed turn an attached reader has not consumed', async () => {
+  const f = fixture({ http: () => new Response(`${JSON.stringify(done)}\n`, { headers: { 'content-type': 'application/x-ndjson' } }) });
+  const { client } = f.browser();
+  const session = await DaemonSessionClient.createStandalone(client);
+  const abort = new AbortController();
+  const stream = session.events({ signal: abort.signal });
+  cleanups.push(async () => { abort.abort(); await bounded(stream.return(), 'capacity reader cleanup'); });
+  await bounded(stream.next(), 'capacity reader initial connection');
+  const accepted: string[] = [];
+  for (let i = 0; i < 64; i++) { accepted.push((await session.submitPrompt(question)).promptId); await tick(); }
+  await expect(session.submitPrompt(question)).rejects.toThrow('在途请求过多');
+  expect(f.prompts()).toHaveLength(64);
+  const first = await bounded(stream.next(), 'preserved oldest terminal');
+  assertOwn(first.value!, accepted[0]!);
 });
